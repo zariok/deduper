@@ -1,0 +1,97 @@
+[project]
+name = "deduper"
+version = "0.1.0"
+description = "A tool for finding and managing duplicate images and videos"
+readme = "README.md"
+requires-python = ">=3.6"
+license = "MIT"
+authors = [
+    {name = "John Draughn", email = "john@draughn.dev"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+]
+dependencies = [
+    "flask>=3.0.2",
+    "pillow>=11.2.1",
+    "imagehash>=4.3.1",
+    "werkzeug>=3.0.1",
+]
+
+[project.scripts]
+deduper = "deduper.app:create_app"
+
+[project.urls]
+Homepage = "https://github.com/zariok/deduper"
+Repository = "https://github.com/zariok/deduper.git"
+
+[tool.black]
+line-length = 88
+target-version = ['py36']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["deduper"]
+
+[tool.mypy]
+python_version = "3.6"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "--cov=deduper",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-report=xml",
+] 
+
+# Explicitly configure package discovery to avoid picking up top-level folders
+# like `templates` or `static` as Python packages in a flat layout.
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["deduper*"]
+exclude = ["tests*", "templates*", "static*"]

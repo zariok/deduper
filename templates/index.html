@@ -1,0 +1,1662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Media Deduplicator</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .folder-navigation {
+            margin-bottom: 20px;
+            position: relative;
+        }
+        .folder-select {
+            width: 100%;
+            padding: 12px;
+            font-size: 16px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            background-color: white;
+            cursor: pointer;
+            appearance: none;
+            -webkit-appearance: none;
+            -moz-appearance: none;
+            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+            background-repeat: no-repeat;
+            background-position: right 12px center;
+            background-size: 16px;
+        }
+        .folder-select:focus {
+            outline: none;
+            border-color: #007bff;
+            box-shadow: 0 0 0 2px rgba(0,123,255,0.25);
+        }
+        .folder-select option {
+            padding: 8px;
+        }
+        .folder-select option:first-child {
+            color: #666;
+        }
+        .no-folders {
+            background-color: #fff3cd;
+            color: #856404;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            border: 1px solid #ffeeba;
+        }
+        .error-message {
+            background-color: #f8d7da;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            border: 1px solid #f5c6cb;
+        }
+        .duplicate-section {
+            margin-bottom: 30px;
+        }
+        .duplicate-group {
+            background-color: white;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            display: flex;
+            gap: 30px;
+            align-items: flex-start;
+        }
+        .duplicate-group h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        .best-file-section {
+            flex: 0 0 300px;
+            min-width: 300px;
+        }
+        .duplicates-section {
+            flex: 1;
+        }
+        .media-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 20px;
+        }
+        .media-item {
+            position: relative;
+            width: 200px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            overflow: hidden;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .media-item:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        .media-item img {
+            width: 100%;
+            height: 150px;
+            object-fit: cover;
+            border-radius: 0;
+            transition: opacity 0.3s ease;
+        }
+        .media-item img[data-src] {
+            opacity: 0;
+        }
+        .media-item img.loaded {
+            opacity: 1;
+        }
+        .media-item .image-placeholder {
+            width: 100%;
+            height: 150px;
+            background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+            background-size: 200% 100%;
+            animation: loading 1.5s infinite;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #999;
+            font-size: 14px;
+        }
+        @keyframes loading {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+        .media-info {
+            padding: 12px;
+        }
+        .media-filename {
+            font-weight: bold;
+            font-size: 14px;
+            margin-bottom: 8px;
+            color: #333;
+            word-break: break-word;
+        }
+        .media-details {
+            font-size: 12px;
+            color: #666;
+            line-height: 1.4;
+        }
+        .media-detail-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 4px;
+        }
+        .media-detail-label {
+            font-weight: 500;
+        }
+        .media-detail-value {
+            color: #888;
+        }
+        
+        /* Responsive design */
+        @media (max-width: 768px) {
+            .duplicate-group {
+                flex-direction: column;
+                gap: 20px;
+            }
+            .best-file-section {
+                flex: none;
+                min-width: auto;
+            }
+            .media-container {
+                grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+                gap: 15px;
+            }
+            .media-item {
+                width: 100%;
+            }
+        }
+        .delete-btn {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            background-color: #dc3545;
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+        }
+        .delete-btn:hover {
+            background-color: #c82333;
+        }
+        .heart-btn {
+            position: absolute;
+            top: 5px;
+            left: 5px;
+            background-color: rgba(255, 255, 255, 0.9);
+            border: 2px solid #ddd;
+            border-radius: 50%;
+            width: 32px;
+            height: 32px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+            transition: all 0.2s ease;
+            z-index: 10;
+        }
+        .heart-btn:hover {
+            background-color: #fff;
+            border-color: #ff6b6b;
+            transform: scale(1.1);
+        }
+        .heart-btn.selected {
+            background-color: #ff6b6b;
+            border-color: #ff6b6b;
+            color: white;
+        }
+        .heart-btn.selected:hover {
+            background-color: #ff5252;
+            border-color: #ff5252;
+        }
+        .golden-heart-btn {
+            position: absolute;
+            top: 5px;
+            left: 5px;
+            background-color: rgba(255, 215, 0, 0.9);
+            border: 2px solid #ffd700;
+            border-radius: 50%;
+            width: 32px;
+            height: 32px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+            transition: all 0.2s ease;
+            z-index: 10;
+        }
+        .golden-heart-btn:hover {
+            background-color: #ffd700;
+            border-color: #ffb300;
+            transform: scale(1.1);
+        }
+        .exact-match-container {
+            width: 100%;
+            height: 150px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, #fff9c4, #fff59d);
+            border: 2px solid #ffd700;
+            border-radius: 8px;
+        }
+        .golden-heart-display {
+            font-size: 48px;
+            margin-bottom: 8px;
+            animation: pulse 2s infinite;
+        }
+        .exact-match-text {
+            font-size: 14px;
+            font-weight: bold;
+            color: #b8860b;
+            text-align: center;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+            100% { transform: scale(1); }
+        }
+        .loading {
+            text-align: center;
+            padding: 20px;
+            font-size: 18px;
+            color: #666;
+        }
+        
+    </style>
+</head>
+<body>
+    <h1>Media Deduplicator</h1>
+    
+    {% if error %}
+    <div class="error-message">
+        Error: {{ error }}
+    </div>
+    {% endif %}
+
+    {% if user_folders %}
+    <div class="folder-navigation">
+        <select class="folder-select" id="folderSelect">
+            <option value="">Select a folder...</option>
+            {% for folder in user_folders %}
+            <option value="{{ folder }}">{{ folder }}</option>
+            {% endfor %}
+        </select>
+        <div class="cache-controls" id="cacheControls" style="display: none; margin-top: 10px;">
+            <div class="cache-info" id="cacheInfo" style="background: #e9ecef; padding: 10px; border-radius: 5px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <div id="cacheDetails" style="font-size: 12px; color: #666; line-height: 1.4;">
+                        <div style="margin-bottom: 4px;">
+                            <span style="font-weight: 500;">Files Cached:</span> <span id="totalCachedFiles">-</span> 
+                            <span style="margin-left: 12px; font-weight: 500;">Size:</span> <span id="cacheSize">-</span>
+                        </div>
+                        <div style="margin-bottom: 4px;">
+                            <span style="font-weight: 500;">Groups:</span> <span id="totalGroups">-</span> | 
+                            <span style="font-weight: 500;">Duplicates:</span> <span id="duplicateGroups">-</span> | 
+                            <span style="font-weight: 500;">Processed:</span> <span id="processedGroups">-</span>
+                        </div>
+                        <div>
+                            <span style="font-weight: 500;">Remaining Files:</span> <span id="remainingDuplicates">-</span>
+                        </div>
+                        <div style="margin-top: 4px; font-size: 11px; color: #888;">
+                            <span style="font-weight: 500;">Created:</span> <span id="cacheCreated">-</span> | 
+                            <span style="font-weight: 500;">Updated:</span> <span id="cacheUpdated">-</span>
+                        </div>
+                    </div>
+                </div>
+                <button id="clearCacheBtn" class="btn btn-warning" style="background: #ffc107; color: #212529; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer;">
+                    Clear Cache
+                </button>
+            </div>
+        </div>
+        
+        <!-- Progress Display -->
+        <div id="progressContainer" style="display: none; margin-top: 15px;">
+            <div class="progress-card" style="background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                <div class="progress-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                    <h3 id="progressTitle" style="margin: 0; color: #333;">Processing Files...</h3>
+                    <span id="progressPercentage" style="font-weight: bold; color: #007bff;">0%</span>
+                </div>
+                <div class="progress-bar-container" style="background: #f0f0f0; border-radius: 10px; height: 20px; margin-bottom: 10px; overflow: hidden;">
+                    <div id="progressBar" style="background: linear-gradient(90deg, #007bff, #0056b3); height: 100%; width: 0%; transition: width 0.3s ease; border-radius: 10px;"></div>
+                </div>
+                <div class="progress-details" style="display: flex; justify-content: space-between; align-items: center; font-size: 14px; color: #666;">
+                    <span id="progressMessage">Initializing...</span>
+                    <span id="progressCount">0 / 0</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% else %}
+    <div class="no-folders">
+        <h3>No folders found</h3>
+        <p>To get started:</p>
+        <ol>
+            <li>Create a folder in the <code>data</code> directory</li>
+            <li>Add your images and videos to that folder</li>
+            <li>Refresh this page to see your folder</li>
+        </ol>
+    </div>
+    {% endif %}
+
+    <div id="duplicate-content" style="display: none;">
+        <div class="duplicate-section" id="duplicate-images">
+            <h2>Duplicate Images</h2>
+            <div id="images-container"></div>
+        </div>
+
+        <div class="duplicate-section" id="duplicate-videos">
+            <h2>Duplicate Videos</h2>
+            <div id="videos-container"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentEventSource = null;
+        let imageObserver = null;
+        let loadedImages = new Set();
+        let loadingQueue = [];
+        let isProcessingQueue = false;
+        const BATCH_SIZE = 10; // Load 10 images at a time
+        const BATCH_DELAY = 100; // 100ms delay between batches
+        
+        // Pagination variables
+        let allDuplicateImages = [];
+        let allDuplicateVideos = [];
+        let currentImagePage = 0;
+        let currentVideoPage = 0;
+        const GROUPS_PER_PAGE = 5; // Load 5 groups at a time
+        
+        // Cache update variables
+        let cacheUpdateInterval = null;
+        let currentFolder = null;
+        
+        // Load more button observer
+        let loadMoreObserver = null;
+        let isLoadingMore = false; // Prevent rapid successive loads
+
+        // Initialize load more button observer
+        function initLoadMoreObserver() {
+            if (loadMoreObserver) {
+                loadMoreObserver.disconnect();
+            }
+            
+            loadMoreObserver = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting && !isLoadingMore) {
+                        const button = entry.target;
+                        const type = button.dataset.type;
+                        
+                        console.log(`Load more button for ${type} is now visible, auto-loading...`);
+                        
+                        // Set loading flag to prevent rapid successive loads
+                        isLoadingMore = true;
+                        
+                        // Remove the button first
+                        button.remove();
+                        
+                        // Load the next page
+                        if (type === 'images') {
+                            loadNextImagePage();
+                        } else if (type === 'videos') {
+                            loadNextVideoPage();
+                        }
+                        
+                        // Reset loading flag after a short delay
+                        setTimeout(() => {
+                            isLoadingMore = false;
+                        }, 1000);
+                    }
+                });
+            }, {
+                rootMargin: '100px 0px', // Start loading 100px before the button comes into view
+                threshold: 0.1
+            });
+        }
+
+        // Load saved folder selection on page load
+        window.addEventListener('load', () => {
+            // Initialize the load more observer
+            initLoadMoreObserver();
+            
+            const savedFolder = localStorage.getItem('selectedFolder');
+            if (savedFolder) {
+                const folderSelect = document.getElementById('folderSelect');
+                folderSelect.value = savedFolder;
+                // Trigger the change event to rescan the folder
+                folderSelect.dispatchEvent(new Event('change'));
+            }
+        });
+        
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            stopCacheUpdates();
+            if (currentEventSource) {
+                currentEventSource.close();
+            }
+            if (loadMoreObserver) {
+                loadMoreObserver.disconnect();
+            }
+        });
+
+        // Function to clear folder selection and hide UI elements
+        function clearFolderSelection() {
+            // Clear saved folder selection
+            localStorage.removeItem('selectedFolder');
+            document.getElementById('cacheControls').style.display = 'none';
+            document.getElementById('progressContainer').style.display = 'none';
+            document.getElementById('duplicate-content').style.display = 'none';
+            if (currentEventSource) {
+                currentEventSource.close();
+                currentEventSource = null;
+            }
+            // Clear lazy loading state
+            clearLazyLoading();
+            // Stop cache updates
+            stopCacheUpdates();
+            
+            // Reset cache stats display immediately
+            const cacheDetails = document.getElementById('cacheDetails');
+            if (cacheDetails) {
+                const ids = ['totalCachedFiles','cacheSize','totalGroups','duplicateGroups','processedGroups','remainingDuplicates','cacheCreated','cacheUpdated'];
+                ids.forEach(id => {
+                    const el = cacheDetails.querySelector('#' + id);
+                    if (el) el.textContent = '-';
+                });
+            }
+            // Disconnect load more observer
+            if (loadMoreObserver) {
+                loadMoreObserver.disconnect();
+            }
+        }
+
+        // Function to scan a folder for duplicates
+        async function scanFolder(folder) {
+            // Save folder selection to localStorage
+            localStorage.setItem('selectedFolder', folder);
+            
+            // Clear lazy loading state for new scan
+            loadedImages.clear();
+            loadingQueue = [];
+            isProcessingQueue = false;
+            
+            // Show cache controls and start periodic updates
+            document.getElementById('cacheControls').style.display = 'block';
+            startCacheUpdates(folder);
+            
+            // Reinitialize load more observer for new folder
+            initLoadMoreObserver();
+            
+            // Hide duplicate content until scan is complete
+            document.getElementById('duplicate-content').style.display = 'none';
+            
+            // Generate a session ID on the frontend side
+            const sessionId = `${folder}_${Date.now()}`;
+            
+            // Start progress tracking immediately, before making the scan request
+            startProgressTracking(sessionId);
+            
+            try {
+                // URL encode the folder name to handle special characters
+                const encodedFolder = encodeURIComponent(folder);
+                const response = await fetch(`/scan/${encodedFolder}`, {
+                    headers: {
+                        'X-Session-ID': sessionId
+                    }
+                });
+                const data = await response.json();
+                
+                // Store all data for pagination
+                allDuplicateImages = data.duplicate_images || [];
+                allDuplicateVideos = data.duplicate_videos || [];
+                currentImagePage = 0;
+                currentVideoPage = 0;
+                
+                // Show the duplicate content area now that we have results
+                document.getElementById('duplicate-content').style.display = 'block';
+                
+                // Render initial pages
+                const imagesContainer = document.getElementById('images-container');
+                imagesContainer.innerHTML = allDuplicateImages.length ? '' : '<p>No duplicate images found.</p>';
+                
+                const videosContainer = document.getElementById('videos-container');
+                videosContainer.innerHTML = allDuplicateVideos.length ? '' : '<p>No duplicate videos found.</p>';
+                
+                // Load initial pages
+                loadNextImagePage();
+                loadNextVideoPage();
+                
+                // Trigger lazy loading for visible images after initial render
+                // Use requestAnimationFrame to ensure DOM is fully rendered
+                console.log('About to trigger lazy loading for initial images...');
+                requestAnimationFrame(() => {
+                    setTimeout(() => {
+                        console.log('Triggering lazy loading for initial images...');
+                        triggerLazyLoadingForVisibleImages();
+                        
+                        // Fallback: force trigger again after a longer delay if images are still loading
+                        setTimeout(() => {
+                            const stillLoadingImages = document.querySelectorAll('img[data-src]');
+                            if (stillLoadingImages.length > 0) {
+                                console.log(`Fallback: Found ${stillLoadingImages.length} images still loading, forcing trigger`);
+                                triggerLazyLoadingForVisibleImages();
+                                
+                                // Second fallback: force load ALL images if they're still not loading
+                                setTimeout(() => {
+                                    const stillLoadingImages2 = document.querySelectorAll('img[data-src]');
+                                    if (stillLoadingImages2.length > 0) {
+                                        console.log(`Second fallback: Force loading ${stillLoadingImages2.length} remaining images`);
+                                        stillLoadingImages2.forEach(img => {
+                                            const src = img.getAttribute('data-src');
+                                            if (src && !loadedImages.has(src)) {
+                                                console.log(`Force loading image: ${src}`);
+                                                loadingQueue.push({ img, src });
+                                            }
+                                        });
+                                        if (loadingQueue.length > 0 && !isProcessingQueue) {
+                                            console.log(`Second fallback: Calling processLoadingQueue with ${loadingQueue.length} images`);
+                                            processLoadingQueue();
+                                        } else {
+                                            console.log(`Second fallback: Not calling processLoadingQueue - queueLength=${loadingQueue.length}, isProcessingQueue=${isProcessingQueue}`);
+                                        }
+                                    }
+                                }, 2000);
+                            }
+                        }, 1000);
+                    }, 200); // Increased delay to ensure DOM is fully rendered
+                });
+            } catch (error) {
+                // Show duplicate content area and display error
+                document.getElementById('duplicate-content').style.display = 'block';
+                document.getElementById('images-container').innerHTML = `<p class="error">Error: ${error.message}</p>`;
+                document.getElementById('videos-container').innerHTML = '';
+            }
+        }
+
+        document.getElementById('folderSelect').addEventListener('change', async (e) => {
+            const folder = e.target.value;
+            if (!folder) {
+                clearFolderSelection();
+                return;
+            }
+            
+            await scanFolder(folder);
+        });
+
+        // Helper function to check if a group has remaining duplicates and remove it if not
+        function checkAndRemoveEmptyGroup(duplicateGroup) {
+            // Check if the group still exists in the DOM
+            if (!duplicateGroup || !duplicateGroup.parentNode) {
+                console.log('Group already removed or not found');
+                return;
+            }
+            
+            const duplicatesSection = duplicateGroup.querySelector('.duplicates-section .media-container');
+            console.log('Checking group for empty duplicates:', {
+                group: duplicateGroup,
+                duplicatesSection: duplicatesSection,
+                childrenCount: duplicatesSection ? duplicatesSection.children.length : 0
+            });
+            
+            if (duplicatesSection && duplicatesSection.children.length === 0) {
+                // No more duplicates, remove the entire group
+                console.log('Removing empty group');
+                duplicateGroup.remove();
+            } else {
+                console.log(`Group still has ${duplicatesSection ? duplicatesSection.children.length : 0} duplicates`);
+            }
+        }
+
+        // Helper function to add event listeners to heart and delete buttons
+        function addButtonEventListeners(heartBtn, deleteBtn) {
+            if (heartBtn && !heartBtn.hasAttribute('data-listener-added')) {
+                heartBtn.setAttribute('data-listener-added', 'true');
+                heartBtn.addEventListener('click', async (e) => {
+                    // Prevent rapid successive clicks
+                    if (heartBtn.disabled) {
+                        return;
+                    }
+                    
+                    if (!confirm('Are you sure you want to set this file as the best file and process all duplicates? This will make the current best file a duplicate, then delete all duplicate files and replace them with symlinks to the new best file.')) {
+                        return;
+                    }
+                    
+                    // Disable button to prevent rapid clicks
+                    heartBtn.disabled = true;
+                    heartBtn.style.opacity = '0.6';
+                    heartBtn.style.cursor = 'not-allowed';
+                    
+                    const bestFile = e.target.dataset.best;
+                    const duplicateFile = e.target.dataset.duplicate;
+                    const groupId = e.target.dataset.groupId;
+                    const selectedFolder = document.getElementById('folderSelect').value;
+                    
+                    // Convert absolute path to relative path
+                    // Extract just the filename from the full path
+                    const duplicateFileName = duplicateFile.split('/').pop();
+                    
+                    try {
+                        // First, set the duplicate file as the new best file
+                        const setBestResponse = await fetch('/manage-duplicate', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                                action: 'set_best',
+                                file_path: duplicateFile,
+                                best_file_path: bestFile,
+                                group_id: groupId,
+                                folder: selectedFolder
+                            })
+                        });
+                        
+                        if (!setBestResponse.ok) {
+                            const data = await setBestResponse.json();
+                            alert(`Error setting best file: ${data.error}`);
+                            return;
+                        }
+                        
+                        console.log('Successfully set new best file, now processing all duplicates...');
+                        
+                        // Then process all duplicates (including the old best file)
+                        const response = await fetch('/manage-duplicate', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                                action: 'process_all_duplicates',
+                                best_file_path: duplicateFileName,
+                                group_id: groupId,
+                                folder: selectedFolder
+                            })
+                        });
+                        
+                        if (response.ok) {
+                            // Find and remove the container holding this duplicate group
+                            const duplicateGroup = e.target.closest('.duplicate-group');
+                            if (duplicateGroup) {
+                                duplicateGroup.remove();
+                                
+                                // Update cache stats immediately
+                                const selectedFolder = document.getElementById('folderSelect').value;
+                                if (selectedFolder) {
+                                    loadCacheStats(selectedFolder);
+                                }
+                            } else {
+                                // Fallback: if we can't find the specific group, refresh the page
+                                location.reload();
+                            }
+                        } else {
+                            const data = await response.json();
+                            // Check if it's the specific "No files found for group" error
+                            if (data.error && data.error.includes('No files found for group')) {
+                                // Try to retry the operation once before suggesting refresh
+                                console.log('Group data not ready, retrying in 1 second...');
+                                setTimeout(async () => {
+                                    try {
+                                        const retryResponse = await fetch('/manage-duplicate', {
+                                            method: 'POST',
+                                            headers: {
+                                                'Content-Type': 'application/json',
+                                            },
+                                            body: JSON.stringify({
+                                                action: 'process_all_duplicates',
+                                                best_file_path: duplicateFileName,
+                                                group_id: groupId,
+                                                folder: selectedFolder
+                                            })
+                                        });
+                                        
+                                        if (retryResponse.ok) {
+                                            // Success on retry
+                                            const duplicateGroup = e.target.closest('.duplicate-group');
+                                            if (duplicateGroup) {
+                                                duplicateGroup.remove();
+                                                const selectedFolder = document.getElementById('folderSelect').value;
+                                                if (selectedFolder) {
+                                                    loadCacheStats(selectedFolder);
+                                                }
+                                            } else {
+                                                location.reload();
+                                            }
+                                        } else {
+                                            // Still failed, show user-friendly message
+                                            if (confirm('The group data is not ready yet. This sometimes happens after auto-loading. Would you like to refresh the page to reload the data?')) {
+                                                location.reload();
+                                            }
+                                        }
+                                    } catch (retryError) {
+                                        console.error('Retry failed:', retryError);
+                                        if (confirm('The group data is not ready yet. This sometimes happens after auto-loading. Would you like to refresh the page to reload the data?')) {
+                                            location.reload();
+                                        }
+                                    }
+                                }, 1000);
+                                return; // Exit early to prevent the finally block from re-enabling the button
+                            } else {
+                                alert(`Error processing duplicates: ${data.error}\n\nNote: The best file selection was updated, but processing duplicates failed. You may need to refresh the page.`);
+                            }
+                        }
+                    } catch (error) {
+                        alert(`Error: ${error.message}\n\nNote: The best file selection may have been updated, but processing duplicates failed. You may need to refresh the page.`);
+                    } finally {
+                        // Re-enable button after operation completes
+                        heartBtn.disabled = false;
+                        heartBtn.style.opacity = '1';
+                        heartBtn.style.cursor = 'pointer';
+                    }
+                });
+            }
+            
+            if (deleteBtn && !deleteBtn.hasAttribute('data-listener-added')) {
+                deleteBtn.setAttribute('data-listener-added', 'true');
+                deleteBtn.addEventListener('click', async (e) => {
+                    if (!confirm('Are you sure you want to replace this duplicate with a symlink to the best file?')) {
+                        return;
+                    }
+                    
+                    const bestFile = e.target.dataset.best;
+                    const duplicateFile = e.target.dataset.duplicate;
+                    const selectedFolder = document.getElementById('folderSelect').value;
+                    
+                    try {
+                        const response = await fetch('/manage-duplicate', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                                action: 'delete',
+                                file_path: duplicateFile,
+                                best_file_path: bestFile,
+                                folder: selectedFolder
+                            })
+                        });
+                        
+                        if (response.ok) {
+                            // Find the duplicate group BEFORE removing the element
+                            const duplicateGroup = e.target.closest('.duplicate-group');
+                            console.log('Found duplicate group:', duplicateGroup);
+                            
+                            // Remove the deleted file from the UI
+                            console.log('Removing duplicate file from UI');
+                            e.target.parentElement.remove();
+                            
+                            // Update cache stats immediately
+                            const selectedFolder = document.getElementById('folderSelect').value;
+                            if (selectedFolder) {
+                                loadCacheStats(selectedFolder);
+                            }
+                            
+                            // Check if the group now has no duplicates and remove it if so
+                            if (duplicateGroup) {
+                                // Use setTimeout to ensure DOM is updated before checking
+                                setTimeout(() => {
+                                    console.log('About to check if group is empty...');
+                                    checkAndRemoveEmptyGroup(duplicateGroup);
+                                }, 0);
+                            } else {
+                                console.log('Could not find duplicate group - this should not happen');
+                            }
+                        } else {
+                            const data = await response.json();
+                            alert(`Error: ${data.error}`);
+                        }
+                    } catch (error) {
+                        alert(`Error: ${error.message}`);
+                    }
+                });
+            }
+        }
+
+        // Helper function to add event listener to golden heart button
+        function addGoldenHeartEventListener(goldenHeartBtn) {
+            if (goldenHeartBtn && !goldenHeartBtn.hasAttribute('data-listener-added')) {
+                goldenHeartBtn.setAttribute('data-listener-added', 'true');
+                goldenHeartBtn.addEventListener('click', async (e) => {
+                    // Prevent rapid successive clicks
+                    if (goldenHeartBtn.disabled) {
+                        return;
+                    }
+                    
+                    if (!confirm('Are you sure you want to process all duplicates and keep this as the best file? This will delete all duplicate files and replace them with symlinks.')) {
+                        return;
+                    }
+                    
+                    // Disable button to prevent rapid clicks
+                    goldenHeartBtn.disabled = true;
+                    goldenHeartBtn.style.opacity = '0.6';
+                    goldenHeartBtn.style.cursor = 'not-allowed';
+                    
+                    const bestFile = e.target.dataset.best;
+                    const groupId = e.target.dataset.groupId;
+                    const selectedFolder = document.getElementById('folderSelect').value;
+                    
+                    // Convert absolute path to relative path
+                    // Extract just the filename from the full path
+                    const bestFileName = bestFile.split('/').pop();
+                    
+                    try {
+                        const response = await fetch('/manage-duplicate', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                                action: 'process_all_duplicates',
+                                best_file_path: bestFileName,
+                                group_id: groupId,
+                                folder: selectedFolder
+                            })
+                        });
+                        
+                        if (response.ok) {
+                            // Find and remove the container holding this duplicate group
+                            const duplicateGroup = e.target.closest('.duplicate-group');
+                            if (duplicateGroup) {
+                                duplicateGroup.remove();
+                                
+                                // Update cache stats immediately
+                                const selectedFolder = document.getElementById('folderSelect').value;
+                                if (selectedFolder) {
+                                    loadCacheStats(selectedFolder);
+                                }
+                            } else {
+                                // Fallback: if we can't find the specific group, refresh the page
+                                location.reload();
+                            }
+                        } else {
+                            const data = await response.json();
+                            // Check if it's the specific "No files found for group" error
+                            if (data.error && data.error.includes('No files found for group')) {
+                                // Try to retry the operation once before suggesting refresh
+                                console.log('Group data not ready, retrying in 1 second...');
+                                setTimeout(async () => {
+                                    try {
+                                        const retryResponse = await fetch('/manage-duplicate', {
+                                            method: 'POST',
+                                            headers: {
+                                                'Content-Type': 'application/json',
+                                            },
+                                            body: JSON.stringify({
+                                                action: 'process_all_duplicates',
+                                                best_file_path: bestFileName,
+                                                group_id: groupId,
+                                                folder: selectedFolder
+                                            })
+                                        });
+                                        
+                                        if (retryResponse.ok) {
+                                            // Success on retry
+                                            const duplicateGroup = e.target.closest('.duplicate-group');
+                                            if (duplicateGroup) {
+                                                duplicateGroup.remove();
+                                                const selectedFolder = document.getElementById('folderSelect').value;
+                                                if (selectedFolder) {
+                                                    loadCacheStats(selectedFolder);
+                                                }
+                                            } else {
+                                                location.reload();
+                                            }
+                                        } else {
+                                            // Still failed, show user-friendly message
+                                            if (confirm('The group data is not ready yet. This sometimes happens after auto-loading. Would you like to refresh the page to reload the data?')) {
+                                                location.reload();
+                                            }
+                                        }
+                                    } catch (retryError) {
+                                        console.error('Retry failed:', retryError);
+                                        if (confirm('The group data is not ready yet. This sometimes happens after auto-loading. Would you like to refresh the page to reload the data?')) {
+                                            location.reload();
+                                        }
+                                    }
+                                }, 1000);
+                                return; // Exit early to prevent the finally block from re-enabling the button
+                            } else {
+                                alert(`Error: ${data.error}`);
+                            }
+                        }
+                    } catch (error) {
+                        alert(`Error: ${error.message}`);
+                    } finally {
+                        // Re-enable button after operation completes
+                        goldenHeartBtn.disabled = false;
+                        goldenHeartBtn.style.opacity = '1';
+                        goldenHeartBtn.style.cursor = 'pointer';
+                    }
+                });
+            }
+        }
+
+        // Render duplicate groups
+        function renderDuplicateGroups(duplicates, type, replace = true) {
+            const container = document.getElementById(`${type}-container`);
+            if (!container) {
+                console.error(`Container ${type}-container not found`);
+                return;
+            }
+            
+            console.log(`renderDuplicateGroups: Rendering ${duplicates.length} ${type} groups, replace=${replace}`);
+            
+            // Clear container if replacing
+            if (replace) {
+                container.innerHTML = '';
+            }
+            
+            duplicates.forEach(group => {
+                const groupDiv = document.createElement('div');
+                groupDiv.className = 'duplicate-group';
+                
+                // Use group ID from backend
+                const groupId = group.group_id || 'unknown';
+                
+                // Best file
+                const bestFile = document.createElement('div');
+                bestFile.className = 'best-file-section';
+                bestFile.innerHTML = `
+                    <h3>Best File:</h3>
+                    <div class="media-item">
+                        <a href="${group.best_file.full}" target="_blank">
+                            <div class="image-placeholder">Loading...</div>
+                            <img data-src="${group.best_file.thumb}" alt="Best file">
+                        </a>
+                        <div class="media-info">
+                            <div class="media-filename">${group.best_file.full.split('/').pop()}</div>
+                            <div class="media-details">
+                                <div class="media-detail-row">
+                                    <span class="media-detail-label">Resolution:</span>
+                                    <span class="media-detail-value">${group.best_file.resolution ? (group.best_file.resolution.width || 0) + ' × ' + (group.best_file.resolution.height || 0) : 'Unknown'}</span>
+                                </div>
+                                <div class="media-detail-row">
+                                    <span class="media-detail-label">Size:</span>
+                                    <span class="media-detail-value">${group.best_file.size_formatted}</span>
+                                </div>
+                            </div>
+                        </div>
+                        <button class="golden-heart-btn" 
+                                data-best="${group.best_file.original_path}"
+                                data-group-id="${groupId}"
+                                title="Process all duplicates and keep this as best">💛</button>
+                    </div>
+                `;
+                
+                // Duplicate files
+                const duplicatesDiv = document.createElement('div');
+                duplicatesDiv.className = 'duplicates-section';
+                duplicatesDiv.innerHTML = `
+                    <h3>Duplicates:</h3>
+                    <div class="media-container">
+                        ${group.duplicate_files.map(file => `
+                            <div class="media-item">
+                                ${file.is_exact_match ? `
+                                    <div class="exact-match-container">
+                                        <div class="golden-heart-display">💛</div>
+                                        <div class="exact-match-text">Exact Match</div>
+                                    </div>
+                                ` : `
+                                    <a href="${file.full}" target="_blank">
+                                        <div class="image-placeholder">Loading...</div>
+                                        <img data-src="${file.thumb}" alt="Duplicate file">
+                                    </a>
+                                `}
+                                <div class="media-info">
+                                    <div class="media-filename">${file.full.split('/').pop()}</div>
+                                    <div class="media-details">
+                                        <div class="media-detail-row">
+                                            <span class="media-detail-label">Resolution:</span>
+                                            <span class="media-detail-value">${file.resolution ? (file.resolution.width || 0) + ' × ' + (file.resolution.height || 0) : 'Unknown'}</span>
+                                        </div>
+                                        <div class="media-detail-row">
+                                            <span class="media-detail-label">Size:</span>
+                                            <span class="media-detail-value">${file.size_formatted}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <button class="heart-btn" 
+                                        data-best="${group.best_file.original_path}"
+                                        data-duplicate="${file.original_path}"
+                                        data-group-id="${groupId}"
+                                        title="Set as best file and process all duplicates">❤️</button>
+                                <button class="delete-btn" 
+                                        data-best="${group.best_file.original_path}"
+                                        data-duplicate="${file.original_path}">×</button>
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+                
+                groupDiv.appendChild(bestFile);
+                groupDiv.appendChild(duplicatesDiv);
+                container.appendChild(groupDiv);
+                
+                // Add event listeners to the buttons in this group
+                const goldenHeartBtn = groupDiv.querySelector('.golden-heart-btn');
+                const heartBtns = groupDiv.querySelectorAll('.heart-btn');
+                const deleteBtns = groupDiv.querySelectorAll('.delete-btn');
+                
+                if (goldenHeartBtn) {
+                    addGoldenHeartEventListener(goldenHeartBtn);
+                }
+                
+                heartBtns.forEach(btn => {
+                    addButtonEventListeners(btn, null);
+                });
+                
+                deleteBtns.forEach(btn => {
+                    addButtonEventListeners(null, btn);
+                });
+            });
+            
+            // Start observing images for lazy loading
+            if (replace) {
+                console.log(`renderDuplicateGroups: replace=true, calling observeImages()`);
+                observeImages();
+            } else {
+                console.log(`renderDuplicateGroups: replace=false, setting up lazy loading for new images`);
+                // Ensure observer is initialized and observe new images when appending
+                if (!imageObserver) {
+                    console.log(`renderDuplicateGroups: Initializing lazy loading observer`);
+                    initLazyLoading();
+                }
+                
+                // Get only the newly added images (not all images on the page)
+                const newImages = container.querySelectorAll('img[data-src]');
+                console.log(`renderDuplicateGroups: Found ${newImages.length} new images with data-src attribute`);
+                
+                newImages.forEach((img, index) => {
+                    // Check if image is already visible (in viewport)
+                    const rect = img.getBoundingClientRect();
+                    const isVisible = rect.top < window.innerHeight && rect.bottom > 0;
+                    const src = img.getAttribute('data-src');
+                    
+                    console.log(`renderDuplicateGroups: Image ${index}: src=${src}, visible=${isVisible}, rect=`, rect);
+                    
+                    if (isVisible) {
+                        // Load immediately if already visible
+                        if (src && !loadedImages.has(src)) {
+                            console.log(`renderDuplicateGroups: Loading immediately visible new image: ${src}`);
+                            loadingQueue.push({ img, src });
+                        }
+                    } else {
+                        // Observe for lazy loading if not visible
+                        console.log(`renderDuplicateGroups: Observing image for lazy loading: ${src}`);
+                        imageObserver.observe(img);
+                    }
+                });
+                
+                // Process any immediately visible images
+                if (loadingQueue.length > 0 && !isProcessingQueue) {
+                    console.log(`renderDuplicateGroups: Processing ${loadingQueue.length} images in loading queue`);
+                    processLoadingQueue();
+                }
+            }
+        }
+
+        // Cache management functions
+        async function loadCacheStats(folder) {
+            try {
+                const cacheDetails = document.getElementById('cacheDetails');
+                
+                const encodedFolder = encodeURIComponent(folder);
+                const response = await fetch(`/cache/${encodedFolder}/live-stats`);
+                const stats = await response.json();
+                
+                if (stats.error) {
+                    // Show user-friendly error message
+                    if (cacheDetails) {
+                        cacheDetails.innerHTML = `
+                            <div style="color: #dc3545; text-align: center; padding: 10px;">
+                                <div style="font-weight: 500; margin-bottom: 4px;">Unable to load stats</div>
+                                <div style="font-size: 11px;">Backend unavailable</div>
+                            </div>
+                        `;
+                    }
+                    return;
+                }
+                
+                // Restore the proper cache details structure if it was replaced by error message
+                if (cacheDetails && !document.getElementById('totalCachedFiles')) {
+                    cacheDetails.innerHTML = `
+                        <div style="margin-bottom: 4px;">
+                            <span style="font-weight: 500;">Files Cached:</span> <span id="totalCachedFiles">-</span> 
+                            <span style="margin-left: 12px; font-weight: 500;">Size:</span> <span id="cacheSize">-</span>
+                        </div>
+                        <div style="margin-bottom: 4px;">
+                            <span style="font-weight: 500;">Groups:</span> <span id="totalGroups">-</span> | 
+                            <span style="font-weight: 500;">Duplicates:</span> <span id="duplicateGroups">-</span> | 
+                            <span style="font-weight: 500;">Processed:</span> <span id="processedGroups">-</span>
+                        </div>
+                        <div>
+                            <span style="font-weight: 500;">Remaining Files:</span> <span id="remainingDuplicates">-</span>
+                        </div>
+                        <div style="margin-top: 4px; font-size: 11px; color: #888;">
+                            <span style="font-weight: 500;">Created:</span> <span id="cacheCreated">-</span> | 
+                            <span style="font-weight: 500;">Updated:</span> <span id="cacheUpdated">-</span>
+                        </div>
+                    `;
+                }
+                
+                const created = new Date(stats.created * 1000).toLocaleString();
+                const lastUpdated = new Date(stats.last_updated * 1000).toLocaleString();
+                const cacheSize = stats.cache_size_mb.toFixed(2);
+                
+                // Update all individual cache information elements
+                const totalCachedFiles = document.getElementById('totalCachedFiles');
+                const cacheSizeEl = document.getElementById('cacheSize');
+                const totalGroups = document.getElementById('totalGroups');
+                const duplicateGroups = document.getElementById('duplicateGroups');
+                const processedGroups = document.getElementById('processedGroups');
+                const remainingDuplicates = document.getElementById('remainingDuplicates');
+                const cacheCreated = document.getElementById('cacheCreated');
+                const cacheUpdated = document.getElementById('cacheUpdated');
+                
+                if (totalCachedFiles) totalCachedFiles.textContent = stats.total_cached_files || 0;
+                if (cacheSizeEl) cacheSizeEl.textContent = `${cacheSize} MB`;
+                if (totalGroups) totalGroups.textContent = stats.total_groups || 0;
+                if (duplicateGroups) duplicateGroups.textContent = stats.duplicate_groups || 0;
+                if (processedGroups) processedGroups.textContent = stats.processed_groups || 0;
+                if (remainingDuplicates) remainingDuplicates.textContent = stats.remaining_duplicates || 0;
+                if (cacheCreated) cacheCreated.textContent = created;
+                if (cacheUpdated) cacheUpdated.textContent = lastUpdated;
+                
+                
+            } catch (error) {
+                // Show user-friendly error message
+                const cacheDetails = document.getElementById('cacheDetails');
+                if (cacheDetails) {
+                    cacheDetails.innerHTML = `
+                        <div style="color: #dc3545; text-align: center; padding: 10px;">
+                            <div style="font-weight: 500; margin-bottom: 4px;">Unable to load stats</div>
+                            <div style="font-size: 11px;">Backend unavailable</div>
+                        </div>
+                    `;
+                }
+            }
+        }
+
+        // Start periodic cache updates
+        function startCacheUpdates(folder) {
+            // Clear any existing interval
+            if (cacheUpdateInterval) {
+                clearInterval(cacheUpdateInterval);
+            }
+            
+            currentFolder = folder;
+            
+            // Update immediately
+            loadCacheStats(folder);
+            
+            // Then update every 2 seconds
+            cacheUpdateInterval = setInterval(() => {
+                if (currentFolder === folder) {
+                    loadCacheStats(folder);
+                }
+            }, 2000);
+        }
+        
+        // Stop periodic cache updates
+        function stopCacheUpdates() {
+            if (cacheUpdateInterval) {
+                clearInterval(cacheUpdateInterval);
+                cacheUpdateInterval = null;
+            }
+            currentFolder = null;
+        }
+
+        document.getElementById('clearCacheBtn').addEventListener('click', async (e) => {
+            const folder = document.getElementById('folderSelect').value;
+            if (!folder) return;
+            
+            if (!confirm('Are you sure you want to clear the cache? This will force recalculation of all hashes and automatically rescan the folder to rebuild the cache.')) {
+                return;
+            }
+            
+            try {
+                const encodedFolder = encodeURIComponent(folder);
+                const response = await fetch(`/cache/${encodedFolder}/clear`, {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                
+                if (result.error) {
+                    alert(`Error: ${result.error}`);
+                } else {
+                    console.log('Cache cleared successfully, starting rescan...');
+                    
+                    // Automatically trigger folder scan after cache is cleared
+                    await scanFolder(folder);
+                }
+            } catch (error) {
+                alert(`Error: ${error.message}`);
+            }
+        });
+
+        function startProgressTracking(sessionId) {
+            // Close existing connection
+            if (currentEventSource) {
+                currentEventSource.close();
+            }
+            
+            // Show progress container
+            document.getElementById('progressContainer').style.display = 'block';
+            
+            // Create new EventSource connection
+            currentEventSource = new EventSource(`/progress/${sessionId}`);
+            
+            currentEventSource.onmessage = function(event) {
+                try {
+                    console.log('DEBUG: Received progress data:', event.data);
+                    const progress = JSON.parse(event.data);
+                    console.log('DEBUG: Parsed progress:', progress);
+                    updateProgressDisplay(progress);
+                    
+                    // Close connection when complete or error
+                    if (progress.status === 'complete' || progress.status === 'error') {
+                        currentEventSource.close();
+                        currentEventSource = null;
+                        
+                        // Hide progress after a delay
+                        setTimeout(() => {
+                            document.getElementById('progressContainer').style.display = 'none';
+                        }, 3000);
+                    }
+                } catch (e) {
+                    console.error('Error parsing progress data:', e);
+                }
+            };
+            
+            currentEventSource.onerror = function(event) {
+                console.error('EventSource failed:', event);
+                currentEventSource.close();
+                currentEventSource = null;
+            };
+        }
+
+        function updateProgressDisplay(progress) {
+            console.log('DEBUG: updateProgressDisplay called with:', progress);
+            const progressBar = document.getElementById('progressBar');
+            const progressPercentage = document.getElementById('progressPercentage');
+            const progressMessage = document.getElementById('progressMessage');
+            const progressCount = document.getElementById('progressCount');
+            const progressTitle = document.getElementById('progressTitle');
+            
+            // Update title based on status
+            const statusTitles = {
+                'initializing_cache': 'Initializing Cache...',
+                'scanning': 'Scanning Files...',
+                'hashing': 'Hashing Files...',
+                'grouping': 'Grouping Duplicates...',
+                'auto_eliminating': 'Auto-Eliminating Exact Matches...',
+                'processing': 'Building Results...',
+                'complete': 'Complete!',
+                'error': 'Error'
+            };
+            console.log('DEBUG: Setting title to:', statusTitles[progress.status] || 'Processing...');
+            progressTitle.textContent = statusTitles[progress.status] || 'Processing...';
+            
+            // Calculate percentage
+            let percentage = 0;
+            if (progress.total > 0) {
+                percentage = Math.round((progress.current / progress.total) * 100);
+            } else if (progress.status === 'complete') {
+                percentage = 100;
+            }
+            
+            // Update progress bar
+            progressBar.style.width = `${percentage}%`;
+            progressPercentage.textContent = `${percentage}%`;
+            
+            // Update message and count
+            progressMessage.textContent = progress.message || 'Processing...';
+            if (progress.total > 0) {
+                progressCount.textContent = `${progress.current} / ${progress.total}`;
+            } else {
+                // Indeterminate display when total unknown
+                progressCount.textContent = progress.current > 0 ? progress.current.toString() : '...';
+            }
+            
+            // Update colors based on status
+            if (progress.status === 'error') {
+                progressBar.style.background = 'linear-gradient(90deg, #dc3545, #c82333)';
+                progressTitle.style.color = '#dc3545';
+            } else if (progress.status === 'complete') {
+                progressBar.style.background = 'linear-gradient(90deg, #28a745, #1e7e34)';
+                progressTitle.style.color = '#28a745';
+            } else {
+                progressBar.style.background = 'linear-gradient(90deg, #007bff, #0056b3)';
+                progressTitle.style.color = '#333';
+            }
+            
+            // Update cache stats during processing
+            if (progress.status === 'complete' || progress.status === 'grouping') {
+                const selectedFolder = document.getElementById('folderSelect').value;
+                if (selectedFolder) {
+                    loadCacheStats(selectedFolder);
+                }
+            }
+        }
+
+        // Lazy loading functionality
+        function initLazyLoading() {
+            if (imageObserver) {
+                imageObserver.disconnect();
+            }
+            
+            imageObserver = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        const img = entry.target;
+                        const src = img.getAttribute('data-src');
+                        
+                        console.log(`Image intersecting: ${src}`);
+                        
+                        if (src && !loadedImages.has(src)) {
+                            // Add to loading queue instead of loading immediately
+                            loadingQueue.push({ img, src });
+                            console.log(`Added to loading queue: ${src}`);
+                            
+                            // Stop observing this image
+                            imageObserver.unobserve(img);
+                            
+                            // Process queue if not already processing
+                            if (!isProcessingQueue) {
+                                processLoadingQueue();
+                            }
+                        }
+                    }
+                });
+            }, {
+                rootMargin: '50px 0px', // Start loading 50px before the image comes into view
+                threshold: 0.1
+            });
+        }
+
+        function processLoadingQueue() {
+            console.log(`processLoadingQueue called: isProcessingQueue=${isProcessingQueue}, queueLength=${loadingQueue.length}`);
+            if (isProcessingQueue || loadingQueue.length === 0) {
+                console.log(`processLoadingQueue: Exiting early - isProcessingQueue=${isProcessingQueue}, queueLength=${loadingQueue.length}`);
+                return;
+            }
+            
+            console.log(`Processing loading queue with ${loadingQueue.length} images`);
+            isProcessingQueue = true;
+            
+            const processBatch = () => {
+                const batch = loadingQueue.splice(0, BATCH_SIZE);
+                
+                console.log(`processBatch: Processing batch of ${batch.length} images, remaining in queue: ${loadingQueue.length}`);
+                
+                if (batch.length === 0) {
+                    console.log(`processBatch: No more images to process, setting isProcessingQueue=false`);
+                    isProcessingQueue = false;
+                    return;
+                }
+                
+                console.log(`Processing batch of ${batch.length} images`);
+                
+                batch.forEach(({ img, src }, index) => {
+                    console.log(`processBatch: Processing image ${index + 1}/${batch.length}: ${src}`);
+                    
+                    if (loadedImages.has(src)) {
+                        console.log(`processBatch: Skipping already loaded image: ${src}`);
+                        return; // Skip if already loaded
+                    }
+                    
+                    loadedImages.add(src);
+                    console.log(`processBatch: Loading image: ${src}`);
+                    
+                    // Create a new image to preload
+                    const imageLoader = new Image();
+                    imageLoader.onload = () => {
+                        console.log(`processBatch: Image loaded successfully: ${src}`);
+                        img.src = src;
+                        img.classList.add('loaded');
+                        img.removeAttribute('data-src');
+                        
+                        // Remove placeholder if it exists
+                        const placeholder = img.parentElement.querySelector('.image-placeholder');
+                        if (placeholder) {
+                            placeholder.remove();
+                        }
+                    };
+                    imageLoader.onerror = () => {
+                        console.log(`processBatch: Image failed to load: ${src}`);
+                        // Handle error by showing a placeholder
+                        const placeholder = img.parentElement.querySelector('.image-placeholder');
+                        if (placeholder) {
+                            placeholder.textContent = 'Failed to load';
+                            placeholder.style.background = '#ffebee';
+                            placeholder.style.color = '#c62828';
+                        }
+                    };
+                    console.log(`processBatch: Setting imageLoader.src = ${src}`);
+                    imageLoader.src = src;
+                });
+                
+                // Process next batch after delay
+                if (loadingQueue.length > 0) {
+                    setTimeout(processBatch, BATCH_DELAY);
+                } else {
+                    isProcessingQueue = false;
+                }
+            };
+            
+            processBatch();
+        }
+
+        function observeImages() {
+            if (!imageObserver) {
+                initLazyLoading();
+            }
+            
+            // Clear previous loading queue
+            loadingQueue = [];
+            isProcessingQueue = false;
+            
+            // Observe all images with data-src attribute
+            const imagesToObserve = document.querySelectorAll('img[data-src]');
+            console.log(`Observing ${imagesToObserve.length} images for lazy loading`);
+            
+            imagesToObserve.forEach(img => {
+                // Check if image is already visible (in viewport)
+                const rect = img.getBoundingClientRect();
+                const isVisible = rect.top < window.innerHeight && rect.bottom > 0;
+                
+                if (isVisible) {
+                    // Load immediately if already visible
+                    const src = img.getAttribute('data-src');
+                    if (src && !loadedImages.has(src)) {
+                        console.log(`Loading immediately visible image: ${src}`);
+                        loadingQueue.push({ img, src });
+                    }
+                } else {
+                    // Observe for lazy loading if not visible
+                    if (imageObserver) {
+                        imageObserver.observe(img);
+                    }
+                }
+            });
+            
+            // Process any immediately visible images
+            if (loadingQueue.length > 0 && !isProcessingQueue) {
+                processLoadingQueue();
+            }
+        }
+        
+        function triggerLazyLoadingForVisibleImages() {
+            // Find all images that are currently visible and have data-src
+            const visibleImages = document.querySelectorAll('img[data-src]');
+            console.log(`Triggering lazy loading for ${visibleImages.length} images with data-src`);
+            
+            let visibleCount = 0;
+            visibleImages.forEach(img => {
+                const rect = img.getBoundingClientRect();
+                const isVisible = rect.top < window.innerHeight && rect.bottom > 0;
+                
+                if (isVisible) {
+                    visibleCount++;
+                    const src = img.getAttribute('data-src');
+                    console.log(`Checking visible image: ${src}, already loaded: ${loadedImages.has(src)}`);
+                    if (src && !loadedImages.has(src)) {
+                        loadingQueue.push({ img, src });
+                        console.log(`Added visible image to loading queue: ${src}`);
+                    } else if (src && loadedImages.has(src)) {
+                        console.log(`Skipping already loaded image: ${src}`);
+                    }
+                }
+            });
+            
+            console.log(`Found ${visibleCount} visible images out of ${visibleImages.length} total`);
+            
+            // Process queue if there are visible images
+            if (loadingQueue.length > 0 && !isProcessingQueue) {
+                console.log(`triggerLazyLoadingForVisibleImages: Processing loading queue with ${loadingQueue.length} images`);
+                processLoadingQueue();
+            } else {
+                console.log(`triggerLazyLoadingForVisibleImages: Not processing queue - queueLength=${loadingQueue.length}, isProcessingQueue=${isProcessingQueue}`);
+            }
+        }
+
+        function clearLazyLoading() {
+            // Clear loading queue and stop processing
+            loadingQueue = [];
+            isProcessingQueue = false;
+            loadedImages.clear();
+            
+            // Disconnect observer
+            if (imageObserver) {
+                imageObserver.disconnect();
+                imageObserver = null;
+            }
+        }
+
+        function createLazyImage(src, alt, placeholderText = 'Loading...') {
+            const img = document.createElement('img');
+            img.setAttribute('data-src', src);
+            img.alt = alt;
+            img.className = 'lazy-image';
+            
+            const placeholder = document.createElement('div');
+            placeholder.className = 'image-placeholder';
+            placeholder.textContent = placeholderText;
+            
+            return { img, placeholder };
+        }
+
+        // Pagination functions
+        function loadNextImagePage() {
+            const startIndex = currentImagePage * GROUPS_PER_PAGE;
+            const endIndex = startIndex + GROUPS_PER_PAGE;
+            const pageGroups = allDuplicateImages.slice(startIndex, endIndex);
+            
+            console.log(`loadNextImagePage: Loading ${pageGroups.length} image groups (${startIndex}-${endIndex})`);
+            
+            if (pageGroups.length > 0) {
+                renderDuplicateGroups(pageGroups, 'images', false); // false = append, don't replace
+                currentImagePage++;
+                
+                // Add load more button if there are more groups
+                if (endIndex < allDuplicateImages.length) {
+                    addLoadMoreButton('images');
+                }
+                
+                // Trigger lazy loading for newly added images
+                console.log('loadNextImagePage: Triggering lazy loading for newly added images...');
+                requestAnimationFrame(() => {
+                    setTimeout(() => {
+                        triggerLazyLoadingForVisibleImages();
+                    }, 100);
+                });
+            }
+        }
+
+        function loadNextVideoPage() {
+            const startIndex = currentVideoPage * GROUPS_PER_PAGE;
+            const endIndex = startIndex + GROUPS_PER_PAGE;
+            const pageGroups = allDuplicateVideos.slice(startIndex, endIndex);
+            
+            console.log(`loadNextVideoPage: Loading ${pageGroups.length} video groups (${startIndex}-${endIndex})`);
+            
+            if (pageGroups.length > 0) {
+                renderDuplicateGroups(pageGroups, 'videos', false); // false = append, don't replace
+                currentVideoPage++;
+                
+                // Add load more button if there are more groups
+                if (endIndex < allDuplicateVideos.length) {
+                    addLoadMoreButton('videos');
+                }
+                
+                // Trigger lazy loading for newly added images
+                console.log('loadNextVideoPage: Triggering lazy loading for newly added images...');
+                requestAnimationFrame(() => {
+                    setTimeout(() => {
+                        triggerLazyLoadingForVisibleImages();
+                    }, 100);
+                });
+            }
+        }
+
+        function addLoadMoreButton(type) {
+            const container = document.getElementById(`${type}-container`);
+            const existingButton = container.querySelector('.load-more-btn');
+            
+            if (existingButton) {
+                return; // Button already exists
+            }
+            
+            const loadMoreBtn = document.createElement('button');
+            loadMoreBtn.className = 'load-more-btn';
+            loadMoreBtn.textContent = 'Load More';
+            loadMoreBtn.dataset.type = type; // Add type attribute for the observer
+            loadMoreBtn.style.cssText = `
+                display: block;
+                margin: 20px auto;
+                padding: 10px 20px;
+                background: #007bff;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                cursor: pointer;
+                font-size: 16px;
+            `;
+            
+            // Keep the click handler for manual loading (fallback)
+            loadMoreBtn.addEventListener('click', () => {
+                loadMoreBtn.remove();
+                if (type === 'images') {
+                    loadNextImagePage();
+                } else {
+                    loadNextVideoPage();
+                }
+            });
+            
+            container.appendChild(loadMoreBtn);
+            
+            // Add the button to the intersection observer for automatic loading
+            if (loadMoreObserver) {
+                loadMoreObserver.observe(loadMoreBtn);
+            }
+        }
+    </script>
+</body>
+</html> 
