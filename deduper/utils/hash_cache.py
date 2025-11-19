@@ -262,7 +262,7 @@ class HashCache:
                 continue
                 
             # File was deleted, check for and remove associated thumbnail
-            thumb_path = absolute_path.with_name(f"thumb-deduper.{absolute_path.name}")
+            thumb_path = absolute_path.with_name(f"thumb-deduper.{absolute_path.stem}.jpg")
             if thumb_path.exists():
                 try:
                     thumb_path.unlink()

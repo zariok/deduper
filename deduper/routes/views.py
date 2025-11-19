@@ -1,5 +1,6 @@
 import os
 import urllib.parse
+from pathlib import Path
 from flask import Blueprint, render_template, jsonify, request, send_from_directory, abort, url_for, Response
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import HTTPException
@@ -264,7 +265,8 @@ def manage_duplicate():
                 # Also remove deduper thumbnail if it exists (we'll let the system regenerate it if needed)
                 directory = os.path.dirname(full_file_path)
                 basename = os.path.basename(full_file_path)
-                deduper_thumb_path = os.path.join(directory, f"thumb-deduper.{basename}")
+                basename_stem = Path(basename).stem
+                deduper_thumb_path = os.path.join(directory, f"thumb-deduper.{basename_stem}.jpg")
                 if os.path.exists(deduper_thumb_path):
                     os.remove(deduper_thumb_path)
                 
@@ -469,7 +471,8 @@ def manage_duplicate():
                         
                         # Also remove deduper thumbnail if it exists
                         basename = os.path.basename(file_path)
-                        deduper_thumb_path = os.path.join(duplicate_dir, f"thumb-deduper.{basename}")
+                        basename_stem = Path(basename).stem
+                        deduper_thumb_path = os.path.join(duplicate_dir, f"thumb-deduper.{basename_stem}.jpg")
                         if os.path.exists(deduper_thumb_path):
                             os.remove(deduper_thumb_path)
                         
@@ -534,9 +537,10 @@ def serve_thumbnail(filename):
             # Get the directory and filename parts
             directory = os.path.dirname(filename)
             basename = os.path.basename(filename)
-            deduper_thumb_path = os.path.join(Config.DATA_DIR, directory, f"thumb-deduper.{basename}")
+            basename_stem = Path(basename).stem
+            deduper_thumb_path = os.path.join(Config.DATA_DIR, directory, f"thumb-deduper.{basename_stem}.jpg")
             if os.path.exists(deduper_thumb_path):
-                return send_from_directory(Config.DATA_DIR, os.path.join(directory, f"thumb-deduper.{basename}"))
+                return send_from_directory(Config.DATA_DIR, os.path.join(directory, f"thumb-deduper.{basename_stem}.jpg"))
             else:
                 # Try to generate thumbnail on-demand for videos
                 from deduper.utils.media import extract_video_thumbnail

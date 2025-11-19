@@ -128,7 +128,8 @@ def create_symlink_and_remove_duplicate(duplicate_path: str, best_file_path: str
         # Also remove deduper thumbnail if it exists
         directory = os.path.dirname(duplicate_path)
         basename = os.path.basename(duplicate_path)
-        deduper_thumb_path = os.path.join(directory, f"thumb-deduper.{basename}")
+        basename_stem = Path(basename).stem
+        deduper_thumb_path = os.path.join(directory, f"thumb-deduper.{basename_stem}.jpg")
         if os.path.exists(deduper_thumb_path):
             os.remove(deduper_thumb_path)
         

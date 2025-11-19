@@ -284,7 +284,7 @@ def extract_video_thumbnail(
         logger.debug("Cannot create thumbnail, video missing: %s", video_path)
         return None
 
-    target = source.with_name(f"thumb-deduper.{source.name}")
+    target = source.with_name(f"thumb-deduper.{source.stem}.jpg")
     try:
         if target.exists() and target.stat().st_size > 0:
             # Validate that the existing thumbnail is a valid image
