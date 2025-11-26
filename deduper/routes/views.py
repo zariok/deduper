@@ -12,7 +12,8 @@ from ..services.duplicate_finder import DuplicateFinder
 from ..services.background_scanner import get_background_scanner, ScanStatus
 from ..config import Config
 from ..utils.setup import create_example_folder
-from ..utils.media import extract_video_thumbnail
+from ..utils.media import extract_video_thumbnail, resolve_media_resolution, get_video_duration
+from ..utils.helpers import get_file_size, format_file_size
 from ..utils.hash_cache import HashCache
 from ..utils.logging_config import get_logger
 from ..utils.metrics import metrics, timer, increment_counter, set_gauge
@@ -850,6 +851,41 @@ def get_cached_results(user_folder: str):
         grouping_results = cache_data.get('grouping_results', {})
         best_files = cache_data.get('best_files', {})
 
+        # Helper to get file metadata
+        def get_file_metadata(abs_path: str, is_video: bool) -> dict:
+            """Get resolution, size, and duration metadata for a file."""
+            try:
+                resolution_obj = resolve_media_resolution(
+                    abs_path,
+                    tuple(Config.IMAGE_EXTENSIONS),
+                    tuple(Config.VIDEO_EXTENSIONS)
+                )
+                size = get_file_size(abs_path)
+
+                metadata = {
+                    'resolution': {
+                        'width': resolution_obj.width,
+                        'height': resolution_obj.height,
+                        'label': resolution_obj.label()
+                    },
+                    'size': size,
+                    'size_formatted': format_file_size(size)
+                }
+
+                if is_video:
+                    duration = get_video_duration(abs_path)
+                    metadata['duration'] = duration
+                    metadata['duration_formatted'] = f"{duration:.1f}s" if duration > 0 else "Unknown"
+
+                return metadata
+            except Exception as e:
+                logger.warning(f"Error getting metadata for {abs_path}: {e}")
+                return {
+                    'resolution': {'width': 0, 'height': 0, 'label': 'Unknown'},
+                    'size': 0,
+                    'size_formatted': 'Unknown'
+                }
+
         for rep_path, files in grouping_results.items():
             if len(files) <= 1:
                 continue  # Skip non-duplicate groups
@@ -875,11 +911,12 @@ def get_cached_results(user_folder: str):
             else:
                 best_file_path = abs_files[0]
 
-            # Build group structure
+            # Determine if this is a video group
             is_video = any(best_file_path.lower().endswith(ext) for ext in Config.VIDEO_EXTENSIONS)
 
-            # Get relative paths for URLs
+            # Get relative path and metadata for best file
             best_rel_path = os.path.relpath(best_file_path, folder_path)
+            best_metadata = get_file_metadata(best_file_path, is_video)
 
             group = {
                 'group_id': group_id,
@@ -887,20 +924,34 @@ def get_cached_results(user_folder: str):
                     'path': best_rel_path,
                     'full': url_for('main.serve_file', filename=os.path.join(decoded_folder, best_rel_path)),
                     'thumb': url_for('main.serve_thumbnail', filename=os.path.join(decoded_folder, best_rel_path)),
-                    'original_path': best_rel_path
+                    'original_path': best_rel_path,
+                    **best_metadata
                 },
                 'duplicate_files': []
             }
 
+            # Process duplicate files
             for abs_path in abs_files:
                 if abs_path == best_file_path:
                     continue
+
                 rel_path = os.path.relpath(abs_path, folder_path)
+                dup_metadata = get_file_metadata(abs_path, is_video)
+
+                # Check if this is an exact match
+                is_exact_match = (
+                    dup_metadata['resolution']['width'] == best_metadata['resolution']['width'] and
+                    dup_metadata['resolution']['height'] == best_metadata['resolution']['height'] and
+                    dup_metadata['size'] == best_metadata['size']
+                )
+
                 group['duplicate_files'].append({
                     'path': rel_path,
                     'full': url_for('main.serve_file', filename=os.path.join(decoded_folder, rel_path)),
                     'thumb': url_for('main.serve_thumbnail', filename=os.path.join(decoded_folder, rel_path)),
-                    'original_path': rel_path
+                    'original_path': rel_path,
+                    'is_exact_match': is_exact_match,
+                    **dup_metadata
                 })
 
             if is_video:
