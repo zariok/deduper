@@ -13,16 +13,15 @@ logger = get_logger(__name__)
 
 class HashCache:
     """Manages persistent hash cache for duplicate detection."""
-    
+
     CACHE_VERSION = "1.0"
     CACHE_FILENAME = ".deduper"
-    
-    # Class-level lock for file operations
-    _file_lock = threading.Lock()
-    
+
     def __init__(self, directory_path: str):
         self.directory_path = Path(directory_path).resolve()
         self.cache_file = self.directory_path / self.CACHE_FILENAME
+        # Instance-level lock to prevent contention between different folder operations
+        self._file_lock = threading.Lock()
         self.cache_data = self._load_cache()
         self._last_save_time = 0
         self._save_debounce_seconds = 2  # Minimum time between saves

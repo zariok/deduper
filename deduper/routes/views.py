@@ -9,6 +9,7 @@ import threading
 import time
 from typing import Dict, Any, Optional
 from ..services.duplicate_finder import DuplicateFinder
+from ..services.background_scanner import get_background_scanner, ScanStatus
 from ..config import Config
 from ..utils.setup import create_example_folder
 from ..utils.media import extract_video_thumbnail
@@ -79,19 +80,38 @@ def index():
 def progress_stream(session_id):
     """Stream progress updates via Server-Sent Events."""
     def generate():
+        start_time = time.time()
+        timeout = 300  # 5 minute timeout to prevent infinite loops
+        last_progress_time = time.time()
+        stale_timeout = 60  # Consider progress stale if no updates for 60 seconds
+
         while True:
-            progress = get_progress(session_id)
-            if progress['status'] in ['complete', 'error']:
-                # Send final update and close
-                yield f"data: {json.dumps(progress)}\n\n"
+            # Check for overall timeout
+            if time.time() - start_time > timeout:
+                yield f"data: {json.dumps({'status': 'error', 'message': 'Progress stream timeout'})}\n\n"
                 break
-            else:
-                yield f"data: {json.dumps(progress)}\n\n"
+
+            progress = get_progress(session_id)
+
+            # Check if progress is stale (no updates for too long)
+            progress_timestamp = progress.get('timestamp', 0)
+            if progress_timestamp > 0:
+                if time.time() - progress_timestamp > stale_timeout:
+                    yield f"data: {json.dumps({'status': 'error', 'message': 'Scan appears to have stopped responding'})}\n\n"
+                    break
+                last_progress_time = progress_timestamp
+
+            yield f"data: {json.dumps(progress)}\n\n"
+
+            if progress['status'] in ['complete', 'error']:
+                break
+
             time.sleep(0.5)  # Update every 500ms
-    
+
     return Response(generate(), mimetype='text/event-stream', headers={
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',  # Disable nginx buffering if applicable
         'Access-Control-Allow-Origin': '*'
     })
 
@@ -101,79 +121,94 @@ def scan_folder(user_folder: str):
     """Scan a user folder for duplicates."""
     # URL decode the folder name to handle special characters
     decoded_folder = urllib.parse.unquote(user_folder)
-    
+
     # Get session ID from request headers or generate one
     session_id = request.headers.get('X-Session-ID', f"{decoded_folder}_{int(time.time())}")
-    
+
     # Debug logging
     logger.debug(f"Received folder name: {user_folder}")
     logger.debug(f"Decoded folder name: {decoded_folder}")
     logger.debug(f"Data directory: {Config.DATA_DIR}")
-    
+
     # Security check: ensure the folder name doesn't contain path traversal attempts
     if '..' in decoded_folder or '/' in decoded_folder or '\\' in decoded_folder:
         logger.warning(f"Invalid folder name detected: {decoded_folder}")
         increment_counter('scan_errors', tags={'error': 'invalid_folder_name'})
         return jsonify({'error': 'Invalid folder name'}), 400
-    
+
     folder_path = os.path.join(Config.DATA_DIR, decoded_folder)
     logger.debug(f"Full folder path: {folder_path}")
     logger.debug(f"Folder exists: {os.path.exists(folder_path)}")
-    
+
     if not os.path.exists(folder_path):
         logger.warning(f"Folder not found: {decoded_folder}")
         increment_counter('scan_errors', tags={'error': 'folder_not_found'})
         return jsonify({'error': f'Folder not found: {decoded_folder}'}), 404
-        
+
+    # Check if background scanner is already scanning this folder
+    scanner = get_background_scanner()
+    if scanner and scanner.is_folder_being_scanned(decoded_folder):
+        # Background is already scanning, tell frontend to wait for those results
+        logger.info(f"Background scanner already processing {decoded_folder}, redirecting to wait")
+        return jsonify({
+            'status': 'background_scanning',
+            'message': 'Background scan in progress, please wait',
+            'session_id': session_id
+        }), 202
+
     try:
+        # Mark that user is scanning this folder (prevents background from starting)
+        if scanner:
+            scanner.mark_user_scan_start(decoded_folder)
+
         # Start progress tracking
         increment_counter('scan_requests', tags={'folder': decoded_folder})
         update_progress(session_id, 'scanning', 0, 0, 'Starting scan...')
-        
+
         finder = DuplicateFinder(Config.IMAGE_EXTENSIONS, Config.VIDEO_EXTENSIONS)
         duplicate_images, duplicate_videos = finder.find_duplicates(folder_path, progress_callback=lambda status, current, total, message: update_progress(session_id, status, current, total, message))
-        
+
         # Ensure we have valid lists
         if duplicate_images is None:
             duplicate_images = []
         if duplicate_videos is None:
             duplicate_videos = []
-        
+
         logger.info(f"Found {len(duplicate_images)} image groups and {len(duplicate_videos)} video groups")
-        
+
         # Mark as complete
         update_progress(session_id, 'complete', 100, 100, f'Found {len(duplicate_images)} image groups and {len(duplicate_videos)} video groups')
-        
+
         # Convert file paths to URLs
         def convert_to_urls(duplicates):
             for group in duplicates:
                 # Get the full file URL for best file (path is now relative)
                 best_file_path = group['best_file']['path']
-                full_file = url_for('main.serve_file', 
+                full_file = url_for('main.serve_file',
                     filename=os.path.join(decoded_folder, best_file_path))
-                
+
                 # Get the thumbnail URL for best file
-                thumb_file = url_for('main.serve_thumbnail', 
+                thumb_file = url_for('main.serve_thumbnail',
                     filename=os.path.join(decoded_folder, best_file_path))
-                
+
                 group['best_file'].update({
                     'full': full_file,
                     'thumb': thumb_file,
                     'original_path': group['best_file']['path']  # Keep relative path
                 })
-                
+
                 # Convert duplicate files
                 for duplicate in group['duplicate_files']:
                     duplicate_path = duplicate['path']
                     duplicate.update({
-                        'full': url_for('main.serve_file', 
+                        'full': url_for('main.serve_file',
                             filename=os.path.join(decoded_folder, duplicate_path)),
-                        'thumb': url_for('main.serve_thumbnail', 
+                        'thumb': url_for('main.serve_thumbnail',
                             filename=os.path.join(decoded_folder, duplicate_path)),
                         'original_path': duplicate_path  # Keep relative path
                     })
             return duplicates
-        
+
         return jsonify({
             'duplicate_images': convert_to_urls(duplicate_images),
             'duplicate_videos': convert_to_urls(duplicate_videos),
@@ -182,6 +217,10 @@ def scan_folder(user_folder: str):
     except Exception as e:
         update_progress(session_id, 'error', 0, 0, f'Error: {str(e)}')
         return jsonify({'error': str(e)}), 500
+    finally:
+        # Always mark user scan as complete
+        if scanner:
+            scanner.mark_user_scan_complete(decoded_folder)
 
 @bp.route('/manage-duplicate', methods=['POST'])
 def manage_duplicate():
@@ -578,50 +617,309 @@ def clear_cache(user_folder):
 
 @bp.route('/cache/<path:user_folder>/live-stats')
 def live_cache_stats(user_folder):
-    """Get live cache statistics with real-time updates."""
+    """Get live cache statistics with real-time updates.
+
+    This endpoint uses read-only file access to avoid blocking when a scan is running.
+    """
     try:
         decoded_folder = urllib.parse.unquote(user_folder)
         folder_path = os.path.join(Config.DATA_DIR, decoded_folder)
-        
+
         if not os.path.exists(folder_path):
             return jsonify({'error': f'Folder not found: {decoded_folder}'}), 404
-        
-        cache = HashCache(folder_path)
-        stats = cache.get_cache_stats()
-        
-        # Add additional statistics
-        stats['total_groups'] = 0
-        stats['duplicate_groups'] = 0
-        stats['processed_groups'] = 0
-        stats['remaining_duplicates'] = 0
-        
-        # Count groups from cached grouping results
-        if 'grouping_results' in cache.cache_data:
-            all_groups = cache.cache_data['grouping_results']
-            stats['total_groups'] = len(all_groups)
-            
-            # Count duplicate groups (more than 1 file) and remaining duplicates
-            for group_files in all_groups.values():
-                if len(group_files) > 1:
-                    stats['duplicate_groups'] += 1
-                    # Count non-symlink files as remaining duplicates
-                    for rel_path in group_files:
-                        abs_path = cache._get_absolute_path(rel_path)
-                        if os.path.exists(abs_path) and not os.path.islink(abs_path):
-                            stats['remaining_duplicates'] += 1
-        
-        # Count processed groups
-        if 'groups' in cache.cache_data:
-            for group_data in cache.cache_data['groups'].values():
-                if group_data.get('processed', False):
-                    stats['processed_groups'] += 1
-        
-        # Add timestamp for cache freshness
-        stats['timestamp'] = time.time()
-        
+
+        cache_file = os.path.join(folder_path, '.deduper')
+
+        # Default stats if cache doesn't exist
+        stats = {
+            'total_cached_files': 0,
+            'cache_size_mb': 0,
+            'created': 0,
+            'last_updated': 0,
+            'total_groups': 0,
+            'duplicate_groups': 0,
+            'processed_groups': 0,
+            'remaining_duplicates': 0,
+            'timestamp': time.time()
+        }
+
+        # Read cache file directly without locking (read-only access)
+        if os.path.exists(cache_file):
+            try:
+                # Get file size
+                stats['cache_size_mb'] = os.path.getsize(cache_file) / (1024 * 1024)
+
+                # Read and parse JSON - this is read-only, no lock needed
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+                stats['total_cached_files'] = len(data.get('hashes', {}))
+                stats['created'] = data.get('created', 0)
+                stats['last_updated'] = data.get('last_updated', 0)
+
+                # Count groups from cached grouping results
+                grouping_results = data.get('grouping_results', {})
+                stats['total_groups'] = len(grouping_results)
+
+                # Count duplicate groups and remaining duplicates
+                for group_files in grouping_results.values():
+                    if len(group_files) > 1:
+                        stats['duplicate_groups'] += 1
+                        # Count non-symlink files as remaining duplicates
+                        for rel_path in group_files:
+                            abs_path = os.path.join(folder_path, rel_path)
+                            if os.path.exists(abs_path) and not os.path.islink(abs_path):
+                                stats['remaining_duplicates'] += 1
+
+                # Count processed groups
+                groups = data.get('groups', {})
+                for group_data in groups.values():
+                    if isinstance(group_data, dict) and group_data.get('processed', False):
+                        stats['processed_groups'] += 1
+
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Error reading cache file for stats: {e}")
+                # Return default stats on error
+
         return jsonify(stats)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@bp.route('/scanner/status')
+def scanner_status():
+    """Get the status of the background scanner and all folders."""
+    try:
+        scanner = get_background_scanner()
+        if scanner is None:
+            return jsonify({
+                'running': False,
+                'scanner_state': 'idle',
+                'scanner_message': 'Background scanner not initialized',
+                'current_folder': None,
+                'folders': {}
+            })
+
+        # Get overall scanner status
+        scanner_info = scanner.get_scanner_status()
+        folder_states = scanner.get_all_folder_states()
+
+        # Convert to JSON-serializable format
+        folders_info = {}
+        for folder_name, state in folder_states.items():
+            folders_info[folder_name] = {
+                'status': state.status.value,
+                'last_scan_time': state.last_scan_time,
+                'last_modified_time': state.last_modified_time,
+                'file_count': state.file_count,
+                'error_message': state.error_message,
+                'ready': state.status == ScanStatus.COMPLETE,
+                'scan_progress': state.scan_progress,
+                'scan_total': state.scan_total,
+                'scan_message': state.scan_message
+            }
+
+        return jsonify({
+            'running': scanner.is_running(),
+            'scanner_state': scanner_info['state'],
+            'scanner_message': scanner_info['message'],
+            'current_folder': scanner_info['current_folder'],
+            'next_action_in': scanner_info['next_action_in'],
+            'folders': folders_info
+        })
+    except Exception as e:
+        logger.error(f"Error getting scanner status: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@bp.route('/scanner/folder/<path:user_folder>/status')
+def folder_scan_status(user_folder: str):
+    """Get the background scan status for a specific folder."""
+    try:
+        decoded_folder = urllib.parse.unquote(user_folder)
+        scanner = get_background_scanner()
+
+        if scanner is None:
+            return jsonify({
+                'status': 'unknown',
+                'ready': False,
+                'message': 'Background scanner not running'
+            })
+
+        state = scanner.get_folder_status(decoded_folder)
+
+        if state is None:
+            return jsonify({
+                'status': 'unknown',
+                'ready': False,
+                'message': 'Folder not tracked by background scanner'
+            })
+
+        return jsonify({
+            'status': state.status.value,
+            'ready': state.status == ScanStatus.COMPLETE,
+            'last_scan_time': state.last_scan_time,
+            'file_count': state.file_count,
+            'error_message': state.error_message,
+            'scan_progress': state.scan_progress,
+            'scan_total': state.scan_total,
+            'scan_message': state.scan_message
+        })
+    except Exception as e:
+        logger.error(f"Error getting folder scan status: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@bp.route('/scanner/folder/<path:user_folder>/prioritize', methods=['POST'])
+def prioritize_folder_scan(user_folder: str):
+    """Prioritize a folder for immediate background scanning."""
+    try:
+        decoded_folder = urllib.parse.unquote(user_folder)
+        scanner = get_background_scanner()
+
+        if scanner is None:
+            return jsonify({
+                'success': False,
+                'message': 'Background scanner not running'
+            })
+
+        scanner.prioritize_folder(decoded_folder)
+
+        return jsonify({
+            'success': True,
+            'message': f'Folder {decoded_folder} prioritized for scanning'
+        })
+    except Exception as e:
+        logger.error(f"Error prioritizing folder: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@bp.route('/cached-results/<path:user_folder>')
+@timer('cached_results')
+def get_cached_results(user_folder: str):
+    """Get cached duplicate results without triggering a new scan.
+
+    This endpoint returns results from the cache if available,
+    making initial page loads fast when the background scanner has pre-scanned.
+    """
+    try:
+        decoded_folder = urllib.parse.unquote(user_folder)
+        folder_path = os.path.join(Config.DATA_DIR, decoded_folder)
+
+        if not os.path.exists(folder_path):
+            return jsonify({'error': f'Folder not found: {decoded_folder}'}), 404
+
+        # Check if background scanner has this folder ready
+        scanner = get_background_scanner()
+        is_ready = scanner and scanner.is_folder_ready(decoded_folder)
+
+        cache_file = os.path.join(folder_path, '.deduper')
+        if not os.path.exists(cache_file):
+            return jsonify({
+                'cached': False,
+                'ready': False,
+                'message': 'No cache available, scan required'
+            })
+
+        # Read cached results
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Error reading cache file: {e}")
+            return jsonify({
+                'cached': False,
+                'ready': False,
+                'message': 'Cache file corrupted or unreadable'
+            })
+
+        # Check if we have grouping results
+        if 'grouping_results' not in cache_data:
+            return jsonify({
+                'cached': False,
+                'ready': is_ready,
+                'message': 'Cache exists but no grouping results available'
+            })
+
+        # Build the duplicate groups from cached data
+        cache = HashCache(folder_path)
+        duplicate_images = []
+        duplicate_videos = []
+
+        # Process cached groups
+        grouping_results = cache_data.get('grouping_results', {})
+        best_files = cache_data.get('best_files', {})
+
+        for rep_path, files in grouping_results.items():
+            if len(files) <= 1:
+                continue  # Skip non-duplicate groups
+
+            # Convert relative paths to absolute
+            abs_files = []
+            for rel_path in files:
+                abs_path = os.path.join(folder_path, rel_path)
+                # Skip symlinks and non-existent files
+                if os.path.exists(abs_path) and not os.path.islink(abs_path):
+                    abs_files.append(abs_path)
+
+            if len(abs_files) <= 1:
+                continue  # No longer a duplicate group after filtering
+
+            # Determine best file
+            group_id = cache._generate_group_id_from_files(abs_files)
+            best_file_path = best_files.get(group_id)
+            if best_file_path:
+                best_file_path = os.path.join(folder_path, best_file_path)
+                if not os.path.exists(best_file_path) or os.path.islink(best_file_path):
+                    best_file_path = abs_files[0]
+            else:
+                best_file_path = abs_files[0]
+
+            # Build group structure
+            is_video = any(best_file_path.lower().endswith(ext) for ext in Config.VIDEO_EXTENSIONS)
+
+            # Get relative paths for URLs
+            best_rel_path = os.path.relpath(best_file_path, folder_path)
+
+            group = {
+                'group_id': group_id,
+                'best_file': {
+                    'path': best_rel_path,
+                    'full': url_for('main.serve_file', filename=os.path.join(decoded_folder, best_rel_path)),
+                    'thumb': url_for('main.serve_thumbnail', filename=os.path.join(decoded_folder, best_rel_path)),
+                    'original_path': best_rel_path
+                },
+                'duplicate_files': []
+            }
+
+            for abs_path in abs_files:
+                if abs_path == best_file_path:
+                    continue
+                rel_path = os.path.relpath(abs_path, folder_path)
+                group['duplicate_files'].append({
+                    'path': rel_path,
+                    'full': url_for('main.serve_file', filename=os.path.join(decoded_folder, rel_path)),
+                    'thumb': url_for('main.serve_thumbnail', filename=os.path.join(decoded_folder, rel_path)),
+                    'original_path': rel_path
+                })
+
+            if is_video:
+                duplicate_videos.append(group)
+            else:
+                duplicate_images.append(group)
+
+        return jsonify({
+            'cached': True,
+            'ready': is_ready,
+            'duplicate_images': duplicate_images,
+            'duplicate_videos': duplicate_videos,
+            'last_updated': cache_data.get('last_updated', 0)
+        })
+
+    except Exception as e:
+        logger.error(f"Error getting cached results: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
 
 @bp.errorhandler(Exception)
 def handle_error(e):

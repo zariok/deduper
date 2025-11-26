@@ -280,10 +280,84 @@
             font-size: 18px;
             color: #666;
         }
-        
+
+        /* Background Scanner Status Widget */
+        .scanner-status-widget {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+            padding: 10px 14px;
+            font-size: 12px;
+            z-index: 1000;
+            min-width: 200px;
+            max-width: 280px;
+        }
+        .scanner-status-widget .scanner-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 6px;
+            font-weight: 600;
+            color: #333;
+        }
+        .scanner-status-widget .scanner-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .scanner-status-widget .scanner-indicator.scanning {
+            background: #28a745;
+            animation: pulse-green 1.5s infinite;
+        }
+        .scanner-status-widget .scanner-indicator.sleeping {
+            background: #6c757d;
+        }
+        .scanner-status-widget .scanner-indicator.waiting {
+            background: #ffc107;
+            animation: pulse-yellow 2s infinite;
+        }
+        .scanner-status-widget .scanner-indicator.idle {
+            background: #17a2b8;
+        }
+        @keyframes pulse-green {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        @keyframes pulse-yellow {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        .scanner-status-widget .scanner-folder {
+            color: #666;
+            margin-bottom: 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .scanner-status-widget .scanner-message {
+            color: #888;
+            font-size: 11px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
     </style>
 </head>
 <body>
+    <!-- Background Scanner Status Widget -->
+    <div class="scanner-status-widget" id="scannerStatusWidget">
+        <div class="scanner-header">
+            <span class="scanner-indicator idle" id="scannerIndicator"></span>
+            <span id="scannerStateText">Background Scan</span>
+        </div>
+        <div class="scanner-folder" id="scannerFolder">Initializing...</div>
+        <div class="scanner-message" id="scannerMessage"></div>
+    </div>
     <h1>Media Deduplicator</h1>
     
     {% if error %}
@@ -377,21 +451,101 @@
         let isProcessingQueue = false;
         const BATCH_SIZE = 10; // Load 10 images at a time
         const BATCH_DELAY = 100; // 100ms delay between batches
-        
+
         // Pagination variables
         let allDuplicateImages = [];
         let allDuplicateVideos = [];
         let currentImagePage = 0;
         let currentVideoPage = 0;
         const GROUPS_PER_PAGE = 5; // Load 5 groups at a time
-        
+
         // Cache update variables
         let cacheUpdateInterval = null;
         let currentFolder = null;
-        
+
+        // Background scanner status update interval
+        let scannerStatusInterval = null;
+
         // Load more button observer
         let loadMoreObserver = null;
         let isLoadingMore = false; // Prevent rapid successive loads
+
+        // Start polling for background scanner status
+        function startScannerStatusUpdates() {
+            // Update immediately
+            updateScannerStatus();
+
+            // Then update every 2 seconds
+            if (scannerStatusInterval) {
+                clearInterval(scannerStatusInterval);
+            }
+            scannerStatusInterval = setInterval(updateScannerStatus, 2000);
+        }
+
+        // Stop polling for scanner status
+        function stopScannerStatusUpdates() {
+            if (scannerStatusInterval) {
+                clearInterval(scannerStatusInterval);
+                scannerStatusInterval = null;
+            }
+        }
+
+        // Update the scanner status widget
+        async function updateScannerStatus() {
+            try {
+                const response = await fetch('/scanner/status');
+                const data = await response.json();
+
+                const indicator = document.getElementById('scannerIndicator');
+                const stateText = document.getElementById('scannerStateText');
+                const folderText = document.getElementById('scannerFolder');
+                const messageText = document.getElementById('scannerMessage');
+
+                // Update indicator color based on state
+                indicator.className = 'scanner-indicator ' + data.scanner_state;
+
+                // Update state text
+                const stateLabels = {
+                    'scanning': 'Scanning',
+                    'sleeping': 'Sleeping',
+                    'waiting': 'Waiting',
+                    'idle': 'Idle'
+                };
+                stateText.textContent = 'Background: ' + (stateLabels[data.scanner_state] || data.scanner_state);
+
+                // Update folder/status text
+                if (data.scanner_state === 'scanning' && data.current_folder) {
+                    folderText.textContent = 'Folder: ' + data.current_folder;
+                    // Get progress for current folder
+                    const folderInfo = data.folders[data.current_folder];
+                    if (folderInfo && folderInfo.scan_message) {
+                        messageText.textContent = folderInfo.scan_message;
+                    } else {
+                        messageText.textContent = data.scanner_message;
+                    }
+                } else if (data.scanner_state === 'sleeping') {
+                    folderText.textContent = 'All folders up to date';
+                    messageText.textContent = '';
+                } else if (data.scanner_state === 'waiting') {
+                    folderText.textContent = data.scanner_message;
+                    if (data.next_action_in > 0) {
+                        messageText.textContent = 'Next check in ' + Math.round(data.next_action_in) + 's';
+                    } else {
+                        messageText.textContent = '';
+                    }
+                } else {
+                    folderText.textContent = data.scanner_message || 'Initializing...';
+                    messageText.textContent = '';
+                }
+            } catch (error) {
+                console.error('Error updating scanner status:', error);
+            }
+        }
+
+        // Start scanner status updates on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            startScannerStatusUpdates();
+        });
 
         // Initialize load more button observer
         function initLoadMoreObserver() {
@@ -436,15 +590,81 @@
         window.addEventListener('load', () => {
             // Initialize the load more observer
             initLoadMoreObserver();
-            
+
             const savedFolder = localStorage.getItem('selectedFolder');
             if (savedFolder) {
                 const folderSelect = document.getElementById('folderSelect');
                 folderSelect.value = savedFolder;
-                // Trigger the change event to rescan the folder
-                folderSelect.dispatchEvent(new Event('change'));
+                // Try to load cached results first for instant display
+                loadCachedOrScan(savedFolder);
             }
         });
+
+        // Try to load cached results, fall back to full scan if not available
+        async function loadCachedOrScan(folder) {
+            // Save folder selection to localStorage
+            localStorage.setItem('selectedFolder', folder);
+
+            // Show cache controls and start periodic updates
+            document.getElementById('cacheControls').style.display = 'block';
+            startCacheUpdates(folder);
+
+            // Reinitialize load more observer
+            initLoadMoreObserver();
+
+            try {
+                // First, try to get cached results (instant load)
+                const encodedFolder = encodeURIComponent(folder);
+                const cachedResponse = await fetch(`/cached-results/${encodedFolder}`);
+                const cachedData = await cachedResponse.json();
+
+                if (cachedData.cached && cachedData.duplicate_images) {
+                    console.log('Loading from cache - instant display');
+
+                    // Display cached results immediately
+                    allDuplicateImages = cachedData.duplicate_images || [];
+                    allDuplicateVideos = cachedData.duplicate_videos || [];
+                    currentImagePage = 0;
+                    currentVideoPage = 0;
+
+                    document.getElementById('duplicate-content').style.display = 'block';
+
+                    const imagesContainer = document.getElementById('images-container');
+                    imagesContainer.innerHTML = allDuplicateImages.length ? '' : '<p>No duplicate images found.</p>';
+
+                    const videosContainer = document.getElementById('videos-container');
+                    videosContainer.innerHTML = allDuplicateVideos.length ? '' : '<p>No duplicate videos found.</p>';
+
+                    loadNextImagePage();
+                    loadNextVideoPage();
+
+                    // Trigger lazy loading
+                    requestAnimationFrame(() => {
+                        setTimeout(() => {
+                            triggerLazyLoadingForVisibleImages();
+                        }, 200);
+                    });
+
+                    // If cache is stale or not ready, trigger background rescan
+                    if (!cachedData.ready) {
+                        console.log('Cache available but may be stale, triggering background scan');
+                        // Prioritize this folder in background scanner
+                        fetch(`/scanner/folder/${encodedFolder}/prioritize`, { method: 'POST' });
+                    }
+
+                    return;
+                }
+
+                // No cached results available, do a full scan
+                console.log('No cache available, performing full scan');
+                await scanFolder(folder);
+
+            } catch (error) {
+                console.error('Error loading cached results:', error);
+                // Fall back to full scan
+                await scanFolder(folder);
+            }
+        }
         
         // Cleanup on page unload
         window.addEventListener('beforeunload', () => {
@@ -492,28 +712,28 @@
         async function scanFolder(folder) {
             // Save folder selection to localStorage
             localStorage.setItem('selectedFolder', folder);
-            
+
             // Clear lazy loading state for new scan
             loadedImages.clear();
             loadingQueue = [];
             isProcessingQueue = false;
-            
+
             // Show cache controls and start periodic updates
             document.getElementById('cacheControls').style.display = 'block';
             startCacheUpdates(folder);
-            
+
             // Reinitialize load more observer for new folder
             initLoadMoreObserver();
-            
+
             // Hide duplicate content until scan is complete
             document.getElementById('duplicate-content').style.display = 'none';
-            
+
             // Generate a session ID on the frontend side
             const sessionId = `${folder}_${Date.now()}`;
-            
+
             // Start progress tracking immediately, before making the scan request
             startProgressTracking(sessionId);
-            
+
             try {
                 // URL encode the folder name to handle special characters
                 const encodedFolder = encodeURIComponent(folder);
@@ -523,7 +743,20 @@
                     }
                 });
                 const data = await response.json();
-                
+
+                // Check if background scanner is already processing this folder
+                if (response.status === 202 && data.status === 'background_scanning') {
+                    console.log('Background scanner is processing this folder, waiting for results...');
+                    // Show a message and poll for cached results
+                    document.getElementById('duplicate-content').style.display = 'block';
+                    document.getElementById('images-container').innerHTML = '<p>Background scan in progress. Results will appear shortly...</p>';
+                    document.getElementById('videos-container').innerHTML = '';
+
+                    // Poll for cached results
+                    await waitForBackgroundScan(folder);
+                    return;
+                }
+
                 // Store all data for pagination
                 allDuplicateImages = data.duplicate_images || [];
                 allDuplicateVideos = data.duplicate_videos || [];
@@ -597,8 +830,9 @@
                 clearFolderSelection();
                 return;
             }
-            
-            await scanFolder(folder);
+
+            // Use cached results if available, otherwise full scan
+            await loadCachedOrScan(folder);
         });
 
         // Helper function to check if a group has remaining duplicates and remove it if not
@@ -1206,12 +1440,12 @@
             // Update immediately
             loadCacheStats(folder);
             
-            // Then update every 2 seconds
+            // Then update every 5 seconds (reduced from 2s to minimize backend load)
             cacheUpdateInterval = setInterval(() => {
                 if (currentFolder === folder) {
                     loadCacheStats(folder);
                 }
-            }, 2000);
+            }, 5000);
         }
         
         // Stop periodic cache updates
@@ -1251,15 +1485,84 @@
             }
         });
 
+        // Wait for background scan to complete by polling for cached results
+        async function waitForBackgroundScan(folder) {
+            const encodedFolder = encodeURIComponent(folder);
+            const maxAttempts = 120; // 2 minutes max wait
+            let attempts = 0;
+
+            while (attempts < maxAttempts) {
+                await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+                attempts++;
+
+                try {
+                    // Check if background scan is still running
+                    const statusResponse = await fetch(`/scanner/folder/${encodedFolder}/status`);
+                    const statusData = await statusResponse.json();
+
+                    // Update progress display
+                    if (statusData.status === 'scanning') {
+                        document.getElementById('images-container').innerHTML =
+                            `<p>Background scan in progress: ${statusData.scan_message || 'Processing...'}</p>`;
+                    }
+
+                    // If scan is complete, fetch cached results
+                    if (statusData.status === 'complete' || statusData.ready) {
+                        const cachedResponse = await fetch(`/cached-results/${encodedFolder}`);
+                        const cachedData = await cachedResponse.json();
+
+                        if (cachedData.cached) {
+                            // Display the results
+                            allDuplicateImages = cachedData.duplicate_images || [];
+                            allDuplicateVideos = cachedData.duplicate_videos || [];
+                            currentImagePage = 0;
+                            currentVideoPage = 0;
+
+                            const imagesContainer = document.getElementById('images-container');
+                            imagesContainer.innerHTML = allDuplicateImages.length ? '' : '<p>No duplicate images found.</p>';
+
+                            const videosContainer = document.getElementById('videos-container');
+                            videosContainer.innerHTML = allDuplicateVideos.length ? '' : '<p>No duplicate videos found.</p>';
+
+                            loadNextImagePage();
+                            loadNextVideoPage();
+
+                            // Trigger lazy loading
+                            requestAnimationFrame(() => {
+                                setTimeout(() => {
+                                    triggerLazyLoadingForVisibleImages();
+                                }, 200);
+                            });
+
+                            return;
+                        }
+                    }
+
+                    // If error, show message and stop
+                    if (statusData.status === 'error') {
+                        document.getElementById('images-container').innerHTML =
+                            `<p class="error">Background scan error: ${statusData.error_message}</p>`;
+                        return;
+                    }
+                } catch (error) {
+                    console.error('Error polling for background scan:', error);
+                }
+            }
+
+            // Timeout - scan took too long
+            document.getElementById('images-container').innerHTML =
+                '<p class="error">Background scan is taking longer than expected. Please try again.</p>';
+        }
+
         function startProgressTracking(sessionId) {
             // Close existing connection
             if (currentEventSource) {
                 currentEventSource.close();
             }
-            
+
             // Show progress container
             document.getElementById('progressContainer').style.display = 'block';
-            
+
             // Create new EventSource connection
             currentEventSource = new EventSource(`/progress/${sessionId}`);
             
