@@ -25,12 +25,15 @@ class DuplicateFinder:
         try:
             logger.info(f"Starting duplicate detection in: {folder_path}")
             increment_counter('duplicate_detection_started')
-            
+
             if progress_callback:
                 progress_callback('initializing_cache', 0, 0, 'Initializing cache...')
-            
+
             # Initialize hash cache
+            logger.debug(f"Creating HashCache for: {folder_path}")
             cache = HashCache(folder_path)
+            logger.debug(f"HashCache created, getting stats...")
+
             cache_stats = cache.get_cache_stats()
             logger.info(f"Cache stats: {cache_stats['total_cached_files']} files cached, {cache_stats['cache_size_mb']:.2f} MB")
             

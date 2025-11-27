@@ -29,6 +29,7 @@ class HashCache:
     def _load_cache(self) -> Dict[str, Any]:
         """Load cache from .deduper file."""
         if not self.cache_file.exists():
+            logger.debug(f"No cache file exists at {self.cache_file}, creating new cache")
             return {
                 "version": self.CACHE_VERSION,
                 "created": time.time(),
@@ -36,20 +37,27 @@ class HashCache:
                 "hashes": {},
                 "file_stats": {}
             }
-        
+
+        logger.debug(f"Loading cache file: {self.cache_file}")
+        file_size = self.cache_file.stat().st_size if self.cache_file.exists() else 0
+        logger.debug(f"Cache file size: {file_size / 1024 / 1024:.2f} MB")
+
         with self._file_lock:
             try:
+                load_start = time.time()
                 with open(self.cache_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                
+                load_time = time.time() - load_start
+                logger.debug(f"Cache JSON parsed in {load_time:.2f}s, {len(data.get('hashes', {}))} hashes")
+
                 # Validate cache version
                 if data.get("version") != self.CACHE_VERSION:
                     logger.info(f"Cache version mismatch, creating new cache")
                     return self._create_empty_cache()
-                
+
                 # Migrate old cache format if needed
                 self._migrate_cache_format(data)
-                
+
                 return data
             except (json.JSONDecodeError, KeyError, OSError) as e:
                 logger.warning(f"Error loading cache: {e}, creating new cache")

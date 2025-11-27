@@ -571,9 +571,11 @@ class BackgroundScanner:
         def run_scan():
             """Worker function to run the actual scan."""
             try:
-                scanner_log('debug', f"Worker thread started for: {folder_name}")
+                scanner_log('info', f"[{folder_name}] Worker thread STARTED")
 
-                # Create progress callback that updates state
+                # Create progress callback that updates state and logs
+                last_log_time = [time.time()]  # Use list to allow modification in nested function
+
                 def progress_callback(status: str, current: int, total: int, message: str):
                     with self._lock:
                         folder_state = self._folder_states.get(folder_name)
@@ -584,20 +586,27 @@ class BackgroundScanner:
 
                         self._state_message = f"{folder_name}: {message}"
 
-                    # Log progress periodically
-                    if current > 0 and current % 100 == 0:
-                        scanner_log('debug', f"Progress [{folder_name}]: {status} - {current}/{total} - {message}")
+                    # Log progress periodically (every 100 items OR every 30 seconds)
+                    now = time.time()
+                    should_log = (current > 0 and current % 100 == 0) or (now - last_log_time[0] > 30)
 
-                        # Forward to registered callback if any
-                        callback = self._progress_callbacks.get(folder_name)
-                        if callback:
-                            try:
-                                callback(status, current, total, message)
-                            except Exception as e:
-                                logger.warning(f"Error in progress callback: {e}")
+                    if should_log:
+                        last_log_time[0] = now
+                        scanner_log('info', f"[{folder_name}] Progress: {status} - {current}/{total} - {message}")
+
+                    # Forward to registered callback if any
+                    callback = self._progress_callbacks.get(folder_name)
+                    if callback:
+                        try:
+                            callback(status, current, total, message)
+                        except Exception as e:
+                            logger.warning(f"Error in progress callback: {e}")
 
                 # Run the duplicate finder
+                scanner_log('info', f"[{folder_name}] Creating DuplicateFinder...")
                 finder = DuplicateFinder(self.image_extensions, self.video_extensions)
+
+                scanner_log('info', f"[{folder_name}] Calling find_duplicates()...")
                 duplicate_images, duplicate_videos = finder.find_duplicates(
                     folder_path,
                     progress_callback=progress_callback
@@ -606,7 +615,7 @@ class BackgroundScanner:
                 scan_result['success'] = True
                 scan_result['images'] = duplicate_images
                 scan_result['videos'] = duplicate_videos
-                scanner_log('debug', f"Worker thread completed successfully for: {folder_name}")
+                scanner_log('info', f"[{folder_name}] Worker thread COMPLETED successfully")
 
             except Exception as e:
                 scan_result['error'] = str(e)
@@ -620,8 +629,21 @@ class BackgroundScanner:
         worker = threading.Thread(target=run_scan, name=f"ScanWorker-{folder_name}", daemon=True)
         worker.start()
 
-        # Wait for completion with timeout
-        completed = scan_complete.wait(timeout=self.SCAN_TIMEOUT_SECONDS)
+        # Watchdog: log status every 60 seconds while waiting
+        start_time = time.time()
+        while not scan_complete.wait(timeout=60):
+            elapsed = time.time() - start_time
+            if elapsed >= self.SCAN_TIMEOUT_SECONDS:
+                break
+            # Log watchdog status
+            with self._lock:
+                state = self._folder_states.get(folder_name)
+                if state:
+                    scanner_log('info', f"[{folder_name}] WATCHDOG: Still running after {int(elapsed)}s - "
+                                       f"Progress: {state.scan_progress}/{state.scan_total} - {state.scan_message}")
+
+        # Check if we timed out or completed
+        completed = scan_complete.is_set()
 
         if not completed:
             # Scan timed out
