@@ -3,12 +3,16 @@ import json
 import time
 import hashlib
 import threading
+import signal
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any, List, Set
 from .logging_config import get_logger
 from .media import get_image_hash
 
 logger = get_logger(__name__)
+
+# Timeout for cache file operations (in seconds)
+CACHE_LOAD_TIMEOUT = 60
 
 
 class HashCache:
@@ -27,28 +31,47 @@ class HashCache:
         self._save_debounce_seconds = 2  # Minimum time between saves
     
     def _load_cache(self) -> Dict[str, Any]:
-        """Load cache from .deduper file."""
-        if not self.cache_file.exists():
-            logger.debug(f"No cache file exists at {self.cache_file}, creating new cache")
-            return {
-                "version": self.CACHE_VERSION,
-                "created": time.time(),
-                "last_updated": time.time(),
-                "hashes": {},
-                "file_stats": {}
-            }
+        """Load cache from .deduper file with timeout protection."""
+        logger.info(f"HashCache._load_cache() called for: {self.directory_path}")
 
-        logger.debug(f"Loading cache file: {self.cache_file}")
-        file_size = self.cache_file.stat().st_size if self.cache_file.exists() else 0
-        logger.debug(f"Cache file size: {file_size / 1024 / 1024:.2f} MB")
+        try:
+            cache_exists = self.cache_file.exists()
+            logger.debug(f"Cache file exists check complete: {cache_exists}")
+        except Exception as e:
+            logger.warning(f"Error checking if cache file exists: {e}")
+            return self._create_empty_cache()
+
+        if not cache_exists:
+            logger.debug(f"No cache file exists at {self.cache_file}, creating new cache")
+            return self._create_empty_cache()
+
+        # Get file size with timeout protection
+        try:
+            logger.debug(f"Getting cache file size...")
+            file_size = self.cache_file.stat().st_size
+            logger.info(f"Cache file size: {file_size / 1024 / 1024:.2f} MB ({file_size} bytes)")
+
+            # Warn if cache file is very large
+            if file_size > 50 * 1024 * 1024:  # 50MB
+                logger.warning(f"Cache file is very large ({file_size / 1024 / 1024:.1f} MB), loading may be slow")
+        except Exception as e:
+            logger.warning(f"Error getting cache file size: {e}")
+            file_size = 0
 
         with self._file_lock:
             try:
                 load_start = time.time()
+                logger.debug(f"Opening cache file for reading...")
+
                 with open(self.cache_file, 'r', encoding='utf-8') as f:
+                    logger.debug(f"File opened, parsing JSON...")
                     data = json.load(f)
+
                 load_time = time.time() - load_start
-                logger.debug(f"Cache JSON parsed in {load_time:.2f}s, {len(data.get('hashes', {}))} hashes")
+                hash_count = len(data.get('hashes', {}))
+                logger.info(f"Cache loaded in {load_time:.2f}s: {hash_count} hashes, "
+                           f"{len(data.get('file_stats', {}))} file stats, "
+                           f"{len(data.get('grouping_results', {}))} groups")
 
                 # Validate cache version
                 if data.get("version") != self.CACHE_VERSION:
@@ -59,16 +82,28 @@ class HashCache:
                 self._migrate_cache_format(data)
 
                 return data
-            except (json.JSONDecodeError, KeyError, OSError) as e:
-                logger.warning(f"Error loading cache: {e}, creating new cache")
-                # Try to remove corrupted cache file
-                try:
-                    if self.cache_file.exists():
-                        self.cache_file.unlink()
-                        logger.info("Removed corrupted cache file")
-                except OSError:
-                    pass
+
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error loading cache: {e}")
+                self._try_remove_corrupted_cache()
                 return self._create_empty_cache()
+
+            except OSError as e:
+                logger.error(f"OS error loading cache: {e}")
+                return self._create_empty_cache()
+
+            except Exception as e:
+                logger.error(f"Unexpected error loading cache: {type(e).__name__}: {e}")
+                return self._create_empty_cache()
+
+    def _try_remove_corrupted_cache(self):
+        """Try to remove a corrupted cache file."""
+        try:
+            if self.cache_file.exists():
+                self.cache_file.unlink()
+                logger.info("Removed corrupted cache file")
+        except OSError as e:
+            logger.warning(f"Could not remove corrupted cache file: {e}")
     
     def _migrate_cache_format(self, data: Dict[str, Any]):
         """Migrate old cache format to new format."""
