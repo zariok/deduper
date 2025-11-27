@@ -1,6 +1,7 @@
+import os
 import sys
 import atexit
-from flask import Flask, request
+from flask import Flask
 from .config import config, Config
 from .utils.media import check_all_requirements
 from .utils.logging_config import setup_logging, configure_flask_logging, get_logger
@@ -50,6 +51,14 @@ def create_app(config_name='default'):
 
 def _start_background_scanner(app: Flask):
     """Start the background scanner service."""
+    # When Flask runs with debug=True and use_reloader=True (the default),
+    # it spawns two processes: a parent reloader process and a child worker.
+    # Only start the background scanner in the worker process.
+    # The worker process has WERKZEUG_RUN_MAIN set to "true".
+    if app.debug and os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+        logger.debug("Skipping background scanner in reloader process")
+        return
+
     try:
         data_dir = str(Config.DATA_DIR)
         image_extensions = Config.IMAGE_EXTENSIONS
