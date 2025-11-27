@@ -78,8 +78,11 @@ class HashCache:
                     logger.info(f"Cache version mismatch, creating new cache")
                     return self._create_empty_cache()
 
-                # Migrate old cache format if needed
-                self._migrate_cache_format(data)
+                # Check for old cache format and delete if found
+                if self._is_old_cache_format(data):
+                    logger.info("Old cache format detected (tuple-based file_stats), deleting and starting fresh")
+                    self._try_remove_corrupted_cache()
+                    return self._create_empty_cache()
 
                 return data
 
@@ -105,21 +108,12 @@ class HashCache:
         except OSError as e:
             logger.warning(f"Could not remove corrupted cache file: {e}")
     
-    def _migrate_cache_format(self, data: Dict[str, Any]):
-        """Migrate old cache format to new format."""
-        migrated = False
+    def _is_old_cache_format(self, data: Dict[str, Any]) -> bool:
+        """Check if cache uses old tuple format for file_stats."""
         for relative_path, stats in data.get("file_stats", {}).items():
             if isinstance(stats, (list, tuple)) and len(stats) == 2:
-                # Old format: (mtime, size) -> New format: {"mtime": mtime, "size": size}
-                mtime, size = stats
-                data["file_stats"][relative_path] = {"mtime": mtime, "size": size}
-                migrated = True
-        
-        if migrated:
-            logger.info("Migrated cache format from tuple to dictionary format")
-            # Save the migrated cache
-            self.cache_data = data
-            self._save_cache()
+                return True
+        return False
     
     def _get_relative_path(self, file_path: str) -> str:
         """Convert absolute path to relative path within the directory."""
