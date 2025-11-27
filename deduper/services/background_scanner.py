@@ -5,16 +5,79 @@ pre-scanning them so that when users navigate to a folder, the results are alrea
 """
 
 import os
+import sys
 import time
+import logging
+import logging.handlers
 import threading
+import traceback
 from typing import Dict, Optional, Set, Callable, Tuple, List
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from ..utils.logging_config import get_logger
 from ..utils.hash_cache import HashCache
 from .duplicate_finder import DuplicateFinder
 
+# Get the standard logger
 logger = get_logger(__name__)
+
+# Create a dedicated file logger for background scanner
+_scanner_file_logger: Optional[logging.Logger] = None
+
+
+def _setup_scanner_file_logger() -> logging.Logger:
+    """Set up a dedicated file logger for background scanner operations."""
+    global _scanner_file_logger
+
+    if _scanner_file_logger is not None:
+        return _scanner_file_logger
+
+    _scanner_file_logger = logging.getLogger('deduper.background_scanner.file')
+    _scanner_file_logger.setLevel(logging.DEBUG)
+    _scanner_file_logger.propagate = False  # Don't send to root logger
+
+    # Determine log file path
+    # Try to use the data directory, fall back to current directory
+    log_dir = os.environ.get('DEDUPER_DATA_DIR', './data')
+    log_path = Path(log_dir) / 'logs'
+    log_path.mkdir(parents=True, exist_ok=True)
+    log_file = log_path / 'background_scanner.log'
+
+    # Create rotating file handler
+    try:
+        file_handler = logging.handlers.RotatingFileHandler(
+            str(log_file),
+            maxBytes=5 * 1024 * 1024,  # 5MB
+            backupCount=3
+        )
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        ))
+        _scanner_file_logger.addHandler(file_handler)
+        logger.info(f"Background scanner log file: {log_file}")
+    except Exception as e:
+        logger.warning(f"Could not create background scanner log file: {e}")
+
+    return _scanner_file_logger
+
+
+def scanner_log(level: str, message: str, exc_info: bool = False):
+    """Log to both the main logger and the dedicated scanner file log."""
+    # Log to main logger
+    log_func = getattr(logger, level.lower(), logger.info)
+    log_func(message, exc_info=exc_info)
+
+    # Also log to file logger
+    file_logger = _setup_scanner_file_logger()
+    if file_logger:
+        file_log_func = getattr(file_logger, level.lower(), file_logger.info)
+        if exc_info:
+            # Manually format exception info for file
+            message = f"{message}\n{traceback.format_exc()}"
+        file_log_func(message)
 
 
 class ScanStatus(Enum):
@@ -49,6 +112,11 @@ class FolderState:
     scan_progress: int = 0
     scan_total: int = 0
     scan_message: str = ""
+    # Track failures for retry logic
+    consecutive_failures: int = 0
+    last_failure_time: float = 0
+    # Track when scan started (for timeout detection)
+    scan_start_time: float = 0
 
 
 class BackgroundScanner:
@@ -60,6 +128,8 @@ class BackgroundScanner:
     - Waits 5 minutes after last change before rescanning (to allow ongoing transfers)
     - Coordinates with user-initiated scans to avoid duplicate work
     - Provides real-time status updates
+    - Timeout protection for stuck scans
+    - Retry logic with exponential backoff for failed folders
     """
 
     # Time to wait after folder changes before rescanning (5 minutes)
@@ -70,6 +140,15 @@ class BackgroundScanner:
 
     # Minimum time between scans of the same folder (10 minutes)
     MIN_RESCAN_INTERVAL_SECONDS = 600
+
+    # Timeout for a single folder scan (10 minutes)
+    SCAN_TIMEOUT_SECONDS = 600
+
+    # Maximum consecutive failures before giving up on a folder
+    MAX_CONSECUTIVE_FAILURES = 3
+
+    # Base retry delay after failure (doubles each failure: 5min, 10min, 20min)
+    BASE_RETRY_DELAY_SECONDS = 300
 
     def __init__(
         self,
@@ -244,7 +323,13 @@ class BackgroundScanner:
 
     def _scanner_loop(self):
         """Main loop for the background scanner."""
-        logger.info("Background scanner loop started")
+        scanner_log('info', "="*60)
+        scanner_log('info', "Background scanner loop STARTED")
+        scanner_log('info', f"  Data directory: {self.data_dir}")
+        scanner_log('info', f"  Scan timeout: {self.SCAN_TIMEOUT_SECONDS}s")
+        scanner_log('info', f"  Max failures: {self.MAX_CONSECUTIVE_FAILURES}")
+        scanner_log('info', f"  Base retry delay: {self.BASE_RETRY_DELAY_SECONDS}s")
+        scanner_log('info', "="*60)
 
         # Initial scan of all folders
         self._set_scanner_state(ScannerState.IDLE, "Discovering folders...")
@@ -291,24 +376,28 @@ class BackgroundScanner:
         """Discover all user folders in the data directory."""
         try:
             if not os.path.exists(self.data_dir):
-                logger.warning(f"Data directory does not exist: {self.data_dir}")
+                scanner_log('warning', f"Data directory does not exist: {self.data_dir}")
                 return
 
+            new_folders = []
             for folder_name in os.listdir(self.data_dir):
                 folder_path = os.path.join(self.data_dir, folder_name)
-                if os.path.isdir(folder_path):
+                if os.path.isdir(folder_path) and not folder_name.startswith('.'):
                     with self._lock:
                         if folder_name not in self._folder_states:
                             self._folder_states[folder_name] = FolderState(
                                 path=folder_path,
                                 status=ScanStatus.PENDING
                             )
-                            logger.debug(f"Discovered folder: {folder_name}")
+                            new_folders.append(folder_name)
 
-            logger.info(f"Discovered {len(self._folder_states)} folders")
+            if new_folders:
+                scanner_log('info', f"Discovered {len(new_folders)} new folder(s): {', '.join(new_folders)}")
+
+            scanner_log('debug', f"Total folders tracked: {len(self._folder_states)}")
 
         except Exception as e:
-            logger.error(f"Error discovering folders: {e}", exc_info=True)
+            scanner_log('error', f"Error discovering folders: {e}", exc_info=True)
 
     def _check_folders_for_changes(self):
         """Check all folders for file changes."""
@@ -367,12 +456,13 @@ class BackgroundScanner:
         Returns (folder_name, wait_reason) where wait_reason explains why we're waiting.
 
         Priority order:
-        1. PENDING folders (never scanned)
+        1. PENDING folders (never scanned) - respecting retry delays for failed ones
         2. STALE folders that have been stable for 5+ minutes
+        3. ERROR folders that have waited long enough for retry
         """
         current_time = time.time()
         wait_reason = None
-        earliest_stale_ready = None
+        earliest_ready = None
 
         with self._lock:
             # First priority: unscanned folders (not being scanned by user)
@@ -381,6 +471,20 @@ class BackgroundScanner:
                     # Skip if user is currently scanning this folder
                     if folder_name in self._user_scanning_folders:
                         continue
+
+                    # Check if this folder has failed before and needs to wait
+                    if state.consecutive_failures > 0 and state.last_failure_time > 0:
+                        retry_delay = self.BASE_RETRY_DELAY_SECONDS * (2 ** (state.consecutive_failures - 1))
+                        time_since_failure = current_time - state.last_failure_time
+
+                        if time_since_failure < retry_delay:
+                            # Still waiting for retry delay
+                            wait_time = retry_delay - time_since_failure
+                            if earliest_ready is None or wait_time < earliest_ready:
+                                earliest_ready = wait_time
+                                wait_reason = f"Retry in {int(wait_time)}s for {folder_name}"
+                            continue
+
                     return folder_name, None
 
             # Second priority: stale folders that have been stable
@@ -400,20 +504,45 @@ class BackgroundScanner:
                         else:
                             # Folder is stable but was scanned too recently
                             ready_in = self.MIN_RESCAN_INTERVAL_SECONDS - time_since_scan
-                            if earliest_stale_ready is None or ready_in < earliest_stale_ready:
-                                earliest_stale_ready = ready_in
+                            if earliest_ready is None or ready_in < earliest_ready:
+                                earliest_ready = ready_in
                                 wait_reason = f"Waiting {int(ready_in)}s before rescanning"
                     else:
                         # Folder changed recently, waiting for stability
                         stable_in = self.STABILITY_WAIT_SECONDS - time_since_change
-                        if earliest_stale_ready is None or stable_in < earliest_stale_ready:
-                            earliest_stale_ready = stable_in
+                        if earliest_ready is None or stable_in < earliest_ready:
+                            earliest_ready = stable_in
                             wait_reason = f"Folder changed, waiting {int(stable_in)}s for stability"
+
+            # Third priority: ERROR folders that have waited long enough
+            for folder_name, state in self._folder_states.items():
+                if state.status == ScanStatus.ERROR:
+                    # Skip if user is currently scanning this folder
+                    if folder_name in self._user_scanning_folders:
+                        continue
+
+                    # Calculate retry delay with exponential backoff
+                    # After max failures, use a long delay (1 hour)
+                    retry_delay = min(
+                        self.BASE_RETRY_DELAY_SECONDS * (2 ** state.consecutive_failures),
+                        3600  # Max 1 hour between retries
+                    )
+                    time_since_failure = current_time - state.last_failure_time
+
+                    if time_since_failure >= retry_delay:
+                        # Reset to pending and try again
+                        scanner_log('info', f"Retrying previously failed folder: {folder_name} (failed {state.consecutive_failures} times)")
+                        return folder_name, None
+                    else:
+                        wait_time = retry_delay - time_since_failure
+                        if earliest_ready is None or wait_time < earliest_ready:
+                            earliest_ready = wait_time
+                            wait_reason = f"Retry failed folder in {int(wait_time)}s"
 
         return None, wait_reason
 
     def _scan_folder(self, folder_name: str):
-        """Scan a folder for duplicates."""
+        """Scan a folder for duplicates with timeout protection."""
         with self._lock:
             state = self._folder_states.get(folder_name)
             if not state:
@@ -428,42 +557,83 @@ class BackgroundScanner:
             state.scan_progress = 0
             state.scan_total = 0
             state.scan_message = "Starting scan..."
+            state.scan_start_time = time.time()
             self._current_scan_folder = folder_name
             folder_path = state.path
 
         self._set_scanner_state(ScannerState.SCANNING, f"Scanning {folder_name}")
-        logger.info(f"Background scanning folder: {folder_name}")
+        scanner_log('info', f"Background scan STARTED: {folder_name} (path: {folder_path})")
 
-        try:
-            # Create progress callback that updates state and forwards to any registered callback
-            def progress_callback(status: str, current: int, total: int, message: str):
-                with self._lock:
-                    # Update folder state
-                    folder_state = self._folder_states.get(folder_name)
-                    if folder_state:
-                        folder_state.scan_progress = current
-                        folder_state.scan_total = total
-                        folder_state.scan_message = message
+        # Use a container to store results from the worker thread
+        scan_result = {'success': False, 'images': None, 'videos': None, 'error': None, 'traceback': None}
+        scan_complete = threading.Event()
 
-                    # Update scanner state message
-                    self._state_message = f"{folder_name}: {message}"
+        def run_scan():
+            """Worker function to run the actual scan."""
+            try:
+                scanner_log('debug', f"Worker thread started for: {folder_name}")
 
-                    # Forward to registered callback if any
-                    callback = self._progress_callbacks.get(folder_name)
-                    if callback:
-                        try:
-                            callback(status, current, total, message)
-                        except Exception as e:
-                            logger.warning(f"Error in progress callback: {e}")
+                # Create progress callback that updates state
+                def progress_callback(status: str, current: int, total: int, message: str):
+                    with self._lock:
+                        folder_state = self._folder_states.get(folder_name)
+                        if folder_state:
+                            folder_state.scan_progress = current
+                            folder_state.scan_total = total
+                            folder_state.scan_message = message
 
-            # Run the duplicate finder
-            finder = DuplicateFinder(self.image_extensions, self.video_extensions)
-            duplicate_images, duplicate_videos = finder.find_duplicates(
-                folder_path,
-                progress_callback=progress_callback
-            )
+                        self._state_message = f"{folder_name}: {message}"
 
-            # Update state on success
+                    # Log progress periodically
+                    if current > 0 and current % 100 == 0:
+                        scanner_log('debug', f"Progress [{folder_name}]: {status} - {current}/{total} - {message}")
+
+                        # Forward to registered callback if any
+                        callback = self._progress_callbacks.get(folder_name)
+                        if callback:
+                            try:
+                                callback(status, current, total, message)
+                            except Exception as e:
+                                logger.warning(f"Error in progress callback: {e}")
+
+                # Run the duplicate finder
+                finder = DuplicateFinder(self.image_extensions, self.video_extensions)
+                duplicate_images, duplicate_videos = finder.find_duplicates(
+                    folder_path,
+                    progress_callback=progress_callback
+                )
+
+                scan_result['success'] = True
+                scan_result['images'] = duplicate_images
+                scan_result['videos'] = duplicate_videos
+                scanner_log('debug', f"Worker thread completed successfully for: {folder_name}")
+
+            except Exception as e:
+                scan_result['error'] = str(e)
+                scan_result['traceback'] = traceback.format_exc()
+                scanner_log('error', f"EXCEPTION in scan worker for {folder_name}: {e}\n{traceback.format_exc()}")
+
+            finally:
+                scan_complete.set()
+
+        # Start the scan in a worker thread
+        worker = threading.Thread(target=run_scan, name=f"ScanWorker-{folder_name}", daemon=True)
+        worker.start()
+
+        # Wait for completion with timeout
+        completed = scan_complete.wait(timeout=self.SCAN_TIMEOUT_SECONDS)
+
+        if not completed:
+            # Scan timed out
+            scanner_log('error', f"TIMEOUT: Background scan for {folder_name} exceeded {self.SCAN_TIMEOUT_SECONDS}s")
+            self._handle_scan_failure(folder_name, "Scan timed out - folder may have too many files or be inaccessible")
+            return
+
+        # Process results
+        if scan_result['success']:
+            duplicate_images = scan_result['images']
+            duplicate_videos = scan_result['videos']
+
             with self._lock:
                 state = self._folder_states.get(folder_name)
                 if state:
@@ -471,27 +641,49 @@ class BackgroundScanner:
                     state.last_scan_time = time.time()
                     state.error_message = ""
                     state.scan_message = "Complete"
+                    state.consecutive_failures = 0  # Reset failure count on success
                     # Count total files for stats
                     image_count = sum(len(g.get('duplicate_files', [])) + 1 for g in (duplicate_images or []))
                     video_count = sum(len(g.get('duplicate_files', [])) + 1 for g in (duplicate_videos or []))
                     state.file_count = image_count + video_count
 
-            logger.info(f"Background scan complete: {folder_name} "
+            scanner_log('info', f"Background scan COMPLETE: {folder_name} "
                        f"({len(duplicate_images or [])} image groups, "
                        f"{len(duplicate_videos or [])} video groups)")
+        else:
+            error_msg = scan_result['error'] or "Unknown error"
+            tb = scan_result.get('traceback', '')
+            scanner_log('error', f"Background scan FAILED: {folder_name} - {error_msg}")
+            if tb:
+                scanner_log('debug', f"Traceback for {folder_name}:\n{tb}")
+            self._handle_scan_failure(folder_name, error_msg)
 
-        except Exception as e:
-            logger.error(f"Error scanning folder {folder_name}: {e}", exc_info=True)
-            with self._lock:
-                state = self._folder_states.get(folder_name)
-                if state:
+        with self._lock:
+            self._current_scan_folder = None
+
+    def _handle_scan_failure(self, folder_name: str, error_message: str):
+        """Handle a scan failure with retry tracking."""
+        with self._lock:
+            state = self._folder_states.get(folder_name)
+            if state:
+                state.consecutive_failures += 1
+                state.last_failure_time = time.time()
+                state.error_message = error_message
+
+                if state.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
                     state.status = ScanStatus.ERROR
-                    state.error_message = str(e)
-                    state.scan_message = f"Error: {str(e)[:50]}"
+                    state.scan_message = f"Failed {state.consecutive_failures}x: {error_message[:40]}"
+                    scanner_log('warning', f"GIVING UP on folder {folder_name} after {state.consecutive_failures} failures. "
+                                          f"Error: {error_message}. Will retry in 1 hour.")
+                else:
+                    # Mark as pending to retry later
+                    state.status = ScanStatus.PENDING
+                    retry_delay = self.BASE_RETRY_DELAY_SECONDS * (2 ** (state.consecutive_failures - 1))
+                    state.scan_message = f"Failed, retry in {retry_delay // 60}min"
+                    scanner_log('warning', f"Folder {folder_name} FAILED (attempt {state.consecutive_failures}/{self.MAX_CONSECUTIVE_FAILURES}), "
+                                          f"will retry in {retry_delay}s. Error: {error_message}")
 
-        finally:
-            with self._lock:
-                self._current_scan_folder = None
+            self._current_scan_folder = None
 
 
 # Global instance for the background scanner
