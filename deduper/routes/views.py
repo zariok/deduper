@@ -717,7 +717,8 @@ def scanner_status():
                 'ready': state.status == ScanStatus.COMPLETE,
                 'scan_progress': state.scan_progress,
                 'scan_total': state.scan_total,
-                'scan_message': state.scan_message
+                'scan_message': state.scan_message,
+                'duplicate_count': state.duplicate_count
             }
 
         return jsonify({

@@ -346,6 +346,46 @@
             text-overflow: ellipsis;
         }
 
+        /* Loading overlay for content sections */
+        .loading-overlay {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 40px;
+            color: #666;
+            font-size: 14px;
+            background: #f9f9f9;
+            border-radius: 8px;
+            margin: 10px 0;
+        }
+        .loading-overlay .spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid #ddd;
+            border-top-color: #007bff;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 10px;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Folder select option styling for status */
+        .folder-select option.status-pending {
+            color: #856404;
+        }
+        .folder-select option.status-scanning {
+            color: #0c5460;
+            font-weight: bold;
+        }
+        .folder-select option.status-complete {
+            color: #155724;
+        }
+        .folder-select option.status-error {
+            color: #721c24;
+        }
+
     </style>
 </head>
 <body>
@@ -370,9 +410,6 @@
     <div class="folder-navigation">
         <select class="folder-select" id="folderSelect">
             <option value="">Select a folder...</option>
-            {% for folder in user_folders %}
-            <option value="{{ folder }}">{{ folder }}</option>
-            {% endfor %}
         </select>
         <div class="cache-controls" id="cacheControls" style="display: none; margin-top: 10px;">
             <div class="cache-info" id="cacheInfo" style="background: #e9ecef; padding: 10px; border-radius: 5px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;">
@@ -537,8 +574,115 @@
                     folderText.textContent = data.scanner_message || 'Initializing...';
                     messageText.textContent = '';
                 }
+                // Also update the folder dropdown with status info
+                updateFolderDropdown(data.folders);
             } catch (error) {
                 console.error('Error updating scanner status:', error);
+            }
+        }
+
+        // Build the display label for a folder based on its status
+        function buildFolderLabel(folderName, folderInfo) {
+            if (!folderInfo) {
+                return folderName + ' - (pending scan)';
+            }
+
+            switch (folderInfo.status) {
+                case 'pending':
+                    return folderName + ' - (pending scan)';
+                case 'scanning':
+                    return folderName + ' - (scanning...)';
+                case 'complete':
+                    if (folderInfo.duplicate_count === 0) {
+                        // Return null to indicate this folder should be hidden
+                        return null;
+                    }
+                    return folderName + ' - Duplicates: ' + folderInfo.duplicate_count;
+                case 'stale':
+                    // Stale means it was complete but has changed
+                    if (folderInfo.duplicate_count >= 0) {
+                        return folderName + ' - Duplicates: ' + folderInfo.duplicate_count + ' (stale)';
+                    }
+                    return folderName + ' - (rescan needed)';
+                case 'error':
+                    return folderName + ' - (error)';
+                default:
+                    return folderName;
+            }
+        }
+
+        // Update the folder dropdown based on scanner status
+        function updateFolderDropdown(folders) {
+            const select = document.getElementById('folderSelect');
+            if (!select) return;
+
+            const currentValue = select.value;
+            const savedFolder = localStorage.getItem('selectedFolder');
+
+            // Clear existing options except the placeholder
+            while (select.options.length > 1) {
+                select.remove(1);
+            }
+
+            // Sort folders alphabetically (case-insensitive)
+            const sortedFolders = Object.keys(folders).sort((a, b) =>
+                a.toLowerCase().localeCompare(b.toLowerCase())
+            );
+
+            // Add options with status labels
+            for (const folderName of sortedFolders) {
+                const folderInfo = folders[folderName];
+                const label = buildFolderLabel(folderName, folderInfo);
+
+                // Skip folders with 0 duplicates (label is null)
+                if (label === null) {
+                    continue;
+                }
+
+                const option = document.createElement('option');
+                option.value = folderName;
+                option.textContent = label;
+                option.className = 'status-' + (folderInfo ? folderInfo.status : 'pending');
+                select.appendChild(option);
+            }
+
+            // Restore selection
+            if (currentValue && select.querySelector(`option[value="${currentValue}"]`)) {
+                select.value = currentValue;
+            } else if (savedFolder && select.querySelector(`option[value="${savedFolder}"]`)) {
+                select.value = savedFolder;
+            }
+
+            // After first update, try to load saved folder selection
+            loadSavedFolderSelection();
+        }
+
+        // Show loading state in the content sections
+        function showContentLoading() {
+            // Reset cache stats display
+            const cacheStatsIds = ['totalCachedFiles', 'cacheSize', 'totalGroups', 'duplicateGroups',
+                                   'processedGroups', 'remainingDuplicates', 'cacheCreated', 'cacheUpdated'];
+            cacheStatsIds.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = '-';
+            });
+
+            // Show loading overlays in the duplicate content sections
+            const imagesContainer = document.getElementById('images-container');
+            const videosContainer = document.getElementById('videos-container');
+            const duplicateContent = document.getElementById('duplicate-content');
+
+            if (duplicateContent) {
+                duplicateContent.style.display = 'block';
+            }
+
+            const loadingHTML = '<div class="loading-overlay"><div class="spinner"></div>Loading...</div>';
+
+            if (imagesContainer) {
+                imagesContainer.innerHTML = loadingHTML;
+            }
+            if (videosContainer) {
+                videosContainer.innerHTML = loadingHTML;
             }
         }
 
@@ -586,18 +730,35 @@
             });
         }
 
-        // Load saved folder selection on page load
-        window.addEventListener('load', () => {
-            // Initialize the load more observer
-            initLoadMoreObserver();
+        // Track if initial folder has been loaded
+        let initialFolderLoaded = false;
+
+        // Load saved folder selection on page load (called after first scanner status update)
+        function loadSavedFolderSelection() {
+            if (initialFolderLoaded) return;
 
             const savedFolder = localStorage.getItem('selectedFolder');
             if (savedFolder) {
                 const folderSelect = document.getElementById('folderSelect');
-                folderSelect.value = savedFolder;
-                // Try to load cached results first for instant display
-                loadCachedOrScan(savedFolder);
+                // Check if the saved folder exists in the dropdown
+                const option = folderSelect.querySelector(`option[value="${savedFolder}"]`);
+                if (option) {
+                    folderSelect.value = savedFolder;
+                    // Try to load cached results first for instant display
+                    showContentLoading();
+                    document.getElementById('cacheControls').style.display = 'block';
+                    loadCachedOrScan(savedFolder);
+                    initialFolderLoaded = true;
+                }
+            } else {
+                initialFolderLoaded = true;  // No saved folder, mark as loaded
             }
+        }
+
+        // Initialize on page load
+        window.addEventListener('load', () => {
+            // Initialize the load more observer
+            initLoadMoreObserver();
         });
 
         // Try to load cached results, fall back to full scan if not available
@@ -830,6 +991,10 @@
                 clearFolderSelection();
                 return;
             }
+
+            // Show loading state immediately when folder changes
+            showContentLoading();
+            document.getElementById('cacheControls').style.display = 'block';
 
             // Use cached results if available, otherwise full scan
             await loadCachedOrScan(folder);
