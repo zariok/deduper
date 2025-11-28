@@ -796,6 +796,82 @@ def prioritize_folder_scan(user_folder: str):
         return jsonify({'error': str(e)}), 500
 
 
+@bp.route('/scanner/ui-active-folder', methods=['POST'])
+def set_ui_active_folder():
+    """Set the folder currently being viewed in the UI.
+
+    The background scanner will skip rescanning this folder until the user
+    has been idle for 5 minutes.
+    """
+    try:
+        data = request.get_json() or {}
+        folder_name = data.get('folder')  # Can be None to clear
+
+        scanner = get_background_scanner()
+        if scanner is None:
+            return jsonify({
+                'success': False,
+                'message': 'Background scanner not running'
+            })
+
+        scanner.set_ui_active_folder(folder_name)
+
+        return jsonify({
+            'success': True,
+            'folder': folder_name
+        })
+    except Exception as e:
+        logger.error(f"Error setting UI active folder: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@bp.route('/scanner/ui-activity', methods=['POST'])
+def mark_ui_activity():
+    """Mark that the user has interacted with the current folder.
+
+    Call this when user performs actions like deleting duplicates.
+    """
+    try:
+        scanner = get_background_scanner()
+        if scanner is None:
+            return jsonify({
+                'success': False,
+                'message': 'Background scanner not running'
+            })
+
+        scanner.mark_ui_activity()
+
+        return jsonify({
+            'success': True
+        })
+    except Exception as e:
+        logger.error(f"Error marking UI activity: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@bp.route('/scanner/check-refresh/<path:user_folder>')
+def check_folder_refresh(user_folder: str):
+    """Check if a folder needs to be refreshed after background rescan."""
+    try:
+        decoded_folder = urllib.parse.unquote(user_folder)
+        scanner = get_background_scanner()
+
+        if scanner is None:
+            return jsonify({
+                'needs_refresh': False
+            })
+
+        needs_refresh = scanner.check_folder_needs_refresh(decoded_folder)
+
+        return jsonify({
+            'needs_refresh': needs_refresh,
+            'folder': decoded_folder
+        })
+    except Exception as e:
+        logger.error(f"Error checking folder refresh: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @bp.route('/cached-results/<path:user_folder>')
 @timer('cached_results')
 def get_cached_results(user_folder: str):

@@ -177,6 +177,14 @@ class BackgroundScanner:
         # Track user-initiated scans to avoid conflicts
         self._user_scanning_folders: Set[str] = set()
 
+        # Track the folder currently being viewed in the UI
+        # We skip rescanning this folder until user is idle for 5 minutes
+        self._ui_active_folder: Optional[str] = None
+        self._ui_activity_time: float = 0  # Last time user interacted with the folder
+
+        # Track folders that were rescanned in background and need UI refresh
+        self._folders_needing_refresh: Set[str] = set()
+
         # Allow external progress callbacks to be registered
         self._progress_callbacks: Dict[str, Callable] = {}
 
@@ -291,6 +299,44 @@ class BackgroundScanner:
                     state.status = ScanStatus.PENDING
                     state.last_change_detected = 0  # Skip stability wait
                     logger.debug(f"Prioritized folder for scanning: {folder_name}")
+
+    def set_ui_active_folder(self, folder_name: Optional[str]):
+        """Set the folder currently being viewed in the UI.
+
+        The background scanner will skip rescanning this folder until the user
+        has been idle for 5 minutes (STABILITY_WAIT_SECONDS).
+        """
+        with self._lock:
+            if folder_name != self._ui_active_folder:
+                scanner_log('debug', f"UI active folder changed: {self._ui_active_folder} -> {folder_name}")
+            self._ui_active_folder = folder_name
+            self._ui_activity_time = time.time()
+            # Clear any pending refresh for the newly selected folder
+            if folder_name:
+                self._folders_needing_refresh.discard(folder_name)
+
+    def mark_ui_activity(self):
+        """Mark that the user has interacted with the current folder.
+
+        Call this when user performs actions like deleting duplicates.
+        """
+        with self._lock:
+            self._ui_activity_time = time.time()
+
+    def get_folders_needing_refresh(self) -> Set[str]:
+        """Get and clear the set of folders that were rescanned and need UI refresh."""
+        with self._lock:
+            folders = self._folders_needing_refresh.copy()
+            self._folders_needing_refresh.clear()
+            return folders
+
+    def check_folder_needs_refresh(self, folder_name: str) -> bool:
+        """Check if a specific folder needs refresh (and clear the flag)."""
+        with self._lock:
+            if folder_name in self._folders_needing_refresh:
+                self._folders_needing_refresh.discard(folder_name)
+                return True
+            return False
 
     def register_progress_callback(self, folder_name: str, callback: Callable):
         """Register a callback to receive progress updates for a folder scan."""
@@ -531,6 +577,18 @@ class BackgroundScanner:
             logger.warning(f"Error getting mtime for {folder_path}: {e}")
             return 0
 
+    def _is_ui_folder_active(self, folder_name: str, current_time: float) -> bool:
+        """Check if a folder is actively being used in the UI.
+
+        Returns True if the folder is the UI active folder AND the user
+        has been active within the last STABILITY_WAIT_SECONDS (5 minutes).
+        """
+        if folder_name != self._ui_active_folder:
+            return False
+
+        time_since_activity = current_time - self._ui_activity_time
+        return time_since_activity < self.STABILITY_WAIT_SECONDS
+
     def _get_next_folder_to_scan(self) -> Tuple[Optional[str], Optional[str]]:
         """Get the next folder that needs scanning.
 
@@ -539,7 +597,10 @@ class BackgroundScanner:
         Priority order:
         1. PENDING folders (never scanned) - respecting retry delays for failed ones
         2. STALE folders that have been stable for 5+ minutes
-        3. ERROR folders that have waited long enough for retry
+        3. ERROR folders that have waited long enough
+
+        Note: Folders actively being viewed in the UI are skipped until the user
+        has been idle for 5 minutes.
         """
         current_time = time.time()
         wait_reason = None
@@ -551,6 +612,14 @@ class BackgroundScanner:
                 if state.status == ScanStatus.PENDING:
                     # Skip if user is currently scanning this folder
                     if folder_name in self._user_scanning_folders:
+                        continue
+
+                    # Skip if this is the active UI folder and user is active
+                    if self._is_ui_folder_active(folder_name, current_time):
+                        time_until_idle = self.STABILITY_WAIT_SECONDS - (current_time - self._ui_activity_time)
+                        if earliest_ready is None or time_until_idle < earliest_ready:
+                            earliest_ready = time_until_idle
+                            wait_reason = f"Waiting {int(time_until_idle)}s for UI idle on {folder_name}"
                         continue
 
                     # Check if this folder has failed before and needs to wait
@@ -573,6 +642,14 @@ class BackgroundScanner:
                 if state.status == ScanStatus.STALE:
                     # Skip if user is currently scanning this folder
                     if folder_name in self._user_scanning_folders:
+                        continue
+
+                    # Skip if this is the active UI folder and user is active
+                    if self._is_ui_folder_active(folder_name, current_time):
+                        time_until_idle = self.STABILITY_WAIT_SECONDS - (current_time - self._ui_activity_time)
+                        if earliest_ready is None or time_until_idle < earliest_ready:
+                            earliest_ready = time_until_idle
+                            wait_reason = f"Waiting {int(time_until_idle)}s for UI idle on {folder_name}"
                         continue
 
                     time_since_change = current_time - state.last_change_detected
@@ -600,6 +677,14 @@ class BackgroundScanner:
                 if state.status == ScanStatus.ERROR:
                     # Skip if user is currently scanning this folder
                     if folder_name in self._user_scanning_folders:
+                        continue
+
+                    # Skip if this is the active UI folder and user is active
+                    if self._is_ui_folder_active(folder_name, current_time):
+                        time_until_idle = self.STABILITY_WAIT_SECONDS - (current_time - self._ui_activity_time)
+                        if earliest_ready is None or time_until_idle < earliest_ready:
+                            earliest_ready = time_until_idle
+                            wait_reason = f"Waiting {int(time_until_idle)}s for UI idle on {folder_name}"
                         continue
 
                     # Calculate retry delay with exponential backoff
@@ -751,6 +836,12 @@ class BackgroundScanner:
                     state.file_count = image_count + video_count
                     # Count duplicate groups (folders with at least one duplicate)
                     state.duplicate_count = len(duplicate_images or []) + len(duplicate_videos or [])
+
+            # If this folder is the UI active folder, mark it as needing refresh
+            with self._lock:
+                if folder_name == self._ui_active_folder:
+                    self._folders_needing_refresh.add(folder_name)
+                    scanner_log('info', f"Folder {folder_name} marked for UI refresh")
 
             scanner_log('info', f"Background scan COMPLETE: {folder_name} "
                        f"({len(duplicate_images or [])} image groups, "

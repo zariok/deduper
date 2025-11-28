@@ -576,9 +576,37 @@
                 }
                 // Also update the folder dropdown with status info
                 updateFolderDropdown(data.folders);
+
+                // Check if current folder needs refresh after background rescan
+                await checkForRefresh();
             } catch (error) {
                 console.error('Error updating scanner status:', error);
             }
+        }
+
+        // Check if the current folder needs to be refreshed after a background rescan
+        async function checkForRefresh() {
+            const currentFolder = document.getElementById('folderSelect').value;
+            if (!currentFolder) return;
+
+            try {
+                const response = await fetch(`/scanner/check-refresh/${encodeURIComponent(currentFolder)}`);
+                const data = await response.json();
+
+                if (data.needs_refresh) {
+                    console.log(`Folder ${currentFolder} was rescanned in background, refreshing...`);
+                    // Reload the cached results
+                    showContentLoading();
+                    await loadCachedOrScan(currentFolder);
+                }
+            } catch (error) {
+                console.error('Error checking for refresh:', error);
+            }
+        }
+
+        // Notify backend of UI activity (call when user performs actions)
+        function notifyUiActivity() {
+            fetch('/scanner/ui-activity', { method: 'POST' }).catch(() => {});
         }
 
         // Build the display label for a folder based on its status
@@ -600,7 +628,11 @@
                     return folderName + ' - Duplicates: ' + folderInfo.duplicate_count;
                 case 'stale':
                     // Stale means it was complete but has changed
-                    if (folderInfo.duplicate_count >= 0) {
+                    // Hide if we know there are 0 duplicates
+                    if (folderInfo.duplicate_count === 0) {
+                        return null;
+                    }
+                    if (folderInfo.duplicate_count > 0) {
                         return folderName + ' - Duplicates: ' + folderInfo.duplicate_count + ' (stale)';
                     }
                     return folderName + ' - (rescan needed)';
@@ -989,12 +1021,25 @@
             const folder = e.target.value;
             if (!folder) {
                 clearFolderSelection();
+                // Clear UI active folder
+                fetch('/scanner/ui-active-folder', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ folder: null })
+                });
                 return;
             }
 
             // Show loading state immediately when folder changes
             showContentLoading();
             document.getElementById('cacheControls').style.display = 'block';
+
+            // Notify backend of the active folder
+            fetch('/scanner/ui-active-folder', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ folder: folder })
+            });
 
             // Use cached results if available, otherwise full scan
             await loadCachedOrScan(folder);
@@ -1089,13 +1134,16 @@
                                 folder: selectedFolder
                             })
                         });
-                        
+
                         if (response.ok) {
+                            // Notify backend of UI activity to delay background rescan
+                            notifyUiActivity();
+
                             // Find and remove the container holding this duplicate group
                             const duplicateGroup = e.target.closest('.duplicate-group');
                             if (duplicateGroup) {
                                 duplicateGroup.remove();
-                                
+
                                 // Update cache stats immediately
                                 const selectedFolder = document.getElementById('folderSelect').value;
                                 if (selectedFolder) {
@@ -1193,20 +1241,23 @@
                         });
                         
                         if (response.ok) {
+                            // Notify backend of UI activity to delay background rescan
+                            notifyUiActivity();
+
                             // Find the duplicate group BEFORE removing the element
                             const duplicateGroup = e.target.closest('.duplicate-group');
                             console.log('Found duplicate group:', duplicateGroup);
-                            
+
                             // Remove the deleted file from the UI
                             console.log('Removing duplicate file from UI');
                             e.target.parentElement.remove();
-                            
+
                             // Update cache stats immediately
                             const selectedFolder = document.getElementById('folderSelect').value;
                             if (selectedFolder) {
                                 loadCacheStats(selectedFolder);
                             }
-                            
+
                             // Check if the group now has no duplicates and remove it if so
                             if (duplicateGroup) {
                                 // Use setTimeout to ensure DOM is updated before checking
@@ -1268,13 +1319,16 @@
                                 folder: selectedFolder
                             })
                         });
-                        
+
                         if (response.ok) {
+                            // Notify backend of UI activity to delay background rescan
+                            notifyUiActivity();
+
                             // Find and remove the container holding this duplicate group
                             const duplicateGroup = e.target.closest('.duplicate-group');
                             if (duplicateGroup) {
                                 duplicateGroup.remove();
-                                
+
                                 // Update cache stats immediately
                                 const selectedFolder = document.getElementById('folderSelect').value;
                                 if (selectedFolder) {
