@@ -4,6 +4,7 @@ This service runs in a background thread and continuously monitors folders for c
 pre-scanning them so that when users navigate to a folder, the results are already cached.
 """
 
+import json
 import os
 import sys
 import time
@@ -11,7 +12,7 @@ import logging
 import logging.handlers
 import threading
 import traceback
-from typing import Dict, Optional, Set, Callable, Tuple, List
+from typing import Dict, Optional, Set, Callable, Tuple, List, Any
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -374,8 +375,74 @@ class BackgroundScanner:
         self._set_scanner_state(ScannerState.IDLE, "Stopped")
         logger.info("Background scanner loop stopped")
 
+    def _read_cache_metadata(self, folder_path: str) -> Dict[str, Any]:
+        """Read lightweight metadata from cache file without loading full hash data.
+
+        Returns a dict with:
+        - status: ScanStatus.COMPLETE if valid cache exists, STALE if folder changed, else PENDING
+        - last_scan_time: timestamp of last scan or 0
+        - duplicate_count: number of duplicate groups or -1 if not scanned
+        - file_count: number of files in groups or 0
+        """
+        cache_file = os.path.join(folder_path, HashCache.CACHE_FILENAME)
+
+        default_result: Dict[str, Any] = {
+            'status': ScanStatus.PENDING,
+            'last_scan_time': 0.0,
+            'duplicate_count': -1,
+            'file_count': 0
+        }
+
+        if not os.path.exists(cache_file):
+            return default_result
+
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+
+            # Validate version
+            if cache_data.get('version') != HashCache.CACHE_VERSION:
+                scanner_log('debug', f"Cache version mismatch for {folder_path}")
+                return default_result
+
+            # Check for grouping_results - this indicates a completed scan
+            grouping_results = cache_data.get('grouping_results', {})
+            if not grouping_results:
+                return default_result
+
+            # Count duplicate groups (groups with more than 1 file)
+            duplicate_count = 0
+            file_count = 0
+            for files in grouping_results.values():
+                file_count += len(files)
+                if len(files) > 1:
+                    duplicate_count += 1
+
+            last_scan_time = cache_data.get('last_updated', cache_data.get('grouping_timestamp', 0))
+
+            # Check if folder has been modified since last scan (makes it stale)
+            folder_mtime = self._get_folder_mtime(folder_path)
+            if folder_mtime > last_scan_time:
+                return {
+                    'status': ScanStatus.STALE,
+                    'last_scan_time': last_scan_time,
+                    'duplicate_count': duplicate_count,
+                    'file_count': file_count
+                }
+
+            return {
+                'status': ScanStatus.COMPLETE,
+                'last_scan_time': last_scan_time,
+                'duplicate_count': duplicate_count,
+                'file_count': file_count
+            }
+
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            scanner_log('debug', f"Could not read cache metadata for {folder_path}: {e}")
+            return default_result
+
     def _discover_folders(self):
-        """Discover all user folders in the data directory."""
+        """Discover all user folders in the data directory and initialize state from cache."""
         try:
             if not os.path.exists(self.data_dir):
                 scanner_log('warning', f"Data directory does not exist: {self.data_dir}")
@@ -387,14 +454,20 @@ class BackgroundScanner:
                 if os.path.isdir(folder_path) and not folder_name.startswith('.'):
                     with self._lock:
                         if folder_name not in self._folder_states:
+                            # Try to read existing cache state
+                            cache_meta = self._read_cache_metadata(folder_path)
+
                             self._folder_states[folder_name] = FolderState(
                                 path=folder_path,
-                                status=ScanStatus.PENDING
+                                status=cache_meta['status'],
+                                last_scan_time=cache_meta['last_scan_time'],
+                                duplicate_count=cache_meta['duplicate_count'],
+                                file_count=cache_meta['file_count']
                             )
-                            new_folders.append(folder_name)
+                            new_folders.append(f"{folder_name} ({cache_meta['status'].value})")
 
             if new_folders:
-                scanner_log('info', f"Discovered {len(new_folders)} new folder(s): {', '.join(new_folders)}")
+                scanner_log('info', f"Discovered {len(new_folders)} folder(s): {', '.join(new_folders)}")
 
             scanner_log('debug', f"Total folders tracked: {len(self._folder_states)}")
 
