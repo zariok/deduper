@@ -5,7 +5,7 @@ import hashlib
 import threading
 import signal
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Any, List, Set
+from typing import Any
 from .logging_config import get_logger
 from .media import get_image_hash
 
@@ -30,7 +30,7 @@ class HashCache:
         self._last_save_time = 0
         self._save_debounce_seconds = 2  # Minimum time between saves
     
-    def _load_cache(self) -> Dict[str, Any]:
+    def _load_cache(self) -> dict[str, Any]:
         """Load cache from .deduper file with timeout protection."""
         logger.info(f"HashCache._load_cache() called for: {self.directory_path}")
 
@@ -127,7 +127,7 @@ class HashCache:
         """Convert relative path back to absolute path."""
         return os.path.join(self.directory_path, relative_path)
     
-    def _create_empty_cache(self) -> Dict[str, Any]:
+    def _create_empty_cache(self) -> dict[str, Any]:
         """Create a new empty cache structure."""
         return {
             "version": self.CACHE_VERSION,
@@ -208,7 +208,7 @@ class HashCache:
             logger.error(f"Cache validation failed: {e}")
             return False
     
-    def _get_file_stats(self, file_path: str) -> Tuple[float, int]:
+    def _get_file_stats(self, file_path: str) -> tuple[float, int]:
         """Get file modification time and size."""
         try:
             stat = os.stat(file_path)
@@ -236,7 +236,7 @@ class HashCache:
         
         return (cached_mtime == current_mtime and cached_size == current_size)
     
-    def get_hash(self, file_path: str, video_extensions: set) -> Optional[Any]:
+    def get_hash(self, file_path: str, video_extensions: set) -> Any | None:
         """Get hash for file, using cache if available and file unchanged."""
         # Check if file exists and is unchanged
         if not os.path.exists(file_path):
@@ -309,7 +309,7 @@ class HashCache:
         if deleted_files:
             logger.info(f"Cleaned up {len(deleted_files)} deleted files from cache")
     
-    def get_cache_stats(self) -> Dict[str, Any]:
+    def get_cache_stats(self) -> dict[str, Any]:
         """Get cache statistics."""
         return {
             "total_cached_files": len(self.cache_data["hashes"]),
@@ -355,7 +355,7 @@ class HashCache:
         self._save_cache_debounced()
         logger.debug(f"Set best file for group {group_id}: {relative_path}")
     
-    def get_best_file(self, group_id: str) -> Optional[str]:
+    def get_best_file(self, group_id: str) -> str | None:
         """Get the best file for a duplicate group."""
         if "best_files" not in self.cache_data:
             return None

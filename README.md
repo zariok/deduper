@@ -31,7 +31,7 @@ As this was developed for a linux-based system, **symlink** implies the media is
 
 ## Requirements
 
-- Python 3.6 or higher
+- Python 3.9 or higher (tested with Python 3.12.3)
 - FFmpeg (for video processing)
 
 ## Installation

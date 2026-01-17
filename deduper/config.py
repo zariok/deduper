@@ -1,9 +1,19 @@
 import os
+import sys
 from pathlib import Path
 
 class Config:
     # Flask settings
-    SECRET_KEY = os.environ.get('SECRET_KEY', 'dev')
+    SECRET_KEY = os.environ.get('SECRET_KEY')
+    if not SECRET_KEY:
+        # Only allow 'dev' key in development mode
+        if os.environ.get('FLASK_ENV') == 'development' or os.environ.get('DEDUPER_DEV', '').lower() == 'true':
+            SECRET_KEY = 'dev'
+            import warnings
+            warnings.warn("Using insecure 'dev' SECRET_KEY. Set SECRET_KEY environment variable in production!")
+        else:
+            print("ERROR: SECRET_KEY environment variable must be set in production!", file=sys.stderr)
+            sys.exit(1)
     MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB max file size
     
     # Server settings

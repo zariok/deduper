@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Union, List
+from typing import List
 
 from .logging_config import get_logger
 
 logger = get_logger(__name__)
 
-PathLike = Union[str, os.PathLike]
+# Python 3.10+ supports | for union types
+PathLike = str | os.PathLike[str]
 
 
 def get_file_size(file_path: PathLike) -> int:

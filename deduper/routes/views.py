@@ -7,7 +7,7 @@ from werkzeug.exceptions import HTTPException
 import json
 import threading
 import time
-from typing import Dict, Any, Optional
+from typing import Any
 from ..services.duplicate_finder import DuplicateFinder
 from ..services.background_scanner import get_background_scanner, ScanStatus
 from ..config import Config

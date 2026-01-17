@@ -12,7 +12,7 @@ import logging
 import logging.handlers
 import threading
 import traceback
-from typing import Dict, Optional, Set, Callable, Tuple, List, Any
+from typing import Callable, Any
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -24,7 +24,7 @@ from .duplicate_finder import DuplicateFinder
 logger = get_logger(__name__)
 
 # Create a dedicated file logger for background scanner
-_scanner_file_logger: Optional[logging.Logger] = None
+_scanner_file_logger: logging.Logger | None = None
 
 
 def _setup_scanner_file_logger() -> logging.Logger:
@@ -166,8 +166,8 @@ class BackgroundScanner:
         self._folder_states: Dict[str, FolderState] = {}
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._current_scan_folder: Optional[str] = None
+        self._thread: threading.Thread | None = None
+        self._current_scan_folder: str | None = None
 
         # Scanner state for UI display
         self._scanner_state: ScannerState = ScannerState.IDLE
@@ -179,7 +179,7 @@ class BackgroundScanner:
 
         # Track the folder currently being viewed in the UI
         # We skip rescanning this folder until user is idle for 5 minutes
-        self._ui_active_folder: Optional[str] = None
+        self._ui_active_folder: str | None = None
         self._ui_activity_time: float = 0  # Last time user interacted with the folder
 
         # Track folders that were rescanned in background and need UI refresh
@@ -228,12 +228,12 @@ class BackgroundScanner:
                 'next_action_in': max(0, self._next_action_time - time.time()) if self._next_action_time > 0 else 0
             }
 
-    def get_folder_status(self, folder_name: str) -> Optional[FolderState]:
+    def get_folder_status(self, folder_name: str) -> FolderState | None:
         """Get the current status of a folder."""
         with self._lock:
             return self._folder_states.get(folder_name)
 
-    def get_all_folder_states(self) -> Dict[str, FolderState]:
+    def get_all_folder_states(self) -> dict[str, FolderState]:
         """Get status of all tracked folders."""
         with self._lock:
             return dict(self._folder_states)
@@ -300,7 +300,7 @@ class BackgroundScanner:
                     state.last_change_detected = 0  # Skip stability wait
                     logger.debug(f"Prioritized folder for scanning: {folder_name}")
 
-    def set_ui_active_folder(self, folder_name: Optional[str]):
+    def set_ui_active_folder(self, folder_name: str | None):
         """Set the folder currently being viewed in the UI.
 
         The background scanner will skip rescanning this folder until the user
@@ -348,7 +348,7 @@ class BackgroundScanner:
         with self._lock:
             self._progress_callbacks.pop(folder_name, None)
 
-    def get_folder_progress(self, folder_name: str) -> Optional[Dict]:
+    def get_folder_progress(self, folder_name: str) -> dict | None:
         """Get the current scan progress for a folder."""
         with self._lock:
             state = self._folder_states.get(folder_name)
@@ -589,7 +589,7 @@ class BackgroundScanner:
         time_since_activity = current_time - self._ui_activity_time
         return time_since_activity < self.STABILITY_WAIT_SECONDS
 
-    def _get_next_folder_to_scan(self) -> Tuple[Optional[str], Optional[str]]:
+    def _get_next_folder_to_scan(self) -> tuple[str | None, str | None]:
         """Get the next folder that needs scanning.
 
         Returns (folder_name, wait_reason) where wait_reason explains why we're waiting.
@@ -883,10 +883,10 @@ class BackgroundScanner:
 
 
 # Global instance for the background scanner
-_background_scanner: Optional[BackgroundScanner] = None
+_background_scanner: BackgroundScanner | None = None
 
 
-def get_background_scanner() -> Optional[BackgroundScanner]:
+def get_background_scanner() -> BackgroundScanner | None:
     """Get the global background scanner instance."""
     return _background_scanner
 

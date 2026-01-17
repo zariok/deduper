@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Dict, Generic, Iterable, List, Optional, Tuple, TypeVar
+from typing import Callable, Generic, Iterable, TypeVar
 
 
 ValueT = TypeVar("ValueT")
@@ -14,8 +14,8 @@ class _BKNode(Generic[ValueT, PayloadT]):
 
     def __init__(self, value: ValueT, payload: PayloadT):
         self.value: ValueT = value
-        self.payloads: List[PayloadT] = [payload]
-        self.children: Dict[int, "_BKNode[ValueT, PayloadT]"] = {}
+        self.payloads: list[PayloadT] = [payload]
+        self.children: dict[int, "_BKNode[ValueT, PayloadT]"] = {}
 
     def add(self, value: ValueT, payload: PayloadT, distance_func: Callable[[ValueT, ValueT], int]) -> None:
         distance = distance_func(value, self.value)
@@ -32,7 +32,7 @@ class _BKNode(Generic[ValueT, PayloadT]):
 
         child.add(value, payload, distance_func)
 
-    def search(self, value: ValueT, tolerance: int, distance_func: Callable[[ValueT, ValueT], int], results: List[Tuple[PayloadT, int]]) -> None:
+    def search(self, value: ValueT, tolerance: int, distance_func: Callable[[ValueT, ValueT], int], results: list[tuple[PayloadT, int]]) -> None:
         distance = distance_func(value, self.value)
 
         if distance <= tolerance:
@@ -52,7 +52,7 @@ class BKTree(Generic[ValueT, PayloadT]):
 
     def __init__(self, distance_func: Callable[[ValueT, ValueT], int]):
         self._distance = distance_func
-        self._root: Optional[_BKNode[ValueT, PayloadT]] = None
+        self._root: _BKNode[ValueT, PayloadT] | None = None
 
     def add(self, value: ValueT, payload: PayloadT) -> None:
         if self._root is None:
@@ -61,14 +61,14 @@ class BKTree(Generic[ValueT, PayloadT]):
 
         self._root.add(value, payload, self._distance)
 
-    def bulk_add(self, items: Iterable[Tuple[ValueT, PayloadT]]) -> None:
+    def bulk_add(self, items: Iterable[tuple[ValueT, PayloadT]]) -> None:
         for value, payload in items:
             self.add(value, payload)
 
-    def search(self, value: ValueT, tolerance: int) -> List[Tuple[PayloadT, int]]:
+    def search(self, value: ValueT, tolerance: int) -> list[tuple[PayloadT, int]]:
         if self._root is None:
             return []
 
-        results: List[Tuple[PayloadT, int]] = []
+        results: list[tuple[PayloadT, int]] = []
         self._root.search(value, tolerance, self._distance, results)
         return results
