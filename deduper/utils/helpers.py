@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List
+# No typing imports needed - using modern Python 3.10+ syntax
 
 from .logging_config import get_logger
 

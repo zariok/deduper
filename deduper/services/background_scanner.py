@@ -156,8 +156,8 @@ class BackgroundScanner:
     def __init__(
         self,
         data_dir: str,
-        image_extensions: Set[str],
-        video_extensions: Set[str]
+        image_extensions: set[str],
+        video_extensions: set[str]
     ):
         self.data_dir = data_dir
         self.image_extensions = image_extensions
@@ -175,7 +175,7 @@ class BackgroundScanner:
         self._next_action_time: float = 0  # When the next action will happen
 
         # Track user-initiated scans to avoid conflicts
-        self._user_scanning_folders: Set[str] = set()
+        self._user_scanning_folders: set[str] = set()
 
         # Track the folder currently being viewed in the UI
         # We skip rescanning this folder until user is idle for 5 minutes
@@ -183,7 +183,7 @@ class BackgroundScanner:
         self._ui_activity_time: float = 0  # Last time user interacted with the folder
 
         # Track folders that were rescanned in background and need UI refresh
-        self._folders_needing_refresh: Set[str] = set()
+        self._folders_needing_refresh: set[str] = set()
 
         # Allow external progress callbacks to be registered
         self._progress_callbacks: dict[str, Callable] = {}
@@ -323,7 +323,7 @@ class BackgroundScanner:
         with self._lock:
             self._ui_activity_time = time.time()
 
-    def get_folders_needing_refresh(self) -> Set[str]:
+    def get_folders_needing_refresh(self) -> set[str]:
         """Get and clear the set of folders that were rescanned and need UI refresh."""
         with self._lock:
             folders = self._folders_needing_refresh.copy()
@@ -893,8 +893,8 @@ def get_background_scanner() -> BackgroundScanner | None:
 
 def init_background_scanner(
     data_dir: str,
-    image_extensions: Set[str],
-    video_extensions: Set[str]
+    image_extensions: set[str],
+    video_extensions: set[str]
 ) -> BackgroundScanner:
     """Initialize and start the global background scanner."""
     global _background_scanner
