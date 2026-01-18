@@ -3,7 +3,7 @@ name = "deduper"
 version = "0.1.0"
 description = "A tool for finding and managing duplicate images and videos"
 readme = "README.md"
-requires-python = ">=3.6"
+requires-python = ">=3.9,<3.13"
 license = "MIT"
 authors = [
     {name = "John Draughn", email = "john@draughn.dev"}
@@ -12,10 +12,10 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: End Users/Desktop",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.6",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
     "flask>=3.0.2",
@@ -33,7 +33,7 @@ Repository = "https://github.com/zariok/deduper.git"
 
 [tool.black]
 line-length = 88
-target-version = ['py36']
+target-version = ['py312']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -59,7 +59,7 @@ line_length = 88
 known_first_party = ["deduper"]
 
 [tool.mypy]
-python_version = "3.6"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

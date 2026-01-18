@@ -7,7 +7,7 @@ from werkzeug.exceptions import HTTPException
 import json
 import threading
 import time
-from typing import Dict, Any, Optional
+from typing import Any
 from ..services.duplicate_finder import DuplicateFinder
 from ..services.background_scanner import get_background_scanner, ScanStatus
 from ..config import Config
@@ -38,7 +38,7 @@ def update_progress(session_id: str, status: str, current: int = 0, total: int =
             'timestamp': time.time()
         }
 
-def get_progress(session_id: str) -> Dict[str, Any]:
+def get_progress(session_id: str) -> dict[str, Any]:
     """Get current progress for a session."""
     with progress_lock:
         progress = progress_data.get(session_id, {

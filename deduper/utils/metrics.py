@@ -4,7 +4,7 @@ Metrics collection for monitoring application performance.
 
 import time
 import threading
-from typing import Dict, Any, Optional
+from typing import Any
 from collections import defaultdict, deque
 from .logging_config import get_logger
 
@@ -22,7 +22,7 @@ class MetricsCollector:
         self._gauges = defaultdict(float)
         self._timers = defaultdict(list)
         
-    def increment_counter(self, name: str, value: int = 1, tags: Optional[Dict[str, str]] = None):
+    def increment_counter(self, name: str, value: int = 1, tags: dict[str, str] | None = None):
         """Increment a counter metric."""
         with self._lock:
             key = self._format_key(name, tags)
@@ -34,7 +34,7 @@ class MetricsCollector:
             })
             logger.debug(f"Counter {name} incremented by {value}")
     
-    def set_gauge(self, name: str, value: float, tags: Optional[Dict[str, str]] = None):
+    def set_gauge(self, name: str, value: float, tags: dict[str, str] | None = None):
         """Set a gauge metric value."""
         with self._lock:
             key = self._format_key(name, tags)
@@ -46,7 +46,7 @@ class MetricsCollector:
             })
             logger.debug(f"Gauge {name} set to {value}")
     
-    def record_timer(self, name: str, duration: float, tags: Optional[Dict[str, str]] = None):
+    def record_timer(self, name: str, duration: float, tags: dict[str, str] | None = None):
         """Record a timer metric."""
         with self._lock:
             key = self._format_key(name, tags)
@@ -62,19 +62,19 @@ class MetricsCollector:
             })
             logger.debug(f"Timer {name} recorded: {duration:.3f}s")
     
-    def get_counter(self, name: str, tags: Optional[Dict[str, str]] = None) -> int:
+    def get_counter(self, name: str, tags: dict[str, str] | None = None) -> int:
         """Get current counter value."""
         with self._lock:
             key = self._format_key(name, tags)
             return self._counters.get(key, 0)
     
-    def get_gauge(self, name: str, tags: Optional[Dict[str, str]] = None) -> float:
+    def get_gauge(self, name: str, tags: dict[str, str] | None = None) -> float:
         """Get current gauge value."""
         with self._lock:
             key = self._format_key(name, tags)
             return self._gauges.get(key, 0.0)
     
-    def get_timer_stats(self, name: str, tags: Optional[Dict[str, str]] = None) -> Dict[str, float]:
+    def get_timer_stats(self, name: str, tags: dict[str, str] | None = None) -> dict[str, float]:
         """Get timer statistics (min, max, avg, count)."""
         with self._lock:
             key = self._format_key(name, tags)
@@ -90,7 +90,7 @@ class MetricsCollector:
                 'count': len(values)
             }
     
-    def get_all_metrics(self) -> Dict[str, Any]:
+    def get_all_metrics(self) -> dict[str, Any]:
         """Get all current metrics."""
         with self._lock:
             return {
@@ -109,7 +109,7 @@ class MetricsCollector:
             self._metrics.clear()
             logger.info("All metrics reset")
     
-    def _format_key(self, name: str, tags: Optional[Dict[str, str]]) -> str:
+    def _format_key(self, name: str, tags: dict[str, str] | None) -> str:
         """Format metric key with tags."""
         if not tags:
             return name
@@ -121,7 +121,7 @@ class MetricsCollector:
 class TimerContext:
     """Context manager for timing operations."""
     
-    def __init__(self, metrics: MetricsCollector, name: str, tags: Optional[Dict[str, str]] = None):
+    def __init__(self, metrics: MetricsCollector, name: str, tags: dict[str, str] | None = None):
         self.metrics = metrics
         self.name = name
         self.tags = tags
@@ -141,7 +141,7 @@ class TimerContext:
 metrics = MetricsCollector()
 
 
-def timer(name: str, tags: Optional[Dict[str, str]] = None):
+def timer(name: str, tags: dict[str, str] | None = None):
     """Decorator for timing function execution."""
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -156,17 +156,17 @@ def timer(name: str, tags: Optional[Dict[str, str]] = None):
     return decorator
 
 
-def increment_counter(name: str, value: int = 1, tags: Optional[Dict[str, str]] = None):
+def increment_counter(name: str, value: int = 1, tags: dict[str, str] | None = None):
     """Convenience function to increment a counter."""
     metrics.increment_counter(name, value, tags)
 
 
-def set_gauge(name: str, value: float, tags: Optional[Dict[str, str]] = None):
+def set_gauge(name: str, value: float, tags: dict[str, str] | None = None):
     """Convenience function to set a gauge."""
     metrics.set_gauge(name, value, tags)
 
 
-def record_timer(name: str, duration: float, tags: Optional[Dict[str, str]] = None):
+def record_timer(name: str, duration: float, tags: dict[str, str] | None = None):
     """Convenience function to record a timer."""
     metrics.record_timer(name, duration, tags)
 

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Union, List
+# No typing imports needed - using modern Python 3.10+ syntax
 
 from .logging_config import get_logger
 
 logger = get_logger(__name__)
 
-PathLike = Union[str, os.PathLike]
+# Python 3.10+ supports | for union types
+PathLike = str | os.PathLike[str]
 
 
 def get_file_size(file_path: PathLike) -> int:
@@ -46,7 +47,7 @@ def format_file_size(num_bytes: int) -> str:
     return f"{value:.1f} {units[unit_index]}"
 
 
-def find_symlinks_pointing_to(target_file_path: str, search_directory: str) -> List[str]:
+def find_symlinks_pointing_to(target_file_path: str, search_directory: str) -> list[str]:
     """
     Find all symlinks in a directory that point to the target file.
     

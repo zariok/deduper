@@ -3,7 +3,7 @@ import time
 import multiprocessing as mp
 from collections import defaultdict
 from functools import partial
-from typing import List, Dict, Tuple, Optional, Callable, Any
+from typing import Callable, Any
 import imagehash
 from ..utils.bktree import BKTree
 from ..utils.helpers import get_file_size, format_file_size, create_symlink_and_remove_duplicate
@@ -20,7 +20,7 @@ class DuplicateFinder:
         self.video_extensions = video_extensions
 
     @timer('duplicate_detection_total')
-    def find_duplicates(self, folder_path: str, progress_callback: Optional[Callable] = None) -> Tuple[List[Dict], List[Dict]]:
+    def find_duplicates(self, folder_path: str, progress_callback: Callable | None = None) -> tuple[list[dict], list[dict]]:
         """Find duplicate images and videos in the given folder."""
         try:
             logger.info(f"Starting duplicate detection in: {folder_path}")
@@ -542,8 +542,8 @@ class DuplicateFinder:
         
         return groups
     
-    def _incremental_grouping(self, existing_image_groups: Dict, existing_video_groups: Dict, 
-                            image_files: List[str], video_files: List[str], cache, progress_callback: Optional[Callable] = None) -> Tuple[Dict, Dict]:
+    def _incremental_grouping(self, existing_image_groups: dict, existing_video_groups: dict, 
+                            image_files: list[str], video_files: list[str], cache, progress_callback: Callable | None = None) -> tuple[dict, dict]:
         """Perform incremental grouping for new files only."""
         logger.info("Performing incremental grouping...")
         
@@ -648,7 +648,7 @@ class DuplicateFinder:
         return image_groups, video_groups
     
     @staticmethod
-    def _get_file_hash(file_path: str, video_extensions: Tuple[str, ...]) -> Optional[Any]:
+    def _get_file_hash(file_path: str, video_extensions: tuple[str, ...]) -> Any | None:
         """Get hash for a single file - used for multiprocessing."""
         try:
             return get_image_hash(file_path, video_extensions)
@@ -657,7 +657,7 @@ class DuplicateFinder:
             return None
     
     
-    def _cluster_with_bktree(self, all_hashes: Dict[str, Any], threshold: int, progress_callback: Optional[Callable]) -> Tuple[Dict[str, List[str]], Dict[str, int]]:
+    def _cluster_with_bktree(self, all_hashes: dict[str, Any], threshold: int, progress_callback: Callable | None) -> tuple[dict[str, list[str]], dict[str, int]]:
         """Cluster files using a BK-tree to avoid O(n²) comparisons."""
         # Filter out files without hashes
         valid_items = [(path, hash_obj) for path, hash_obj in all_hashes.items() if hash_obj is not None]
@@ -673,8 +673,8 @@ class DuplicateFinder:
             bk_tree.add(hash_value, path)
         
         # Disjoint-set union structure
-        parent: Dict[str, str] = {}
-        rank: Dict[str, int] = {}
+        parent: dict[str, str] = {}
+        rank: dict[str, int] = {}
         
         def find(item: str) -> str:
             root = parent.setdefault(item, item)
@@ -725,7 +725,7 @@ class DuplicateFinder:
         logger.debug(f"Clustering complete, processed {len(processed_pairs)} unique pairs")
         
         # Build groups more efficiently
-        grouped_paths: Dict[str, List[str]] = defaultdict(list)
+        grouped_paths: dict[str, list[str]] = defaultdict(list)
         for path in parent.keys():
             root = find(path)
             grouped_paths[root].append(path)
@@ -737,7 +737,7 @@ class DuplicateFinder:
                 grouped_paths[path].append(path)
         
         # Normalize groups and count types
-        normalized_groups: Dict[str, List[str]] = {}
+        normalized_groups: dict[str, list[str]] = {}
         exact_groups = 0
         similar_groups = 0
         
@@ -786,7 +786,7 @@ class DuplicateFinder:
         group_string = "|".join(sorted(relative_files))
         return hashlib.md5(group_string.encode()).hexdigest()[:8]
     
-    def _process_exact_matches_automatically(self, groups: Dict[str, List[str]], cache, progress_callback: Optional[Callable] = None) -> Dict[str, List[str]]:
+    def _process_exact_matches_automatically(self, groups: dict[str, list[str]], cache, progress_callback: Callable | None = None) -> dict[str, list[str]]:
         """
         Automatically process exact matches by creating symlinks and removing them from groups.
         

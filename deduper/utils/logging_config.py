@@ -8,7 +8,7 @@ import logging.handlers
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+# No typing imports needed - using modern Python 3.10+ syntax
 from flask import request
 
 
@@ -36,7 +36,7 @@ class ColoredFormatter(logging.Formatter):
 
 def setup_logging(
     log_level: str = None,
-    log_file: Optional[str] = None,
+    log_file: str | None = None,
     enable_console: bool = True,
     enable_colors: bool = True
 ) -> logging.Logger:

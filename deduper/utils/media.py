@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Iterable
 
 import imagehash
 from PIL import Image, UnidentifiedImageError
@@ -32,7 +32,7 @@ class Resolution:
         return f"{self.width}x{self.height}" if self.is_known() else "Unknown"
 
 
-def _normalize_extensions(extensions: Iterable[str]) -> Tuple[str, ...]:
+def _normalize_extensions(extensions: Iterable[str]) -> tuple[str, ...]:
     normalized = []
     for ext in extensions:
         if not ext:
@@ -48,8 +48,8 @@ def _normalize_extensions(extensions: Iterable[str]) -> Tuple[str, ...]:
 @lru_cache(maxsize=2048)
 def _resolve_media_resolution_cached(
     path_str: str,
-    image_exts: Tuple[str, ...],
-    video_exts: Tuple[str, ...],
+    image_exts: tuple[str, ...],
+    video_exts: tuple[str, ...],
 ) -> Resolution:
     path = Path(path_str)
     suffix = path.suffix.lower()
@@ -125,7 +125,7 @@ def check_ffprobe() -> bool:
     return True
 
 
-def check_python_dependencies() -> Tuple[bool, str]:
+def check_python_dependencies() -> tuple[bool, str]:
     """
     Check if required Python dependencies are available.
     
@@ -166,7 +166,7 @@ Or install all requirements:
     return True, ""
 
 
-def check_video_tools() -> Tuple[bool, str]:
+def check_video_tools() -> tuple[bool, str]:
     """
     Check if required video processing tools are available.
     
@@ -248,7 +248,7 @@ Linux (CentOS/RHEL):
     return True, ""
 
 
-def check_all_requirements() -> Tuple[bool, str]:
+def check_all_requirements() -> tuple[bool, str]:
     """
     Check all application requirements (Python dependencies and video tools).
     
@@ -273,7 +273,7 @@ def extract_video_thumbnail(
     *,
     timestamp_seconds: float = 1.0,
     width: int = 320,
-) -> Optional[str]:
+) -> str | None:
     """
     Extract a single-frame thumbnail for the supplied video.
 
@@ -379,7 +379,7 @@ def extract_video_thumbnail(
 def get_image_hash(
     file_path: str,
     video_extensions: Iterable[str],
-) -> Optional[imagehash.ImageHash]:
+) -> imagehash.ImageHash | None:
     """
     Compute a perceptual hash for an image or video.
 
@@ -536,9 +536,9 @@ def compare_thumbnail_similarity(video_path1: str, video_path2: str, video_exten
 def get_enhanced_video_score(
     file_path: str, 
     video_extensions: Iterable[str],
-    reference_resolution: Optional[Resolution] = None,
-    reference_duration: Optional[float] = None,
-    reference_size: Optional[int] = None
+    reference_resolution: Resolution | None = None,
+    reference_duration: float | None = None,
+    reference_size: int | None = None
 ) -> float:
     """
     Calculate an enhanced score for video selection based on multiple criteria.
