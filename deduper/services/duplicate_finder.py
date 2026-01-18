@@ -673,8 +673,8 @@ class DuplicateFinder:
             bk_tree.add(hash_value, path)
         
         # Disjoint-set union structure
-        parent: Dict[str, str] = {}
-        rank: Dict[str, int] = {}
+        parent: dict[str, str] = {}
+        rank: dict[str, int] = {}
         
         def find(item: str) -> str:
             root = parent.setdefault(item, item)
@@ -725,7 +725,7 @@ class DuplicateFinder:
         logger.debug(f"Clustering complete, processed {len(processed_pairs)} unique pairs")
         
         # Build groups more efficiently
-        grouped_paths: Dict[str, List[str]] = defaultdict(list)
+        grouped_paths: dict[str, list[str]] = defaultdict(list)
         for path in parent.keys():
             root = find(path)
             grouped_paths[root].append(path)
@@ -737,7 +737,7 @@ class DuplicateFinder:
                 grouped_paths[path].append(path)
         
         # Normalize groups and count types
-        normalized_groups: Dict[str, List[str]] = {}
+        normalized_groups: dict[str, list[str]] = {}
         exact_groups = 0
         similar_groups = 0
         

@@ -38,7 +38,7 @@ def update_progress(session_id: str, status: str, current: int = 0, total: int =
             'timestamp': time.time()
         }
 
-def get_progress(session_id: str) -> Dict[str, Any]:
+def get_progress(session_id: str) -> dict[str, Any]:
     """Get current progress for a session."""
     with progress_lock:
         progress = progress_data.get(session_id, {

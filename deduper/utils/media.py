@@ -125,7 +125,7 @@ def check_ffprobe() -> bool:
     return True
 
 
-def check_python_dependencies() -> Tuple[bool, str]:
+def check_python_dependencies() -> tuple[bool, str]:
     """
     Check if required Python dependencies are available.
     
@@ -166,7 +166,7 @@ Or install all requirements:
     return True, ""
 
 
-def check_video_tools() -> Tuple[bool, str]:
+def check_video_tools() -> tuple[bool, str]:
     """
     Check if required video processing tools are available.
     
@@ -248,7 +248,7 @@ Linux (CentOS/RHEL):
     return True, ""
 
 
-def check_all_requirements() -> Tuple[bool, str]:
+def check_all_requirements() -> tuple[bool, str]:
     """
     Check all application requirements (Python dependencies and video tools).
     

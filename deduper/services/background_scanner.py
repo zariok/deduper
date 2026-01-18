@@ -163,7 +163,7 @@ class BackgroundScanner:
         self.image_extensions = image_extensions
         self.video_extensions = video_extensions
 
-        self._folder_states: Dict[str, FolderState] = {}
+        self._folder_states: dict[str, FolderState] = {}
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -186,7 +186,7 @@ class BackgroundScanner:
         self._folders_needing_refresh: Set[str] = set()
 
         # Allow external progress callbacks to be registered
-        self._progress_callbacks: Dict[str, Callable] = {}
+        self._progress_callbacks: dict[str, Callable] = {}
 
     def start(self):
         """Start the background scanner thread."""
@@ -421,7 +421,7 @@ class BackgroundScanner:
         self._set_scanner_state(ScannerState.IDLE, "Stopped")
         logger.info("Background scanner loop stopped")
 
-    def _read_cache_metadata(self, folder_path: str) -> Dict[str, Any]:
+    def _read_cache_metadata(self, folder_path: str) -> dict[str, Any]:
         """Read lightweight metadata from cache file without loading full hash data.
 
         Returns a dict with:
@@ -432,7 +432,7 @@ class BackgroundScanner:
         """
         cache_file = os.path.join(folder_path, HashCache.CACHE_FILENAME)
 
-        default_result: Dict[str, Any] = {
+        default_result: dict[str, Any] = {
             'status': ScanStatus.PENDING,
             'last_scan_time': 0.0,
             'duplicate_count': -1,

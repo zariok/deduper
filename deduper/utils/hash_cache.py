@@ -108,7 +108,7 @@ class HashCache:
         except OSError as e:
             logger.warning(f"Could not remove corrupted cache file: {e}")
     
-    def _is_old_cache_format(self, data: Dict[str, Any]) -> bool:
+    def _is_old_cache_format(self, data: dict[str, Any]) -> bool:
         """Check if cache uses old tuple format for file_stats."""
         for relative_path, stats in data.get("file_stats", {}).items():
             if isinstance(stats, (list, tuple)) and len(stats) == 2:
