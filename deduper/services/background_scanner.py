@@ -218,7 +218,7 @@ class BackgroundScanner:
         """Check if the background scanner is running."""
         return self._thread is not None and self._thread.is_alive()
 
-    def get_scanner_status(self) -> Dict:
+    def get_scanner_status(self) -> dict:
         """Get the current overall scanner status for UI display."""
         with self._lock:
             return {
