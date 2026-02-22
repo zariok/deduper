@@ -38,6 +38,15 @@ def _get_process_pool() -> ProcessPoolExecutor:
                 logger.info(f"Created persistent process pool with {workers} workers (spawn)")
     return _process_pool
 
+
+def shutdown_process_pool():
+    """Shut down the shared process pool, killing child processes."""
+    global _process_pool
+    if _process_pool is not None:
+        logger.info("Shutting down process pool...")
+        _process_pool.shutdown(wait=False, cancel_futures=True)
+        _process_pool = None
+
 class DuplicateFinder:
     _BKTREE_CHUNK_SIZE = 10_000
 

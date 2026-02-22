@@ -1,4 +1,5 @@
 import os
+import signal
 import sys
 import atexit
 from flask import Flask
@@ -61,6 +62,34 @@ def create_app(config_name='default'):
     return app
 
 
+_cleanup_done = False
+
+
+def _cleanup():
+    """Shut down background scanner, process pool, and SQLite caches."""
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
+
+    logger.info("Cleaning up resources...")
+    try:
+        stop_background_scanner()
+    except Exception:
+        pass
+    try:
+        from .services.duplicate_finder import shutdown_process_pool
+        shutdown_process_pool()
+    except Exception:
+        pass
+    try:
+        from .utils.hash_cache import close_all_caches
+        close_all_caches()
+    except Exception:
+        pass
+    logger.info("Cleanup complete")
+
+
 def _start_background_scanner(app: Flask):
     """Start the background scanner service."""
     # When Flask runs with debug=True and use_reloader=True (the default),
@@ -84,7 +113,16 @@ def _start_background_scanner(app: Flask):
         logger.info("Background scanner initialized and started")
 
         # Register cleanup on app shutdown
-        atexit.register(stop_background_scanner)
+        atexit.register(_cleanup)
+
+        # Handle SIGINT/SIGTERM so child processes are cleaned up on Ctrl+C
+        def _signal_handler(signum, frame):
+            logger.info(f"Received signal {signum}, shutting down...")
+            _cleanup()
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
 
     except Exception as e:
         logger.error(f"Failed to start background scanner: {e}", exc_info=True)
