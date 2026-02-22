@@ -2,19 +2,39 @@ import os
 import time
 import multiprocessing as mp
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from typing import Callable, Any
 import imagehash
 from ..utils.bktree import BKTree
 from ..utils.helpers import get_file_size, format_file_size, create_symlink_and_remove_duplicate
-from ..utils.media import get_detailed_resolution, get_file_resolution, get_image_hash, resolve_media_resolution, select_best_video_from_group, get_video_duration
-from ..utils.hash_cache import HashCache
+from ..utils.media import MultiHash, batch_extract_video_thumbnails, get_detailed_resolution, get_file_resolution, get_image_hash, resolve_media_resolution, select_best_video_from_group, get_video_duration
+from ..utils.hash_cache import HashCache, get_hash_cache
 from ..utils.logging_config import get_logger
 from ..utils.metrics import metrics, timer, increment_counter, set_gauge
 
 logger = get_logger(__name__)
 
+# Module-level persistent process pool — avoids fork/spawn overhead per scan.
+# Lazy-initialized on first use, reused across all subsequent scans.
+_process_pool: ProcessPoolExecutor | None = None
+_pool_lock = mp.Lock()
+
+
+def _get_process_pool() -> ProcessPoolExecutor:
+    """Return (and lazily create) the shared process pool."""
+    global _process_pool
+    if _process_pool is None:
+        with _pool_lock:
+            if _process_pool is None:
+                workers = min(mp.cpu_count(), 8)  # cap at 8 to avoid memory pressure
+                _process_pool = ProcessPoolExecutor(max_workers=workers)
+                logger.info(f"Created persistent process pool with {workers} workers")
+    return _process_pool
+
 class DuplicateFinder:
+    _BKTREE_CHUNK_SIZE = 10_000
+
     def __init__(self, image_extensions, video_extensions):
         self.image_extensions = image_extensions
         self.video_extensions = video_extensions
@@ -29,10 +49,10 @@ class DuplicateFinder:
             if progress_callback:
                 progress_callback('initializing_cache', 0, 0, 'Initializing cache...')
 
-            # Initialize hash cache
-            logger.debug(f"Creating HashCache for: {folder_path}")
-            cache = HashCache(folder_path)
-            logger.debug(f"HashCache created, getting stats...")
+            # Initialize hash cache (uses connection pool)
+            logger.debug(f"Getting HashCache for: {folder_path}")
+            cache = get_hash_cache(folder_path)
+            logger.debug(f"HashCache ready, getting stats...")
 
             cache_stats = cache.get_cache_stats()
             logger.info(f"Cache stats: {cache_stats['total_cached_files']} files cached, {cache_stats['cache_size_mb']:.2f} MB")
@@ -48,29 +68,37 @@ class DuplicateFinder:
             
             if progress_callback:
                 progress_callback('scanning', 0, 0, 'Scanning directory structure...')
-            
-            logger.debug("Scanning directory structure...")
+
+            logger.debug("Scanning directory structure (os.scandir)...")
             file_count = 0
-            for root, _, files in os.walk(folder_path):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    
-                    # Skip thumbnails and symlinks
-                    if file.startswith('thumb.') or file.startswith('thumb-deduper.') or os.path.islink(file_path):
-                        continue
-                        
-                    all_files.add(file_path)
-                    file_count += 1
-                    
-                    # Categorize files
-                    if any(file.lower().endswith(ext) for ext in self.image_extensions):
-                        image_files.append(file_path)
-                    elif any(file.lower().endswith(ext) for ext in self.video_extensions):
-                        video_files.append(file_path)
-                    
-                    # Update progress every 100 files
-                    if file_count % 100 == 0 and progress_callback:
-                        progress_callback('scanning', file_count, 0, f'Found {file_count} files...')
+
+            def _scan_recursive(path: str) -> None:
+                nonlocal file_count
+                try:
+                    with os.scandir(path) as entries:
+                        for entry in entries:
+                            if entry.name.startswith('thumb.') or entry.name.startswith('thumb-deduper.'):
+                                continue
+                            if entry.is_symlink():
+                                continue
+                            if entry.is_file():
+                                file_path = entry.path
+                                all_files.add(file_path)
+                                file_count += 1
+                                if any(file_path.lower().endswith(ext) for ext in self.image_extensions):
+                                    image_files.append(file_path)
+                                elif any(file_path.lower().endswith(ext) for ext in self.video_extensions):
+                                    video_files.append(file_path)
+                                if file_count % 100 == 0 and progress_callback:
+                                    progress_callback('scanning', file_count, 0, f'Found {file_count} files...')
+                            elif entry.is_dir():
+                                _scan_recursive(entry.path)
+                except PermissionError:
+                    logger.warning(f"Permission denied: {path}")
+                except OSError as e:
+                    logger.warning(f"Error scanning {path}: {e}")
+
+            _scan_recursive(folder_path)
             
             # Clean up deleted files from cache
             cache.cleanup_deleted_files(all_files)
@@ -396,45 +424,42 @@ class DuplicateFinder:
             return [], []
     
     def _group_files_by_hash_parallel(self, file_paths, video_extensions, threshold=5):
-        """Group files by perceptual hash using parallel processing."""
+        """Group files by perceptual hash using parallel processing.
+
+        Uses MultiHash comparison: two files match only when both pHash
+        and dHash distances are within *threshold*.
+        """
         if not file_paths:
             return {}
-        
-        # Use multiprocessing for hash calculation
-        num_processes = min(mp.cpu_count(), len(file_paths))
-        logger.info(f"Using {num_processes} processes for parallel processing")
-        
-        with mp.Pool(processes=num_processes) as pool:
-            # Process files in parallel to get hashes
-            hash_func = partial(self._get_file_hash, video_extensions=video_extensions)
-            hash_results = pool.map(hash_func, file_paths)
-        
-        logger.debug("Grouping similar files...")
-        # Group files by similar hashes
-        groups = {}
-        hash_to_groups = defaultdict(list)
-        
+
+        pool = _get_process_pool()
+        logger.info("Using persistent process pool for parallel processing")
+
+        hash_func = partial(self._get_file_hash, video_extensions=video_extensions)
+        hash_results = list(pool.map(hash_func, file_paths))
+
+        logger.debug("Grouping similar files (multi-hash)...")
+        groups: dict[str, list[str]] = {}
+        # Store (representative_path, representative_hash) for comparison
+        rep_hashes: list[tuple[str, Any]] = []
+
         for file_path, file_hash in zip(file_paths, hash_results):
             if file_hash is None:
                 continue
-                
-            # Convert hash to integer for easier comparison
-            hash_int = int(str(file_hash), 16)
-            
-            # Find existing group with similar hash
+
             found_group = None
-            for existing_hash in hash_to_groups:
-                if abs(hash_int - existing_hash) < threshold:
-                    found_group = hash_to_groups[existing_hash][0]
+            for rep_path, rep_hash in rep_hashes:
+                # MultiHash.__sub__ returns max(pHash_dist, dHash_dist)
+                if (file_hash - rep_hash) < threshold:
+                    found_group = rep_path
                     break
-            
+
             if found_group is not None:
                 groups[found_group].append(file_path)
             else:
-                # Create new group
                 groups[file_path] = [file_path]
-                hash_to_groups[hash_int].append(file_path)
-        
+                rep_hashes.append((file_path, file_hash))
+
         duplicate_count = len([g for g in groups.values() if len(g) > 1])
         logger.info(f"Found {duplicate_count} duplicate groups")
         return groups
@@ -456,28 +481,20 @@ class DuplicateFinder:
         
         for file_path in file_paths:
             relative_path = cache._get_relative_path(file_path)
-            has_cached_hash = relative_path in cache.cache_data["hashes"]
-            is_unchanged = cache._is_file_unchanged(file_path)
-            
-            # Debug logging for first few files
-            if len(files_to_process) < 3:
-                logger.debug(f"File: {file_path}")
-                logger.debug(f"Relative path: {relative_path}")
-                logger.debug(f"Has cached hash: {has_cached_hash}")
-                logger.debug(f"Is unchanged: {is_unchanged}")
-                logger.debug(f"Cache has {len(cache.cache_data['hashes'])} total hashes")
-            
-            if has_cached_hash and is_unchanged:
-                # Use cached hash (convert string back to ImageHash object)
-                try:
-                    cached_hash_str = cache.cache_data["hashes"][relative_path]
-                    cached_hashes[file_path] = imagehash.hex_to_hash(cached_hash_str)
-                    cached_files += 1
-                except Exception as e:
-                    logger.warning(f"Error loading cached hash for {file_path}: {e}")
+            has_cached = cache.has_cached_hash(relative_path) and cache._is_file_unchanged(file_path)
+
+            if has_cached:
+                cached_hash_str = cache.get_cached_hash_str(relative_path)
+                if cached_hash_str:
+                    try:
+                        cached_hashes[file_path] = MultiHash.from_str(cached_hash_str)
+                        cached_files += 1
+                    except Exception as e:
+                        logger.warning(f"Error loading cached hash for {file_path}: {e}")
+                        files_to_process.append(file_path)
+                else:
                     files_to_process.append(file_path)
             else:
-                # Need to process this file
                 files_to_process.append(file_path)
         
         logger.info(f"Found {cached_files} cached hashes, need to process {len(files_to_process)} files")
@@ -485,16 +502,27 @@ class DuplicateFinder:
         # Process new/changed files in parallel
         file_hashes = {}
         if files_to_process:
-            num_processes = min(mp.cpu_count(), len(files_to_process))
-            logger.info(f"Using {num_processes} processes for parallel hash calculation")
-            
+            # Pre-extract video thumbnails concurrently before hashing.
+            # This avoids each hash worker spawning its own FFmpeg sequentially.
+            video_files_to_process = [
+                f for f in files_to_process
+                if any(f.lower().endswith(ext) for ext in video_extensions)
+            ]
+            if video_files_to_process:
+                logger.info(f"Pre-extracting {len(video_files_to_process)} video thumbnails concurrently...")
+                if progress_callback:
+                    progress_callback('hashing', cached_files, len(file_paths),
+                                      f'Extracting {len(video_files_to_process)} video thumbnails...')
+                batch_extract_video_thumbnails(video_files_to_process, progress_callback=progress_callback)
+
+            pool = _get_process_pool()
+            logger.info(f"Using persistent process pool for parallel hash calculation")
+
             if progress_callback:
                 progress_callback('hashing', cached_files, len(file_paths), f'Hashing {len(files_to_process)} files in parallel...')
-            
-            with mp.Pool(processes=num_processes) as pool:
-                # Process files in parallel - use regular hash function, not cache-aware
-                hash_func = partial(self._get_file_hash, video_extensions=tuple(video_extensions))
-                hash_results = pool.map(hash_func, files_to_process)
+
+            hash_func = partial(self._get_file_hash, video_extensions=tuple(video_extensions))
+            hash_results = list(pool.map(hash_func, files_to_process))
             
             # Store results and update cache (batch update for better performance)
             cache_updates = {}
@@ -516,12 +544,7 @@ class DuplicateFinder:
             # Batch update cache to reduce I/O operations
             if cache_updates:
                 logger.debug(f"Batch updating cache with {len(cache_updates)} entries")
-                for relative_path, data in cache_updates.items():
-                    cache.cache_data["hashes"][relative_path] = data["hash"]
-                    cache.cache_data["file_stats"][relative_path] = data["stats"]
-                
-                # Save cache once after all updates
-                cache._save_cache()
+                cache.batch_update_hashes(cache_updates)
         
         # Combine cached and newly calculated hashes
         all_hashes = {**cached_hashes, **file_hashes}
@@ -542,108 +565,106 @@ class DuplicateFinder:
         
         return groups
     
-    def _incremental_grouping(self, existing_image_groups: dict, existing_video_groups: dict, 
+    def _incremental_grouping(self, existing_image_groups: dict, existing_video_groups: dict,
                             image_files: list[str], video_files: list[str], cache, progress_callback: Callable | None = None) -> tuple[dict, dict]:
-        """Perform incremental grouping for new files only."""
-        logger.info("Performing incremental grouping...")
-        
+        """Perform incremental grouping for new files using BK-tree search.
+
+        Builds a BK-tree from existing group representatives, then searches it
+        for each new file.  Complexity: O(new_files * log(existing_groups))
+        instead of the previous O(new_files * existing_groups).
+        """
+        logger.info("Performing incremental grouping (BK-tree accelerated)...")
+
         # Get all existing files from cached groups
         existing_files = set()
         for files in existing_image_groups.values():
             existing_files.update(files)
         for files in existing_video_groups.values():
             existing_files.update(files)
-        
-        # Debug logging for file comparison
+
         logger.debug(f"Existing files count: {len(existing_files)}")
         logger.debug(f"Current files count: {len(image_files + video_files)}")
-        logger.debug(f"First few existing files: {list(existing_files)[:3]}")
-        logger.debug(f"First few current files: {list(set(image_files + video_files))[:3]}")
-        
-        # Check for path mismatches
-        if existing_files and image_files + video_files:
-            sample_existing = list(existing_files)[0]
-            sample_current = list(set(image_files + video_files))[0]
-            logger.debug(f"Sample existing file: {sample_existing}")
-            logger.debug(f"Sample current file: {sample_current}")
-            logger.debug(f"Paths match: {sample_existing == sample_current}")
-        
+
         # Find new files
         all_current_files = set(image_files + video_files)
-        
-        # Normalize paths for consistent comparison
         normalized_existing_files = {os.path.normpath(f) for f in existing_files}
         normalized_current_files = {os.path.normpath(f) for f in all_current_files}
-        
         new_files = normalized_current_files - normalized_existing_files
-        
+
         logger.debug(f"New files count: {len(new_files)}")
-        if new_files:
-            logger.debug(f"First few new files: {list(new_files)[:3]}")
-        
+
         if not new_files:
             logger.info("No new files found, using cached groups")
             return existing_image_groups, existing_video_groups
-        
+
         logger.info(f"Found {len(new_files)} new files to process")
-        
-        # Separate new files by type
+
         new_image_files = [f for f in new_files if any(f.lower().endswith(ext) for ext in self.image_extensions)]
         new_video_files = [f for f in new_files if any(f.lower().endswith(ext) for ext in self.video_extensions)]
-        
         logger.info(f"New files: {len(new_image_files)} images, {len(new_video_files)} videos")
-        
-        # Get hashes for new files (this will use cache for unchanged files)
-        new_file_hashes = {}
+
+        # Hash all new files
+        new_file_hashes: dict[str, Any] = {}
         for file_path in new_files:
             hash_result = cache.get_hash(file_path, set(self.video_extensions))
             if hash_result is not None:
                 new_file_hashes[file_path] = hash_result
-        
+
         # Create copies of existing groups
-        image_groups = existing_image_groups.copy()
-        video_groups = existing_video_groups.copy()
-        
-        # Group new files against existing groups
+        image_groups = {k: list(v) for k, v in existing_image_groups.items()}
+        video_groups = {k: list(v) for k, v in existing_video_groups.items()}
+
+        threshold = 5
+        # MultiHash.__sub__ returns max(pHash dist, dHash dist), so both
+        # hashes must be within threshold for a match.
+        distance_func = lambda a, b: int(a - b)
+
+        # --- Build BK-trees from existing group representatives ---
+        def _build_rep_tree(groups: dict) -> BKTree:
+            tree: BKTree = BKTree(distance_func)
+            for rep_path in groups:
+                hash_str = cache.get_cached_hash_str(cache._get_relative_path(rep_path))
+                if hash_str:
+                    try:
+                        tree.add(MultiHash.from_str(hash_str), rep_path)
+                    except Exception:
+                        pass
+            return tree
+
+        image_tree = _build_rep_tree(image_groups) if image_groups else BKTree(distance_func)
+        video_tree = _build_rep_tree(video_groups) if video_groups else BKTree(distance_func)
+
+        logger.debug(f"Built BK-trees: image reps={len(image_groups)}, video reps={len(video_groups)}")
+
+        # --- Search the trees for each new file ---
         for file_path, file_hash in new_file_hashes.items():
-            found_similar = False
-            
-            # Check against existing image groups
-            if any(file_path.lower().endswith(ext) for ext in self.image_extensions):
-                for rep_path, files in image_groups.items():
-                    if rep_path in cache.cache_data["hashes"]:
-                        existing_hash_str = cache.cache_data["hashes"][cache._get_relative_path(rep_path)]
-                        existing_hash = imagehash.hex_to_hash(existing_hash_str)
-                        if file_hash - existing_hash < 5:  # threshold
-                            image_groups[rep_path].append(file_path)
-                            found_similar = True
-                            logger.debug(f"Added {file_path} to existing image group {rep_path}")
-                            break
-                
-                if not found_similar:
+            is_image = any(file_path.lower().endswith(ext) for ext in self.image_extensions)
+
+            if is_image:
+                matches = image_tree.search(file_hash, threshold)
+                if matches:
+                    best_rep = min(matches, key=lambda m: m[1])[0]  # closest match
+                    image_groups[best_rep].append(file_path)
+                    logger.debug(f"Added {os.path.basename(file_path)} to existing image group")
+                else:
                     image_groups[file_path] = [file_path]
-                    logger.debug(f"Created new image group for {file_path}")
-            
-            # Check against existing video groups
-            elif any(file_path.lower().endswith(ext) for ext in self.video_extensions):
-                for rep_path, files in video_groups.items():
-                    if rep_path in cache.cache_data["hashes"]:
-                        existing_hash_str = cache.cache_data["hashes"][cache._get_relative_path(rep_path)]
-                        existing_hash = imagehash.hex_to_hash(existing_hash_str)
-                        if file_hash - existing_hash < 5:  # threshold
-                            video_groups[rep_path].append(file_path)
-                            found_similar = True
-                            logger.debug(f"Added {file_path} to existing video group {rep_path}")
-                            break
-                
-                if not found_similar:
+                    image_tree.add(file_hash, file_path)
+                    logger.debug(f"Created new image group for {os.path.basename(file_path)}")
+            else:
+                matches = video_tree.search(file_hash, threshold)
+                if matches:
+                    best_rep = min(matches, key=lambda m: m[1])[0]
+                    video_groups[best_rep].append(file_path)
+                    logger.debug(f"Added {os.path.basename(file_path)} to existing video group")
+                else:
                     video_groups[file_path] = [file_path]
-                    logger.debug(f"Created new video group for {file_path}")
-        
+                    video_tree.add(file_hash, file_path)
+                    logger.debug(f"Created new video group for {os.path.basename(file_path)}")
+
         # Update cache with new groups
         all_groups = {**image_groups, **video_groups}
         cache.set_cached_groups(all_groups)
-        
+
         logger.info(f"Incremental grouping complete: {len(image_groups)} image groups, {len(video_groups)} video groups")
         return image_groups, video_groups
     
@@ -658,33 +679,27 @@ class DuplicateFinder:
     
     
     def _cluster_with_bktree(self, all_hashes: dict[str, Any], threshold: int, progress_callback: Callable | None) -> tuple[dict[str, list[str]], dict[str, int]]:
-        """Cluster files using a BK-tree to avoid O(n²) comparisons."""
-        # Filter out files without hashes
+        """Cluster files using a BK-tree with chunked construction to limit memory use."""
         valid_items = [(path, hash_obj) for path, hash_obj in all_hashes.items() if hash_obj is not None]
         if not valid_items:
             return {}, {"exact_groups": 0, "similar_groups": 0, "total_groups": 0}
-        
+
+        # MultiHash.__sub__ returns max(phash_dist, dhash_dist), ensuring
+        # both hashes must agree for two files to be considered similar.
         distance_func = lambda a, b: int(a - b)
         bk_tree: BKTree[Any, str] = BKTree(distance_func)
-        
-        # Build BK-tree more efficiently
-        logger.debug(f"Building BK-tree with {len(valid_items)} items")
-        for hash_value, path in ((hash_obj, path) for path, hash_obj in valid_items):
-            bk_tree.add(hash_value, path)
-        
-        # Disjoint-set union structure
+
         parent: dict[str, str] = {}
         rank: dict[str, int] = {}
-        
+
         def find(item: str) -> str:
             root = parent.setdefault(item, item)
             if root != item:
                 parent[item] = find(root)
             return parent[item]
-        
+
         def union(a: str, b: str) -> None:
-            root_a = find(a)
-            root_b = find(b)
+            root_a, root_b = find(a), find(b)
             if root_a == root_b:
                 return
             rank.setdefault(root_a, 0)
@@ -696,32 +711,28 @@ class DuplicateFinder:
             else:
                 parent[root_b] = root_a
                 rank[root_a] += 1
-        
-        # Optimize clustering by processing in batches and using set operations
+
         total = len(valid_items)
-        processed_pairs = set()  # Track processed pairs to avoid duplicate work
-        
-        logger.debug(f"Starting clustering with threshold {threshold}")
-        for index, (path, hash_obj) in enumerate(valid_items, start=1):
-            matches = bk_tree.search(hash_obj, threshold)
-            
-            # Process matches more efficiently
-            for match_path, distance in matches:
-                if match_path == path:
-                    continue
-                
-                # Create a canonical pair to avoid duplicate processing
-                pair = tuple(sorted([path, match_path]))
-                if pair in processed_pairs:
-                    continue
-                processed_pairs.add(pair)
-                
-                union(path, match_path)
-            
-            # Update progress less frequently to reduce overhead
-            if progress_callback and (index % max(1, total // 20) == 0 or index == total):
-                progress_callback('grouping', index, total, f'Clustering hashes {index}/{total}')
-        
+        processed_pairs: set[tuple[str, str]] = set()
+        chunk_size = self._BKTREE_CHUNK_SIZE
+
+        logger.debug(f"Clustering with BK-tree (chunked, {total} items, threshold={threshold})")
+        for chunk_start in range(0, total, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, total)
+            chunk = valid_items[chunk_start:chunk_end]
+            for path, hash_obj in chunk:
+                matches = bk_tree.search(hash_obj, threshold)
+                for match_path, _ in matches:
+                    if match_path == path:
+                        continue
+                    pair = tuple(sorted([path, match_path]))
+                    if pair in processed_pairs:
+                        continue
+                    processed_pairs.add(pair)
+                    union(path, match_path)
+                bk_tree.add(hash_obj, path)
+            if progress_callback:
+                progress_callback('grouping', chunk_end, total, f'Clustering hashes {chunk_end}/{total}')
         logger.debug(f"Clustering complete, processed {len(processed_pairs)} unique pairs")
         
         # Build groups more efficiently

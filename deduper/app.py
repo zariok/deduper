@@ -2,6 +2,7 @@ import os
 import sys
 import atexit
 from flask import Flask
+from flask_socketio import SocketIO
 from .config import config, Config
 from .utils.media import check_all_requirements
 from .utils.logging_config import setup_logging, configure_flask_logging, get_logger
@@ -10,6 +11,9 @@ from .services.background_scanner import init_background_scanner, stop_backgroun
 
 # Set up logging before creating the app
 logger = setup_logging()
+
+# Module-level SocketIO instance so it can be imported by __main__.py
+socketio = SocketIO()
 
 
 def create_app(config_name='default'):
@@ -39,6 +43,14 @@ def create_app(config_name='default'):
 
     # Register blueprints
     app.register_blueprint(bp)
+
+    # Initialize Socket.IO (Phase 3.2)
+    socketio.init_app(app, cors_allowed_origins="*", async_mode="threading")
+
+    # Register WebSocket event handlers
+    from .routes.socketio_events import register_socketio_events, init_socketio_ref
+    register_socketio_events(socketio)
+    init_socketio_ref(socketio)
 
     # Start background scanner (only in non-testing mode)
     if config_name != 'testing':
@@ -76,4 +88,4 @@ def _start_background_scanner(app: Flask):
 
     except Exception as e:
         logger.error(f"Failed to start background scanner: {e}", exc_info=True)
-        # Don't fail app startup if background scanner fails 
+        # Don't fail app startup if background scanner fails

@@ -13,8 +13,8 @@ from ..services.background_scanner import get_background_scanner, ScanStatus
 from ..config import Config
 from ..utils.setup import create_example_folder
 from ..utils.media import extract_video_thumbnail, resolve_media_resolution, get_video_duration
-from ..utils.helpers import get_file_size, format_file_size
-from ..utils.hash_cache import HashCache
+from ..utils.helpers import get_file_size, format_file_size, create_symlink_and_remove_duplicate, find_symlinks_pointing_to
+from ..utils.hash_cache import HashCache, get_hash_cache
 from ..utils.logging_config import get_logger
 from ..utils.metrics import metrics, timer, increment_counter, set_gauge
 
@@ -27,16 +27,21 @@ progress_data = {}
 progress_lock = threading.Lock()
 
 def update_progress(session_id: str, status: str, current: int = 0, total: int = 0, message: str = "") -> None:
-    """Update progress for a specific session."""
+    """Update progress for a specific session and push via WebSocket."""
     logger.debug(f"update_progress called - session_id: {session_id}, status: {status}, current: {current}, total: {total}, message: {message}")
+    payload = {
+        'status': status,  # 'scanning', 'processing', 'grouping', 'complete', 'error'
+        'current': current,
+        'total': total,
+        'message': message,
+        'timestamp': time.time()
+    }
     with progress_lock:
-        progress_data[session_id] = {
-            'status': status,  # 'scanning', 'processing', 'grouping', 'complete', 'error'
-            'current': current,
-            'total': total,
-            'message': message,
-            'timestamp': time.time()
-        }
+        progress_data[session_id] = payload
+
+    # Push to WebSocket subscribers (Phase 3.2)
+    from .socketio_events import emit_scan_progress
+    emit_scan_progress(session_id, payload)
 
 def get_progress(session_id: str) -> dict[str, Any]:
     """Get current progress for a session."""
@@ -254,79 +259,25 @@ def manage_duplicate():
             full_file_path = os.path.join(folder_path, file_path)
             full_best_file_path = os.path.join(folder_path, best_file_path)
             
-            # Debug logging
-            logger.debug(f"Attempting to delete file: {full_file_path}")
-            logger.debug(f"File exists check: {os.path.exists(full_file_path)}")
-            logger.debug(f"Best file path: {full_best_file_path}")
-            logger.debug(f"Best file exists: {os.path.exists(full_best_file_path)}")
-            
-            # Calculate relative path for symlink
-            if os.path.exists(full_file_path):
-                duplicate_dir = os.path.dirname(full_file_path)
-                best_file_dir = os.path.dirname(full_best_file_path)
-                best_file_name = os.path.basename(full_best_file_path)
-                
-                if duplicate_dir == best_file_dir:
-                    relative_path = best_file_name
-                else:
-                    try:
-                        relative_path = os.path.relpath(full_best_file_path, duplicate_dir)
-                    except ValueError:
-                        relative_path = full_best_file_path
-                
-                logger.debug(f"Will create symlink with relative path: {relative_path}")
-                
-            if os.path.exists(full_file_path):
-                # Remove the original duplicate file
-                os.remove(full_file_path)
-                
-                # Create relative symlink to the best file
-                try:
-                    # Calculate relative path from duplicate to best file
-                    duplicate_dir = os.path.dirname(full_file_path)
-                    best_file_dir = os.path.dirname(full_best_file_path)
-                    best_file_name = os.path.basename(full_best_file_path)
-                    
-                    # If they're in the same directory, just use the filename
-                    if duplicate_dir == best_file_dir:
-                        relative_path = best_file_name
-                    else:
-                        # Calculate relative path between directories
-                        try:
-                            relative_path = os.path.relpath(full_best_file_path, duplicate_dir)
-                        except ValueError:
-                            # If we can't calculate relative path (different drives on Windows), use absolute
-                            relative_path = full_best_file_path
-                    
-                    os.symlink(relative_path, full_file_path)
-                except OSError as e:
-                    return jsonify({'error': f'Failed to create symlink: {str(e)}'}), 500
-                
-                # Also remove deduper thumbnail if it exists (we'll let the system regenerate it if needed)
-                directory = os.path.dirname(full_file_path)
-                basename = os.path.basename(full_file_path)
-                basename_stem = Path(basename).stem
-                deduper_thumb_path = os.path.join(directory, f"thumb-deduper.{basename_stem}.jpg")
-                if os.path.exists(deduper_thumb_path):
-                    os.remove(deduper_thumb_path)
-                
-                # Update cache to reflect the file deletion and symlink creation
-                try:
-                    from ..utils.hash_cache import HashCache
-                    cache = HashCache(folder_path)
-                    
-                    # Remove the deleted file from cache hashes and file_stats
-                    cache.update_file_stats(full_file_path)
-                    
-                    # Remove the deleted file from cached groups
-                    cache.remove_file_from_groups(full_file_path)
-                    
-                    logger.debug(f"Updated cache after deleting {file_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to update cache after deletion: {e}")
-                    
-                return jsonify({'message': 'File replaced with symlink to best file successfully'})
-            return jsonify({'error': f'File not found: {file_path}'}), 404
+            # Use shared helper for symlink creation (single source of truth)
+            logger.debug(f"Attempting to replace duplicate: {full_file_path} -> {full_best_file_path}")
+
+            success = create_symlink_and_remove_duplicate(full_file_path, full_best_file_path)
+            if not success:
+                if not os.path.exists(full_file_path):
+                    return jsonify({'error': f'File not found: {file_path}'}), 404
+                return jsonify({'error': 'Failed to create symlink'}), 500
+
+            # Update cache to reflect the file deletion and symlink creation
+            try:
+                cache = get_hash_cache(folder_path)
+                cache.update_file_stats(full_file_path)
+                cache.remove_file_from_groups(full_file_path)
+                logger.debug(f"Updated cache after deleting {file_path}")
+            except Exception as e:
+                logger.warning(f"Failed to update cache after deletion: {e}")
+
+            return jsonify({'message': 'File replaced with symlink to best file successfully'})
         elif action == 'set_best':
             best_file_path = data.get('best_file_path')
             group_id = data.get('group_id')
@@ -354,8 +305,7 @@ def manage_duplicate():
             try:
                 # Instead of physically swapping files, just update the cache to remember
                 # which file should be considered the "best" for this group
-                from ..utils.hash_cache import HashCache
-                cache = HashCache(folder_path)
+                cache = get_hash_cache(folder_path)
                 
                 # Store the new best file selection in cache (using absolute path for cache)
                 if group_id:
@@ -385,8 +335,6 @@ def manage_duplicate():
             logger.debug(f"Folder: {folder}")
             
             try:
-                from ..utils.hash_cache import HashCache
-                
                 # Construct the full folder path
                 folder_path = os.path.join(Config.DATA_DIR, folder)
                 logger.debug(f"Full folder path: {folder_path}")
@@ -404,17 +352,17 @@ def manage_duplicate():
                     return jsonify({'error': f'Best file not found: {full_best_file_path}'}), 404
             
                 # Get all files in this group
-                cache = HashCache(folder_path)
+                cache = get_hash_cache(folder_path)
                 group_files = cache.get_group_files(group_id)
                 if not group_files:
                     # Additional debugging information
                     logger.debug(f"No files found for group {group_id}")
-                    logger.debug(f"Available groups in cache: {list(cache.cache_data.get('groups', {}).keys())}")
-                    logger.debug(f"Available grouping_results: {list(cache.cache_data.get('grouping_results', {}).keys())}")
+                    logger.debug(f"Available groups in cache: {cache.get_group_ids()}")
+                    logger.debug(f"Available grouping_results: {list(cache.get_cached_groups().keys())}")
 
                     # Try to refresh the cache and search again
                     logger.debug(f"Attempting to refresh cache and search again...")
-                    cache = HashCache(folder_path)  # Reload cache
+                    cache = get_hash_cache(folder_path)  # Reload cache
                     group_files = cache.get_group_files(group_id)
                     
                     if not group_files:
@@ -428,7 +376,6 @@ def manage_duplicate():
                 logger.debug(f"Found {len(group_files)} files in group {group_id}")
                 
                 # Find and update any existing symlinks that point to the old best file
-                from ..utils.helpers import find_symlinks_pointing_to
                 old_symlinks = []
                 for file_path in group_files:
                     if file_path != full_best_file_path and os.path.islink(file_path):
@@ -610,7 +557,7 @@ def clear_cache(user_folder):
         if not os.path.exists(folder_path):
             return jsonify({'error': f'Folder not found: {decoded_folder}'}), 404
         
-        cache = HashCache(folder_path)
+        cache = get_hash_cache(folder_path)
         cache.invalidate_cache()
         return jsonify({'message': 'Cache cleared successfully'})
     except Exception as e:
@@ -629,9 +576,7 @@ def live_cache_stats(user_folder):
         if not os.path.exists(folder_path):
             return jsonify({'error': f'Folder not found: {decoded_folder}'}), 404
 
-        cache_file = os.path.join(folder_path, '.deduper')
-
-        # Default stats if cache doesn't exist
+        db_file = os.path.join(folder_path, HashCache.DB_FILENAME)
         stats = {
             'total_cached_files': 0,
             'cache_size_mb': 0,
@@ -643,45 +588,14 @@ def live_cache_stats(user_folder):
             'remaining_duplicates': 0,
             'timestamp': time.time()
         }
-
-        # Read cache file directly without locking (read-only access)
-        if os.path.exists(cache_file):
+        if os.path.exists(db_file):
             try:
-                # Get file size
-                stats['cache_size_mb'] = os.path.getsize(cache_file) / (1024 * 1024)
-
-                # Read and parse JSON - this is read-only, no lock needed
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-
-                stats['total_cached_files'] = len(data.get('hashes', {}))
-                stats['created'] = data.get('created', 0)
-                stats['last_updated'] = data.get('last_updated', 0)
-
-                # Count groups from cached grouping results
-                grouping_results = data.get('grouping_results', {})
-                stats['total_groups'] = len(grouping_results)
-
-                # Count duplicate groups and remaining duplicates
-                for group_files in grouping_results.values():
-                    if len(group_files) > 1:
-                        stats['duplicate_groups'] += 1
-                        # Count non-symlink files as remaining duplicates
-                        for rel_path in group_files:
-                            abs_path = os.path.join(folder_path, rel_path)
-                            if os.path.exists(abs_path) and not os.path.islink(abs_path):
-                                stats['remaining_duplicates'] += 1
-
-                # Count processed groups
-                groups = data.get('groups', {})
-                for group_data in groups.values():
-                    if isinstance(group_data, dict) and group_data.get('processed', False):
-                        stats['processed_groups'] += 1
-
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning(f"Error reading cache file for stats: {e}")
-                # Return default stats on error
-
+                cache = get_hash_cache(folder_path)
+                s = cache.get_cache_stats()
+                stats.update(s)
+                stats['timestamp'] = time.time()
+            except (OSError, Exception) as e:
+                logger.warning(f"Error reading cache for stats: {e}")
         return jsonify(stats)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -698,6 +612,7 @@ def scanner_status():
                 'scanner_state': 'idle',
                 'scanner_message': 'Background scanner not initialized',
                 'current_folder': None,
+                'started_at': None,
                 'folders': {}
             })
 
@@ -705,28 +620,22 @@ def scanner_status():
         scanner_info = scanner.get_scanner_status()
         folder_states = scanner.get_all_folder_states()
 
-        # Convert to JSON-serializable format
-        folders_info = {}
-        for folder_name, state in folder_states.items():
-            folders_info[folder_name] = {
-                'status': state.status.value,
-                'last_scan_time': state.last_scan_time,
-                'last_modified_time': state.last_modified_time,
-                'file_count': state.file_count,
-                'error_message': state.error_message,
-                'ready': state.status == ScanStatus.COMPLETE,
-                'scan_progress': state.scan_progress,
-                'scan_total': state.scan_total,
-                'scan_message': state.scan_message,
-                'duplicate_count': state.duplicate_count
-            }
+        # Convert to JSON-serializable format (reuse shared serializer)
+        from .socketio_events import _serialize_folder_state
+        folders_info = {
+            name: _serialize_folder_state(state)
+            for name, state in folder_states.items()
+        }
 
         return jsonify({
             'running': scanner.is_running(),
             'scanner_state': scanner_info['state'],
             'scanner_message': scanner_info['message'],
             'current_folder': scanner_info['current_folder'],
+            'active_scans': scanner_info.get('active_scans', []),
+            'queue_size': scanner_info.get('queue_size', 0),
             'next_action_in': scanner_info['next_action_in'],
+            'started_at': scanner_info.get('started_at'),
             'folders': folders_info
         })
     except Exception as e:
@@ -891,42 +800,25 @@ def get_cached_results(user_folder: str):
         scanner = get_background_scanner()
         is_ready = scanner and scanner.is_folder_ready(decoded_folder)
 
-        cache_file = os.path.join(folder_path, '.deduper')
-        if not os.path.exists(cache_file):
+        db_file = os.path.join(folder_path, HashCache.DB_FILENAME)
+        if not os.path.exists(db_file):
             return jsonify({
                 'cached': False,
                 'ready': False,
                 'message': 'No cache available, scan required'
             })
 
-        # Read cached results
-        try:
-            with open(cache_file, 'r', encoding='utf-8') as f:
-                cache_data = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Error reading cache file: {e}")
-            return jsonify({
-                'cached': False,
-                'ready': False,
-                'message': 'Cache file corrupted or unreadable'
-            })
-
-        # Check if we have grouping results
-        if 'grouping_results' not in cache_data:
+        cache = get_hash_cache(folder_path)
+        grouping_results = cache.get_cached_groups()
+        if not grouping_results:
             return jsonify({
                 'cached': False,
                 'ready': is_ready,
                 'message': 'Cache exists but no grouping results available'
             })
 
-        # Build the duplicate groups from cached data
-        cache = HashCache(folder_path)
         duplicate_images = []
         duplicate_videos = []
-
-        # Process cached groups
-        grouping_results = cache_data.get('grouping_results', {})
-        best_files = cache_data.get('best_files', {})
 
         # Helper to get file metadata
         def get_file_metadata(abs_path: str, is_video: bool) -> dict:
@@ -964,28 +856,14 @@ def get_cached_results(user_folder: str):
                 }
 
         for rep_path, files in grouping_results.items():
-            if len(files) <= 1:
-                continue  # Skip non-duplicate groups
-
-            # Convert relative paths to absolute
-            abs_files = []
-            for rel_path in files:
-                abs_path = os.path.join(folder_path, rel_path)
-                # Skip symlinks and non-existent files
-                if os.path.exists(abs_path) and not os.path.islink(abs_path):
-                    abs_files.append(abs_path)
-
+            # get_cached_groups returns absolute paths, already excluding symlinks
+            abs_files = [p for p in files if os.path.exists(p)]
             if len(abs_files) <= 1:
-                continue  # No longer a duplicate group after filtering
+                continue
 
-            # Determine best file
             group_id = cache._generate_group_id_from_files(abs_files)
-            best_file_path = best_files.get(group_id)
-            if best_file_path:
-                best_file_path = os.path.join(folder_path, best_file_path)
-                if not os.path.exists(best_file_path) or os.path.islink(best_file_path):
-                    best_file_path = abs_files[0]
-            else:
+            best_file_path = cache.get_best_file(group_id)
+            if not best_file_path or not os.path.exists(best_file_path) or os.path.islink(best_file_path):
                 best_file_path = abs_files[0]
 
             # Determine if this is a video group
@@ -1041,7 +919,7 @@ def get_cached_results(user_folder: str):
             'ready': is_ready,
             'duplicate_images': duplicate_images,
             'duplicate_videos': duplicate_videos,
-            'last_updated': cache_data.get('last_updated', 0)
+            'last_updated': cache.get_cache_stats().get('last_updated', 0)
         })
 
     except Exception as e:

@@ -62,4 +62,8 @@ data/
 # *.mkv
 
 # Thumbnails
-thumb.* 
+thumb.*
+
+# Claude session notes (keep local only)
+PROGRESS.md
+SUMMARY-CLAUDE.md
