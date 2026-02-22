@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import lru_cache
@@ -14,6 +15,10 @@ from PIL import Image, UnidentifiedImageError
 from .logging_config import get_logger
 
 logger = get_logger(__name__)
+
+# Shared thread pool for concurrent FFmpeg subprocess execution.
+# Threads are ideal here because each thread just waits on a subprocess.
+_ffmpeg_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ffmpeg")
 
 
 @dataclass(frozen=True)
@@ -376,14 +381,130 @@ def extract_video_thumbnail(
     return None
 
 
+def batch_extract_video_thumbnails(
+    video_paths: list[str],
+    *,
+    timestamp_seconds: float = 1.0,
+    width: int = 320,
+    progress_callback: object | None = None,
+) -> dict[str, str | None]:
+    """
+    Extract thumbnails for multiple videos concurrently using a thread pool.
+
+    Each FFmpeg invocation is I/O-bound (waiting on subprocess), so threads
+    give near-linear speedup without the overhead of extra processes.
+
+    Returns a dict mapping video_path -> thumbnail_path (or None on failure).
+    """
+    # Filter to only videos that actually need thumbnail generation
+    to_extract: list[str] = []
+    results: dict[str, str | None] = {}
+
+    for vp in video_paths:
+        source = Path(vp)
+        target = source.with_name(f"thumb-deduper.{source.stem}.jpg")
+        if target.exists() and target.stat().st_size > 0 and _is_valid_image(target):
+            results[vp] = str(target)  # already cached on disk
+        else:
+            to_extract.append(vp)
+
+    if not to_extract:
+        return results
+
+    logger.info(f"Batch extracting {len(to_extract)} video thumbnails ({len(results)} already cached)")
+
+    futures = {
+        _ffmpeg_pool.submit(
+            extract_video_thumbnail,
+            vp,
+            timestamp_seconds=timestamp_seconds,
+            width=width,
+        ): vp
+        for vp in to_extract
+    }
+
+    done_count = 0
+    for future in as_completed(futures):
+        vp = futures[future]
+        try:
+            results[vp] = future.result()
+        except Exception as exc:
+            logger.warning("Thumbnail extraction failed for %s: %s", vp, exc)
+            results[vp] = None
+        done_count += 1
+        if progress_callback and done_count % 50 == 0:
+            logger.debug(f"Batch thumbnails: {done_count}/{len(to_extract)} done")
+
+    return results
+
+
+@dataclass(frozen=True)
+class MultiHash:
+    """Holds both pHash and dHash for a media file (Phase 3.3).
+
+    Using two independent perceptual hash algorithms greatly reduces
+    false-positive matches.  Two files are considered similar only when
+    *both* hashes agree.
+
+    String serialization: ``"<phash_hex>|<dhash_hex>"``
+    """
+    phash: imagehash.ImageHash
+    dhash: imagehash.ImageHash
+
+    # ------ Hamming distances ------
+    def phash_distance(self, other: "MultiHash") -> int:
+        return int(self.phash - other.phash)
+
+    def dhash_distance(self, other: "MultiHash") -> int:
+        return int(self.dhash - other.dhash)
+
+    def max_distance(self, other: "MultiHash") -> int:
+        """Return the larger of the two hash distances.
+
+        This is the value used for BK-tree grouping: a pair is only
+        considered similar when *both* hashes are within threshold, so
+        the effective distance is the maximum of the two.
+        """
+        return max(self.phash_distance(other), self.dhash_distance(other))
+
+    # ------ Serialization ------
+    def __str__(self) -> str:
+        return f"{self.phash}|{self.dhash}"
+
+    @classmethod
+    def from_str(cls, s: str) -> "MultiHash":
+        """Deserialize from the ``"phash_hex|dhash_hex"`` format."""
+        parts = s.split("|", 1)
+        if len(parts) == 2:
+            return cls(
+                phash=imagehash.hex_to_hash(parts[0]),
+                dhash=imagehash.hex_to_hash(parts[1]),
+            )
+        # Legacy fallback: a single hex string is treated as pHash only.
+        # We generate a zero dHash so the distance is always 0 for dHash
+        # and grouping degrades gracefully to pHash-only behaviour.
+        ph = imagehash.hex_to_hash(parts[0])
+        return cls(phash=ph, dhash=ph)
+
+    # ------ Comparison helpers (for BK-tree distance function) ------
+    def __sub__(self, other: "MultiHash") -> int:  # type: ignore[override]
+        """Hamming distance used by BK-tree: max of both hash distances."""
+        return self.max_distance(other)
+
+    def __int__(self) -> int:
+        """Not meaningful, but required by some legacy code paths that do int(hash)."""
+        return int(str(self.phash), 16)
+
+
 def get_image_hash(
     file_path: str,
     video_extensions: Iterable[str],
-) -> imagehash.ImageHash | None:
+) -> MultiHash | None:
     """
-    Compute a perceptual hash for an image or video.
+    Compute a dual perceptual hash (pHash + dHash) for an image or video.
 
     Videos are hashed based on the extracted thumbnail frame.
+    Returns a ``MultiHash`` containing both hash values, or None on failure.
     """
     path = Path(file_path)
     video_exts = _normalize_extensions(video_extensions)
@@ -393,22 +514,26 @@ def get_image_hash(
             if not thumbnail_path:
                 logger.warning("No valid thumbnail available for video: %s - SKIPPING from duplicate detection", path)
                 return None
-            
-            # Double-check that the thumbnail is valid before hashing
+
             thumbnail_path_obj = Path(thumbnail_path)
             if not _is_valid_image(thumbnail_path_obj):
                 logger.debug("Thumbnail is not a valid image: %s", thumbnail_path)
                 return None
-                
+
             with Image.open(thumbnail_path) as frame:
-                return imagehash.phash(frame)
+                return MultiHash(
+                    phash=imagehash.phash(frame),
+                    dhash=imagehash.dhash(frame),
+                )
         else:
-            # For images, validate before hashing
             if not _is_valid_image(path):
                 logger.debug("File is not a valid image: %s", path)
                 return None
             with Image.open(path) as image:
-                return imagehash.phash(image)
+                return MultiHash(
+                    phash=imagehash.phash(image),
+                    dhash=imagehash.dhash(image),
+                )
     except (UnidentifiedImageError, OSError) as exc:
         logger.warning("Unable to hash %s: %s", path, exc)
         return None
@@ -504,30 +629,26 @@ def get_video_duration(file_path: str) -> float:
 
 def compare_thumbnail_similarity(video_path1: str, video_path2: str, video_extensions: Iterable[str]) -> float:
     """
-    Compare thumbnail similarity between two videos.
-    
+    Compare thumbnail similarity between two videos using multi-hash.
+
     Returns a similarity score between 0.0 (completely different) and 1.0 (identical).
     Returns 0.0 if thumbnails cannot be compared.
     """
     try:
-        # Get hashes for both videos
         hash1 = get_image_hash(video_path1, video_extensions)
         hash2 = get_image_hash(video_path2, video_extensions)
-        
+
         if hash1 is None or hash2 is None:
             logger.debug("Cannot compare thumbnails - one or both hashes are None")
             return 0.0
-        
-        # Calculate Hamming distance (0 = identical, higher = more different)
-        hamming_distance = hash1 - hash2
-        
-        # Convert to similarity score (0-1 scale)
-        # Using a threshold of 10 for "completely different" (adjustable)
+
+        # Use max_distance (worst of pHash and dHash) for conservative matching
+        hamming_distance = hash1.max_distance(hash2)
+
         max_distance = 10
         similarity = max(0.0, 1.0 - (hamming_distance / max_distance))
-        
         return similarity
-        
+
     except Exception as exc:
         logger.debug("Error comparing thumbnails: %s", exc)
         return 0.0
@@ -699,7 +820,9 @@ def _format_timestamp(seconds: float) -> str:
 
 
 __all__ = [
+    "MultiHash",
     "Resolution",
+    "batch_extract_video_thumbnails",
     "check_ffmpeg",
     "check_ffprobe",
     "check_python_dependencies",

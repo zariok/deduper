@@ -1,11 +1,14 @@
-from .app import create_app
-from .config import config
+from .app import create_app, socketio
 
 if __name__ == '__main__':
     app = create_app()
-    app.run(
+    # Use socketio.run() instead of app.run() to enable WebSocket support.
+    # This wraps the Flask dev server with Socket.IO's WSGI middleware.
+    socketio.run(
+        app,
         host=app.config['HOST'],
         port=app.config['PORT'],
         debug=True,
-        threaded=True  # Enable threading to prevent blocking on long-running requests
-    ) 
+        use_reloader=True,
+        allow_unsafe_werkzeug=True,  # Required for Flask-SocketIO with Werkzeug dev server
+    )

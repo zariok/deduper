@@ -55,6 +55,23 @@ pip install -e .
 
 ## Usage
 
+### Upgrading from Previous Version
+
+If you're upgrading from a version that used JSON cache files (`.deduper`), you **must** run the migration script **before** starting the new version:
+
+```bash
+# Dry-run to see what would be migrated
+python scripts/migrate_deduper_to_sqlite.py --dry-run
+
+# Migrate all .deduper files to .deduper.db (and remove .deduper files)
+python scripts/migrate_deduper_to_sqlite.py --root /path/to/data
+
+# Or use DEDUPER_DATA_DIR environment variable
+python scripts/migrate_deduper_to_sqlite.py
+```
+
+The migration script converts all existing `.deduper` JSON cache files to the new SQLite format (`.deduper.db`) for 10-20x faster performance.
+
 ### Basic Usage
 1.  Create a `data` directory and put your folders of images within it or set the environmental variable `DEDUPER_DATA_DIR`
 

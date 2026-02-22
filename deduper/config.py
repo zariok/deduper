@@ -27,8 +27,11 @@ class Config:
     STATIC_DIR = BASE_DIR / 'static'
     
     # Supported file extensions
-    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}
-    VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv'}
+    # NOTE: .gif is classified as video because animated GIFs are temporal media.
+    # Hashing only the first frame (image pipeline) causes false matches with static images.
+    # FFmpeg handles GIFs as video streams, extracting a consistent thumbnail frame.
+    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff', '.tif', '.avif'}
+    VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.gif', '.webm', '.flv', '.wmv', '.m4v'}
     
     @classmethod
     def init_app(cls, app):
