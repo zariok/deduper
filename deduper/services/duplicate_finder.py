@@ -2,7 +2,7 @@ import os
 import time
 import multiprocessing as mp
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 from typing import Callable, Any
 import imagehash
@@ -16,9 +16,12 @@ from ..utils.metrics import metrics, timer, increment_counter, set_gauge
 logger = get_logger(__name__)
 
 # Module-level persistent process pool — avoids fork/spawn overhead per scan.
-# Lazy-initialized on first use, reused across all subsequent scans.
+# Uses 'spawn' context to avoid deadlocks when forking a multi-threaded process
+# (the background scanner runs worker threads that hold locks which would be
+# copied in a deadlocked state by fork()).
 _process_pool: ProcessPoolExecutor | None = None
 _pool_lock = mp.Lock()
+_spawn_ctx = mp.get_context("spawn")
 
 
 def _get_process_pool() -> ProcessPoolExecutor:
@@ -28,8 +31,11 @@ def _get_process_pool() -> ProcessPoolExecutor:
         with _pool_lock:
             if _process_pool is None:
                 workers = min(mp.cpu_count(), 8)  # cap at 8 to avoid memory pressure
-                _process_pool = ProcessPoolExecutor(max_workers=workers)
-                logger.info(f"Created persistent process pool with {workers} workers")
+                _process_pool = ProcessPoolExecutor(
+                    max_workers=workers,
+                    mp_context=_spawn_ctx,
+                )
+                logger.info(f"Created persistent process pool with {workers} workers (spawn)")
     return _process_pool
 
 class DuplicateFinder:
@@ -436,14 +442,22 @@ class DuplicateFinder:
         logger.info("Using persistent process pool for parallel processing")
 
         hash_func = partial(self._get_file_hash, video_extensions=video_extensions)
-        hash_results = list(pool.map(hash_func, file_paths))
+        futures = {pool.submit(hash_func, fp): fp for fp in file_paths}
+        hash_by_path = {}
+        for future in as_completed(futures):
+            fp = futures[future]
+            try:
+                hash_by_path[fp] = future.result()
+            except Exception:
+                hash_by_path[fp] = None
 
         logger.debug("Grouping similar files (multi-hash)...")
         groups: dict[str, list[str]] = {}
         # Store (representative_path, representative_hash) for comparison
         rep_hashes: list[tuple[str, Any]] = []
 
-        for file_path, file_hash in zip(file_paths, hash_results):
+        for file_path in file_paths:
+            file_hash = hash_by_path.get(file_path)
             if file_hash is None:
                 continue
 
@@ -516,31 +530,53 @@ class DuplicateFinder:
                 batch_extract_video_thumbnails(video_files_to_process, progress_callback=progress_callback)
 
             pool = _get_process_pool()
-            logger.info(f"Using persistent process pool for parallel hash calculation")
+            logger.info(f"Using persistent process pool for parallel hash calculation ({len(files_to_process)} files)")
 
             if progress_callback:
-                progress_callback('hashing', cached_files, len(file_paths), f'Hashing {len(files_to_process)} files in parallel...')
+                progress_callback('hashing', cached_files, len(file_paths), f'Hashing {len(files_to_process)} files...')
 
             hash_func = partial(self._get_file_hash, video_extensions=tuple(video_extensions))
-            hash_results = list(pool.map(hash_func, files_to_process))
-            
-            # Store results and update cache (batch update for better performance)
+
+            # Submit all tasks and collect results as they complete so we can
+            # report real-time progress instead of blocking on pool.map().
+            futures = {
+                pool.submit(hash_func, fp): fp
+                for fp in files_to_process
+            }
+
             cache_updates = {}
-            for i, (file_path, file_hash) in enumerate(zip(files_to_process, hash_results)):
+            completed = 0
+            for future in as_completed(futures):
+                file_path = futures[future]
+                try:
+                    file_hash = future.result()
+                except Exception as e:
+                    logger.error(f"Error hashing file {file_path}: {e}")
+                    file_hash = None
+
                 if file_hash is not None:
                     file_hashes[file_path] = file_hash
-                    # Prepare cache updates for batch processing
                     relative_path = cache._get_relative_path(file_path)
                     mtime, size = cache._get_file_stats(file_path)
                     cache_updates[relative_path] = {
                         "hash": str(file_hash),
                         "stats": {"mtime": mtime, "size": size}
                     }
-                
-                # Update progress every 100 files to reduce overhead
-                if progress_callback and (i + 1) % 100 == 0:
-                    progress_callback('hashing', cached_files + i + 1, len(file_paths), f'Hashed {cached_files + i + 1}/{len(file_paths)} files...')
-            
+
+                completed += 1
+                if progress_callback and completed % 50 == 0:
+                    progress_callback(
+                        'hashing', cached_files + completed, len(file_paths),
+                        f'Hashed {cached_files + completed}/{len(file_paths)} files...',
+                    )
+
+            # Final progress update
+            if progress_callback:
+                progress_callback(
+                    'hashing', cached_files + completed, len(file_paths),
+                    f'Hashed {cached_files + completed}/{len(file_paths)} files...',
+                )
+
             # Batch update cache to reduce I/O operations
             if cache_updates:
                 logger.debug(f"Batch updating cache with {len(cache_updates)} entries")
