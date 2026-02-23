@@ -340,9 +340,11 @@ class DuplicateFinder:
                     })
                     
                     processed_image_groups += 1
-                    if progress_callback and processed_image_groups % 10 == 0:  # Update every 10 groups
-                        progress_callback('processing', processed_image_groups, total_image_groups, f'Processing image groups... {processed_image_groups}/{total_image_groups}')
-                    
+                    if processed_image_groups % 10 == 0:
+                        time.sleep(0)  # release GIL for HTTP threads
+                        if progress_callback:
+                            progress_callback('processing', processed_image_groups, total_image_groups, f'Processing image groups... {processed_image_groups}/{total_image_groups}')
+
             # Process video groups
             total_video_groups = len([g for g in video_groups.values() if len(g) > 1])
             processed_video_groups = 0
@@ -416,9 +418,11 @@ class DuplicateFinder:
                     })
                     
                     processed_video_groups += 1
-                    if progress_callback and processed_video_groups % 10 == 0:  # Update every 10 groups
-                        progress_callback('processing', processed_video_groups, total_video_groups, f'Processing video groups... {processed_video_groups}/{total_video_groups}')
-                    
+                    if processed_video_groups % 10 == 0:
+                        time.sleep(0)  # release GIL for HTTP threads
+                        if progress_callback:
+                            progress_callback('processing', processed_video_groups, total_video_groups, f'Processing video groups... {processed_video_groups}/{total_video_groups}')
+
             # Record final metrics
             total_duplicates = len(duplicate_images) + len(duplicate_videos)
             set_gauge('duplicate_groups_found', total_duplicates)
@@ -502,7 +506,7 @@ class DuplicateFinder:
         cached_hashes = {}
         cached_files = 0
         
-        for file_path in file_paths:
+        for cache_idx, file_path in enumerate(file_paths):
             relative_path = cache._get_relative_path(file_path)
             has_cached = cache.has_cached_hash(relative_path) and cache._is_file_unchanged(file_path)
 
@@ -519,6 +523,8 @@ class DuplicateFinder:
                     files_to_process.append(file_path)
             else:
                 files_to_process.append(file_path)
+            if cache_idx % 200 == 0:
+                time.sleep(0)  # release GIL for HTTP threads
         
         logger.info(f"Found {cached_files} cached hashes, need to process {len(files_to_process)} files")
         
@@ -682,7 +688,7 @@ class DuplicateFinder:
         logger.debug(f"Built BK-trees: image reps={len(image_groups)}, video reps={len(video_groups)}")
 
         # --- Search the trees for each new file ---
-        for file_path, file_hash in new_file_hashes.items():
+        for inc_idx, (file_path, file_hash) in enumerate(new_file_hashes.items()):
             is_image = any(file_path.lower().endswith(ext) for ext in self.image_extensions)
 
             if is_image:
@@ -705,6 +711,8 @@ class DuplicateFinder:
                     video_groups[file_path] = [file_path]
                     video_tree.add(file_hash, file_path)
                     logger.debug(f"Created new video group for {os.path.basename(file_path)}")
+            if inc_idx % 50 == 0:
+                time.sleep(0)  # release GIL for HTTP threads
 
         # Update cache with new groups
         all_groups = {**image_groups, **video_groups}
@@ -765,7 +773,7 @@ class DuplicateFinder:
         for chunk_start in range(0, total, chunk_size):
             chunk_end = min(chunk_start + chunk_size, total)
             chunk = valid_items[chunk_start:chunk_end]
-            for path, hash_obj in chunk:
+            for item_idx, (path, hash_obj) in enumerate(chunk):
                 matches = bk_tree.search(hash_obj, threshold)
                 for match_path, _ in matches:
                     if match_path == path:
@@ -776,8 +784,11 @@ class DuplicateFinder:
                     processed_pairs.add(pair)
                     union(path, match_path)
                 bk_tree.add(hash_obj, path)
+                if item_idx % 100 == 0:
+                    time.sleep(0)  # release GIL for HTTP threads
             if progress_callback:
                 progress_callback('grouping', chunk_end, total, f'Clustering hashes {chunk_end}/{total}')
+            time.sleep(0)  # release GIL between chunks
         logger.debug(f"Clustering complete, processed {len(processed_pairs)} unique pairs")
         
         # Build groups more efficiently
@@ -797,12 +808,12 @@ class DuplicateFinder:
         exact_groups = 0
         similar_groups = 0
         
-        for group_paths in grouped_paths.values():
+        for grp_idx, group_paths in enumerate(grouped_paths.values()):
             if len(group_paths) > 1:
                 group_paths.sort()
                 representative = group_paths[0]
                 normalized_groups[representative] = group_paths
-                
+
                 # Determine if this is an exact duplicate group more efficiently
                 root_hash = all_hashes.get(representative)
                 if root_hash is not None:
@@ -813,13 +824,15 @@ class DuplicateFinder:
                         if other_hash is None or int(root_hash - other_hash) != 0:
                             all_identical = False
                             break
-                    
+
                     if all_identical:
                         exact_groups += 1
                     else:
                         similar_groups += 1
                 else:
                     similar_groups += 1
+            if grp_idx % 50 == 0:
+                time.sleep(0)  # release GIL for HTTP threads
         
         total_groups = len([g for g in normalized_groups.values() if len(g) > 1])
         logger.debug(f"Clustering results: {exact_groups} exact groups, {similar_groups} similar groups, {total_groups} total groups")
@@ -864,6 +877,7 @@ class DuplicateFinder:
         total_files_processed = 0
         
         for idx, (group_id, group_files) in enumerate(groups.items(), start=1):
+            time.sleep(0)  # release GIL for HTTP threads between groups
             if progress_callback:
                 progress_callback('auto_eliminating', idx - 1, len(groups), f'Auto-eliminating exact matches in group {idx}/{len(groups)}')
             if len(group_files) <= 1:

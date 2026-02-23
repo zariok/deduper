@@ -758,7 +758,7 @@ class BackgroundScanner:
                 return
 
             new_folders = []
-            for folder_name in os.listdir(self.data_dir):
+            for disc_idx, folder_name in enumerate(os.listdir(self.data_dir)):
                 folder_path = os.path.join(self.data_dir, folder_name)
                 if os.path.isdir(folder_path) and not folder_name.startswith('.'):
                     with self._lock:
@@ -774,6 +774,8 @@ class BackgroundScanner:
                                 file_count=cache_meta['file_count']
                             )
                             new_folders.append(f"{folder_name} ({cache_meta['status'].value})")
+                if disc_idx % 20 == 0:
+                    time.sleep(0)  # release GIL for HTTP threads
 
             if new_folders:
                 scanner_log('info', f"Discovered {len(new_folders)} folder(s): {', '.join(new_folders)}")
@@ -790,26 +792,34 @@ class BackgroundScanner:
         # Also check for new folders
         self._discover_folders()
 
+        # Take a snapshot of folder info under the lock, then do I/O
+        # (scandir for mtime) without holding it.  This avoids blocking
+        # HTTP threads that call is_folder_ready() / get_scanner_status().
         with self._lock:
-            for folder_name, state in self._folder_states.items():
-                try:
-                    # Get current modification time of folder
-                    folder_mtime = self._get_folder_mtime(state.path)
+            folder_snapshot = [
+                (name, state.path, state.last_scan_time, state.last_modified_time, state.status)
+                for name, state in self._folder_states.items()
+            ]
 
-                    # Check if folder has changed since last scan
-                    if folder_mtime > state.last_scan_time:
-                        if state.last_modified_time != folder_mtime:
-                            # Folder contents changed - update tracking
+        for chk_idx, (folder_name, folder_path, last_scan, last_mtime, status) in enumerate(folder_snapshot):
+            try:
+                folder_mtime = self._get_folder_mtime(folder_path)
+
+                if folder_mtime > last_scan and last_mtime != folder_mtime:
+                    with self._lock:
+                        state = self._folder_states.get(folder_name)
+                        if state and state.last_modified_time != folder_mtime:
                             state.last_modified_time = folder_mtime
                             state.last_change_detected = current_time
-
                             if state.status == ScanStatus.COMPLETE:
                                 state.status = ScanStatus.STALE
                                 logger.debug(f"Folder marked stale: {folder_name}")
                                 self._emit_folder_update(folder_name, state)
+            except Exception as e:
+                logger.warning(f"Error checking folder {folder_name}: {e}")
 
-                except Exception as e:
-                    logger.warning(f"Error checking folder {folder_name}: {e}")
+            if chk_idx % 20 == 0:
+                time.sleep(0)  # release GIL for HTTP threads
 
     def _get_folder_mtime(self, folder_path: str) -> float:
         """Get the most recent modification time of media files in a folder.
