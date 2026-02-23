@@ -219,6 +219,10 @@ class HashCache:
         ).fetchone()
         return row[0] if row else None
 
+    # Maximum rows to write per lock acquisition.  Keeps the lock held for
+    # only a few milliseconds so web-request threads can interleave.
+    _BATCH_CHUNK_SIZE = 200
+
     def batch_update_hashes(self, updates: dict[str, dict[str, Any]]) -> None:
         """Batch insert/update hashes. updates: {relative_path: {hash: str, stats: {mtime, size}}}."""
         if not updates:
@@ -231,12 +235,22 @@ class HashCache:
             mtime = s.get("mtime", 0.0)
             size = int(s.get("size", 0))
             rows.append((rel, h, mtime, size, now))
+
+        # Write in chunks so the lock is released between each chunk, giving
+        # web-request threads a chance to acquire it instead of blocking for
+        # the entire (potentially thousands-of-rows) batch.
+        for i in range(0, len(rows), self._BATCH_CHUNK_SIZE):
+            chunk = rows[i : i + self._BATCH_CHUNK_SIZE]
+            with self._lock:
+                self._conn.executemany(
+                    """INSERT OR REPLACE INTO file_hashes
+                       (relative_path, hash_value, mtime, size, updated_at) VALUES (?,?,?,?,?)""",
+                    chunk,
+                )
+                self._conn.commit()
+
+        # Final metadata update
         with self._lock:
-            self._conn.executemany(
-                """INSERT OR REPLACE INTO file_hashes
-                   (relative_path, hash_value, mtime, size, updated_at) VALUES (?,?,?,?,?)""",
-                rows,
-            )
             self._conn.execute("UPDATE meta SET value=? WHERE key='last_updated'", (str(now),))
             self._conn.commit()
 
@@ -299,9 +313,12 @@ class HashCache:
                 except OSError as e:
                     logger.warning(f"Failed to remove thumbnail {thumb}: {e}")
         if to_del:
-            with self._lock:
-                self._conn.executemany("DELETE FROM file_hashes WHERE relative_path=?", [(r,) for r in to_del])
-                self._conn.commit()
+            del_rows = [(r,) for r in to_del]
+            for i in range(0, len(del_rows), self._BATCH_CHUNK_SIZE):
+                chunk = del_rows[i : i + self._BATCH_CHUNK_SIZE]
+                with self._lock:
+                    self._conn.executemany("DELETE FROM file_hashes WHERE relative_path=?", chunk)
+                    self._conn.commit()
             logger.info(f"Cleaned up {len(to_del)} deleted files from cache")
 
     def get_cache_stats(self) -> dict[str, Any]:
