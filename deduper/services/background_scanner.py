@@ -1054,6 +1054,15 @@ class BackgroundScanner:
             if self._current_scan_folder == folder_name:
                 self._current_scan_folder = None
 
+        # Close the SQLite connection for this folder to free file descriptors.
+        # With 700+ folders, keeping all connections open exhausts the FD limit.
+        # The connection will be re-opened on next access via get_hash_cache().
+        try:
+            from ..utils.hash_cache import close_hash_cache
+            close_hash_cache(folder_path)
+        except Exception:
+            pass
+
     def _handle_scan_failure(self, folder_name: str, error_message: str):
         """Handle a scan failure with retry tracking."""
         with self._lock:

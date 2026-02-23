@@ -14,13 +14,35 @@ from ..config import Config
 from ..utils.setup import create_example_folder
 from ..utils.media import extract_video_thumbnail, resolve_media_resolution, get_video_duration
 from ..utils.helpers import get_file_size, format_file_size, create_symlink_and_remove_duplicate, find_symlinks_pointing_to
-from ..utils.hash_cache import HashCache, get_hash_cache
+from ..utils.hash_cache import HashCache, get_hash_cache, close_hash_cache
 from ..utils.logging_config import get_logger
 from ..utils.metrics import metrics, timer, increment_counter, set_gauge
 
 logger = get_logger(__name__)
 
 bp = Blueprint('main', __name__)
+
+
+def _release_cache(folder_path: str) -> None:
+    """Close a hash-cache connection opened during a web request.
+
+    With 700+ folders each holding a persistent SQLite connection (DB + WAL +
+    SHM ≈ 3 FDs), the process quickly exhausts its file-descriptor limit.
+    Closing after each request keeps FD usage proportional to the number of
+    *actively scanning* folders rather than every folder ever touched.
+
+    If the background scanner is currently scanning this folder we leave the
+    connection alone — the scanner's own cleanup will close it when the scan
+    finishes.
+    """
+    try:
+        scanner = get_background_scanner()
+        folder_name = os.path.basename(folder_path)
+        if scanner and scanner.is_folder_being_scanned(folder_name):
+            return  # let the scanner own this connection
+        close_hash_cache(folder_path)
+    except Exception:
+        pass
 
 # Global progress tracking
 progress_data = {}
@@ -227,15 +249,17 @@ def scan_folder(user_folder: str):
         # Always mark user scan as complete
         if scanner:
             scanner.mark_user_scan_complete(decoded_folder)
+        _release_cache(folder_path)
 
 @bp.route('/manage-duplicate', methods=['POST'])
 def manage_duplicate():
     """Handle duplicate file management."""
+    _cache_folder_path = None  # track for FD cleanup in finally
     try:
         data = request.get_json()
         if not data:
             return jsonify({'error': 'No data provided'}), 400
-            
+
         action = data.get('action')
         file_path = data.get('file_path')
         
@@ -256,9 +280,10 @@ def manage_duplicate():
             
             # Convert relative paths to absolute paths for file operations
             folder_path = os.path.join(Config.DATA_DIR, folder)
+            _cache_folder_path = folder_path
             full_file_path = os.path.join(folder_path, file_path)
             full_best_file_path = os.path.join(folder_path, best_file_path)
-            
+
             # Use shared helper for symlink creation (single source of truth)
             logger.debug(f"Attempting to replace duplicate: {full_file_path} -> {full_best_file_path}")
 
@@ -289,9 +314,10 @@ def manage_duplicate():
             
             # Convert relative paths to absolute paths for validation
             folder_path = os.path.join(Config.DATA_DIR, folder)
+            _cache_folder_path = folder_path
             full_file_path = os.path.join(folder_path, file_path)
             full_best_file_path = os.path.join(folder_path, best_file_path)
-            
+
             logger.debug(f"Setting new best file: {full_file_path}")
             logger.debug(f"Previous best file: {full_best_file_path}")
             logger.debug(f"Group ID: {group_id}")
@@ -337,6 +363,7 @@ def manage_duplicate():
             try:
                 # Construct the full folder path
                 folder_path = os.path.join(Config.DATA_DIR, folder)
+                _cache_folder_path = folder_path
                 logger.debug(f"Full folder path: {folder_path}")
                 
                 # Validate that the folder exists
@@ -503,9 +530,10 @@ def manage_duplicate():
     except Exception as e:
         increment_counter('manage_duplicate_errors')
         return jsonify({'error': str(e)}), 500
+    finally:
+        if _cache_folder_path:
+            _release_cache(_cache_folder_path)
 
-
-    
 
 @bp.route('/data/<path:filename>')
 def serve_file(filename):
@@ -550,18 +578,22 @@ def serve_thumbnail(filename):
 @bp.route('/cache/<path:user_folder>/clear', methods=['POST'])
 def clear_cache(user_folder):
     """Clear cache for a folder."""
+    folder_path = None
     try:
         decoded_folder = urllib.parse.unquote(user_folder)
         folder_path = os.path.join(Config.DATA_DIR, decoded_folder)
-        
+
         if not os.path.exists(folder_path):
             return jsonify({'error': f'Folder not found: {decoded_folder}'}), 404
-        
+
         cache = get_hash_cache(folder_path)
         cache.invalidate_cache()
         return jsonify({'message': 'Cache cleared successfully'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    finally:
+        if folder_path:
+            _release_cache(folder_path)
 
 @bp.route('/cache/<path:user_folder>/live-stats')
 def live_cache_stats(user_folder):
@@ -569,6 +601,7 @@ def live_cache_stats(user_folder):
 
     This endpoint uses read-only file access to avoid blocking when a scan is running.
     """
+    folder_path = None
     try:
         decoded_folder = urllib.parse.unquote(user_folder)
         folder_path = os.path.join(Config.DATA_DIR, decoded_folder)
@@ -599,6 +632,9 @@ def live_cache_stats(user_folder):
         return jsonify(stats)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    finally:
+        if folder_path:
+            _release_cache(folder_path)
 
 
 @bp.route('/scanner/status')
@@ -789,6 +825,7 @@ def get_cached_results(user_folder: str):
     This endpoint returns results from the cache if available,
     making initial page loads fast when the background scanner has pre-scanned.
     """
+    folder_path = None
     try:
         decoded_folder = urllib.parse.unquote(user_folder)
         folder_path = os.path.join(Config.DATA_DIR, decoded_folder)
@@ -925,6 +962,9 @@ def get_cached_results(user_folder: str):
     except Exception as e:
         logger.error(f"Error getting cached results: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+    finally:
+        if folder_path:
+            _release_cache(folder_path)
 
 
 @bp.errorhandler(Exception)

@@ -31,6 +31,20 @@ def get_hash_cache(directory_path: str) -> "HashCache":
     return _cache_registry[key]
 
 
+def close_hash_cache(directory_path: str) -> None:
+    """Close and remove a single cached connection so it doesn't hold file descriptors."""
+    key = str(Path(directory_path).resolve())
+    with _registry_lock:
+        cache = _cache_registry.pop(key, None)
+        if cache:
+            try:
+                if cache._conn:
+                    cache._conn.close()
+                    cache._conn = None
+            except Exception:
+                pass
+
+
 def close_all_caches() -> None:
     """Close every pooled connection (call at shutdown)."""
     with _registry_lock:
@@ -517,13 +531,13 @@ class HashCache:
         db = Path(folder_path) / DB_FILENAME
         if not db.exists():
             return default
+        conn = None
         try:
             conn = sqlite3.connect(str(db))
             # Check cache version — if it doesn't match, the data will be
             # invalidated when HashCache is instantiated, so report as pending.
             ver_row = conn.execute("SELECT value FROM meta WHERE key='version'").fetchone()
             if ver_row and ver_row[0] != CACHE_VERSION:
-                conn.close()
                 return default
             row = conn.execute("SELECT value FROM meta WHERE key='last_updated'").fetchone()
             last_scan_time = float(row[0]) if row else 0.0
@@ -539,7 +553,6 @@ class HashCache:
                         duplicate_count += 1
                 except Exception:
                     pass
-            conn.close()
             if not has_any:
                 return default
             if folder_mtime is None:
@@ -557,6 +570,12 @@ class HashCache:
         except Exception as e:
             logger.debug(f"Could not read cache metadata for {folder_path}: {e}")
             return default
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     # --- Migration: one-time JSON -> SQLite ---
 
@@ -586,6 +605,7 @@ class HashCache:
         if _is_old_cache_format(data):
             logger.warning(f"Old cache format in {json_path}, skipping")
             return False
+        conn = None
         try:
             conn = sqlite3.connect(str(db_path))
             conn.execute("PRAGMA journal_mode=WAL")
@@ -639,7 +659,6 @@ class HashCache:
             if ts is not None:
                 conn.execute("INSERT INTO meta (key, value) VALUES ('grouping_timestamp', ?)", (str(ts),))
             conn.commit()
-            conn.close()
         except Exception as e:
             logger.error(f"Migration failed for {json_path}: {e}")
             if db_path.exists():
@@ -648,5 +667,11 @@ class HashCache:
                 except OSError:
                     pass
             return False
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         logger.info(f"Migrated {json_path} -> {db_path}")
         return True
