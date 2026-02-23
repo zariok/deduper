@@ -86,6 +86,7 @@ class HashCache:
         self._lock = threading.Lock()
         try:
             self._init_db()
+
         except sqlite3.DatabaseError as e:
             # Corrupt database file — delete and recreate from scratch
             logger.warning(
@@ -101,6 +102,19 @@ class HashCache:
             except OSError as remove_err:
                 logger.error(f"Failed to remove corrupt DB {self.db_file}: {remove_err}")
             self._init_db()  # Retry with fresh file
+
+    def __del__(self):
+        """Close the SQLite connection when this object is garbage-collected.
+
+        This is a safety net for HashCache instances evicted from the registry
+        by _release_cache() — once all request threads drop their references
+        the GC will reclaim the object and free the file descriptors.
+        """
+        try:
+            if self._conn:
+                self._conn.close()
+        except Exception:
+            pass
 
     def _init_db(self) -> None:
         """Create or open SQLite database and ensure schema."""

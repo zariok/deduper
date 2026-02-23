@@ -14,7 +14,7 @@ from ..config import Config
 from ..utils.setup import create_example_folder
 from ..utils.media import extract_video_thumbnail, resolve_media_resolution, get_video_duration
 from ..utils.helpers import get_file_size, format_file_size, create_symlink_and_remove_duplicate, find_symlinks_pointing_to
-from ..utils.hash_cache import HashCache, get_hash_cache, close_hash_cache
+from ..utils.hash_cache import HashCache, get_hash_cache
 from ..utils.logging_config import get_logger
 from ..utils.metrics import metrics, timer, increment_counter, set_gauge
 
@@ -24,23 +24,39 @@ bp = Blueprint('main', __name__)
 
 
 def _release_cache(folder_path: str) -> None:
-    """Close a hash-cache connection opened during a web request.
+    """Evict a hash-cache entry opened during a web request.
 
     With 700+ folders each holding a persistent SQLite connection (DB + WAL +
-    SHM ≈ 3 FDs), the process quickly exhausts its file-descriptor limit.
-    Closing after each request keeps FD usage proportional to the number of
-    *actively scanning* folders rather than every folder ever touched.
+    SHM ≈ 3 FDs), the process can exhaust its file-descriptor limit.
+    Evicting from the registry after each request means the next request for
+    this folder will get a fresh connection instead of reusing a stale one,
+    and the old HashCache object's connection is closed when GC collects it.
+
+    We do NOT call close_hash_cache() here because Flask serves requests in
+    multiple threads — another concurrent request may still hold a reference
+    to the same HashCache object.  Closing _conn from under it causes
+    "Cannot operate on a closed database" errors.  Instead we just remove
+    the entry from the registry; the background scanner's own close_hash_cache
+    call (which runs single-threaded per folder after scan completion) handles
+    the eager FD reclamation.
 
     If the background scanner is currently scanning this folder we leave the
-    connection alone — the scanner's own cleanup will close it when the scan
-    finishes.
+    registry entry alone so the scanner can continue using it.
     """
     try:
+        from ..utils.hash_cache import _cache_registry, _registry_lock
+        from pathlib import Path as _Path
+
         scanner = get_background_scanner()
         folder_name = os.path.basename(folder_path)
         if scanner and scanner.is_folder_being_scanned(folder_name):
             return  # let the scanner own this connection
-        close_hash_cache(folder_path)
+
+        key = str(_Path(folder_path).resolve())
+        with _registry_lock:
+            _cache_registry.pop(key, None)
+            # The evicted HashCache (and its _conn) will be closed by Python's
+            # GC / __del__ once no request threads reference it.
     except Exception:
         pass
 
