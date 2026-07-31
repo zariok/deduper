@@ -4,6 +4,7 @@ import multiprocessing as mp
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
+from pathlib import Path
 from typing import Callable, Any
 import imagehash
 from ..utils.bktree import BKTree
@@ -58,6 +59,10 @@ class DuplicateFinder:
     def find_duplicates(self, folder_path: str, progress_callback: Callable | None = None) -> tuple[list[dict], list[dict]]:
         """Find duplicate images and videos in the given folder."""
         try:
+            # HashCache resolves its own directory, so walk the resolved path too.
+            # Otherwise a symlinked parent (/var -> /private/var) makes every relative
+            # cache key a long '../../..' path that never matches on the next run.
+            folder_path = str(Path(folder_path).resolve())
             logger.info(f"Starting duplicate detection in: {folder_path}")
             increment_counter('duplicate_detection_started')
 

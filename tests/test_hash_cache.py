@@ -121,7 +121,6 @@ class TestGroups:
 
         assert cache.get_cached_groups() == {kept: [kept]}
 
-    @pytest.mark.skip(reason="port: get_cached_groups must drop missing files too")
     def test_deleted_members_are_dropped(self, images_only_dir):
         """os.path.islink is False for a missing path, so a deleted file otherwise
         stays in its group on every later scan, reported with zeroed metadata."""

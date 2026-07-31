@@ -471,8 +471,13 @@ class HashCache:
             abs_files = []
             for r in files:
                 p = self._get_absolute_path(r)
-                if not os.path.islink(p):
-                    abs_files.append(p)
+                # Drop symlinks - they point at the kept original - and drop paths
+                # that no longer exist. Testing islink alone is not enough: it is
+                # False for a missing path, so a deleted file stayed in its group on
+                # every later scan and was reported with zeroed resolution and size.
+                if os.path.islink(p) or not os.path.exists(p):
+                    continue
+                abs_files.append(p)
             if abs_files:
                 out[abs_rep] = abs_files
         return out
