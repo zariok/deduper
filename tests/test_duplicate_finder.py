@@ -76,7 +76,6 @@ class TestColdScan:
         assert duplicate["size_formatted"]
         assert duplicate["is_exact_match"] is False
 
-    @pytest.mark.skip(reason="port: resolve folder_path (cache keys) + SQLite API")
 
     def test_writes_relative_cache_keys(self, images_only_dir):
         """Cache keys must be plain relative names.
@@ -86,15 +85,11 @@ class TestColdScan:
         """
         scan(images_only_dir)
         cache = HashCache(images_only_dir)
-        assert cache.cache_data["hashes"]
-        for key in cache.cache_data["hashes"]:
-            assert not key.startswith(".."), f"non-relative cache key: {key}"
-            assert key == os.path.basename(key)
-
-    @pytest.mark.skip(reason="port: resolve folder_path (cache keys)")
+        for name in ("img_a.png", "img_a_small.png", "img_b.png"):
+            assert cache.has_cached_hash(name), f"expected a plain relative key for {name}"
 
     def test_scanning_an_unresolved_path_still_writes_clean_keys(self, images_only_dir):
-        """Passing a path through a symlinked parent must not corrupt cache keys."""
+        """Reaching the folder through a symlinked parent must not corrupt keys."""
         parent = os.path.dirname(images_only_dir)
         alias = os.path.join(parent, "alias_link")
         os.symlink(images_only_dir, alias)
@@ -102,9 +97,9 @@ class TestColdScan:
         scan(alias)
 
         cache = HashCache(images_only_dir)
-        assert cache.cache_data["hashes"]
-        for key in cache.cache_data["hashes"]:
-            assert not key.startswith("..")
+        assert cache.has_cached_hash("img_a.png"), (
+            "scanning via a symlinked path stored keys the resolved cache cannot find"
+        )
 
 
 class TestWarmRescan:
@@ -117,8 +112,6 @@ class TestWarmRescan:
         first, _ = scan(images_only_dir)
         second, _ = scan(images_only_dir)
         assert {g["group_id"] for g in first} == {g["group_id"] for g in second}
-
-    @pytest.mark.skip(reason="port: fix #1 single exact-match pass")
 
     def test_skips_exact_match_pass_when_nothing_changed(
         self, images_only_dir, count_exact_match_passes
@@ -194,8 +187,6 @@ class TestIncrementalGrouping:
         images, _ = scan(images_only_dir)
         assert find_group(images, "img_d.png") is None
 
-    @pytest.mark.skip(reason="port: get_cached_groups must drop missing files")
-
     def test_removing_a_file_does_not_break_the_next_scan(self, images_only_dir):
         scan(images_only_dir)
         os.remove(os.path.join(images_only_dir, "img_a_small.png"))
@@ -204,7 +195,6 @@ class TestIncrementalGrouping:
 
 
 class TestCachedHashDetection:
-    @pytest.mark.skip(reason="port: _has_valid_cached_hash helper")
     def test_reports_known_and_unknown_files(self, images_only_dir):
         path = os.path.join(images_only_dir, "img_a.png")
         cache = HashCache(images_only_dir)
@@ -212,8 +202,6 @@ class TestCachedHashDetection:
 
         cache.get_hash(path, VIDEO_EXTENSIONS)
         assert DuplicateFinder._has_valid_cached_hash(path, cache) is True
-
-    @pytest.mark.skip(reason="port: _has_valid_cached_hash helper")
 
     def test_modified_file_is_no_longer_valid(self, images_only_dir):
         import time
