@@ -767,7 +767,6 @@ class DuplicateFinder:
                 rank[root_a] += 1
 
         total = len(valid_items)
-        processed_pairs: set[tuple[str, str]] = set()
         chunk_size = self._BKTREE_CHUNK_SIZE
 
         logger.debug(f"Clustering with BK-tree (chunked, {total} items, threshold={threshold})")
@@ -776,21 +775,20 @@ class DuplicateFinder:
             chunk = valid_items[chunk_start:chunk_end]
             for item_idx, (path, hash_obj) in enumerate(chunk):
                 matches = bk_tree.search(hash_obj, threshold)
+                # No pair-deduplication set here: union() already returns immediately
+                # when both paths share a root, so tracking seen pairs only added a
+                # sorted tuple of two full path strings per match - O(matches) memory
+                # and hashing - to skip a call that is a no-op anyway.
                 for match_path, _ in matches:
-                    if match_path == path:
-                        continue
-                    pair = tuple(sorted([path, match_path]))
-                    if pair in processed_pairs:
-                        continue
-                    processed_pairs.add(pair)
-                    union(path, match_path)
+                    if match_path != path:
+                        union(path, match_path)
                 bk_tree.add(hash_obj, path)
                 if item_idx % 100 == 0:
                     time.sleep(0)  # release GIL for HTTP threads
             if progress_callback:
                 progress_callback('grouping', chunk_end, total, f'Clustering hashes {chunk_end}/{total}')
             time.sleep(0)  # release GIL between chunks
-        logger.debug(f"Clustering complete, processed {len(processed_pairs)} unique pairs")
+        logger.debug(f"Clustering complete over {total} items")
         
         # Build groups more efficiently
         grouped_paths: dict[str, list[str]] = defaultdict(list)
