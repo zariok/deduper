@@ -515,20 +515,18 @@ def get_image_hash(
                 logger.warning("No valid thumbnail available for video: %s - SKIPPING from duplicate detection", path)
                 return None
 
-            thumbnail_path_obj = Path(thumbnail_path)
-            if not _is_valid_image(thumbnail_path_obj):
-                logger.debug("Thumbnail is not a valid image: %s", thumbnail_path)
-                return None
-
+            # extract_video_thumbnail already validated the frame it returned, so
+            # hashing it directly avoids decoding the same image a second time.
             with Image.open(thumbnail_path) as frame:
                 return MultiHash(
                     phash=imagehash.phash(frame),
                     dhash=imagehash.dhash(frame),
                 )
         else:
-            if not _is_valid_image(path):
-                logger.debug("File is not a valid image: %s", path)
-                return None
+            # No separate validation pass: _is_valid_image calls img.load(), a full
+            # decode of the whole raster, and the decode below then repeats it. A
+            # corrupt or truncated file raises here instead and is reported the same
+            # way, via the handler below.
             with Image.open(path) as image:
                 return MultiHash(
                     phash=imagehash.phash(image),
