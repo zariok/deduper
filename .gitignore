@@ -30,6 +30,13 @@ ENV/
 env.bak/
 venv.bak/
 
+# Testing and coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+
 # IDE
 .idea/
 .vscode/
