@@ -101,7 +101,6 @@ class TestCachedResultsVideoMetadata:
         assert best["duration"] > 0
         assert best["duration_formatted"].endswith("s")
 
-    @pytest.mark.skip(reason="port: fix #3 persisted media metadata")
 
     def test_page_load_runs_no_ffprobe(self, client, media_dir, count_ffprobe):
         """A page load must serve metadata from the cache, not re-probe every video.
@@ -123,28 +122,36 @@ class TestCachedResultsVideoMetadata:
         assert payload["cached"] is True
         assert count_ffprobe == [], f"unexpected ffprobe calls: {count_ffprobe}"
 
-    @pytest.mark.skip(reason="port: fix #3 persisted media metadata")
 
     def test_metadata_probed_on_request_is_persisted(self, client, media_dir):
-        """If a request does probe, the result must be written back to the cache."""
+        """If a request does have to probe, the result must be written back.
+
+        Otherwise every page load re-probes and the cache never warms.
+        """
+        import sqlite3
+
+        from deduper.utils.hash_cache import HashCache, close_all_caches
         from deduper.utils import media as media_module
 
         http, data_dir = client
         folder = populate(data_dir, media_dir)
         DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS).find_duplicates(folder)
 
-        # Drop the persisted metadata so the request has to probe again
-        cache_file = os.path.join(folder, ".deduper")
-        data = json.loads(open(cache_file).read())
-        data.pop("media_meta", None)
-        with open(cache_file, "w") as handle:
-            json.dump(data, handle)
+        # Drop the persisted metadata so the request is forced to probe again
+        close_all_caches()
+        db = os.path.join(folder, HashCache.DB_FILENAME)
+        with sqlite3.connect(db) as conn:
+            conn.execute("DELETE FROM media_metadata")
+            conn.commit()
         media_module._probe_video_cached.cache_clear()
+        media_module._resolve_media_resolution_cached.cache_clear()
 
         http.get("/cached-results/photos")
 
-        reloaded = json.loads(open(cache_file).read())
-        assert reloaded.get("media_meta"), "probed metadata should be saved back"
+        close_all_caches()
+        with sqlite3.connect(db) as conn:
+            rows = conn.execute("SELECT COUNT(*) FROM media_metadata").fetchone()[0]
+        assert rows > 0, "probed metadata should be written back to the cache"
 
 
 class TestLiveCacheStats:

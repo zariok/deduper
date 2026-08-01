@@ -37,7 +37,8 @@ class Resolution:
         return f"{self.width}x{self.height}" if self.is_known() else "Unknown"
 
 
-def _normalize_extensions(extensions: Iterable[str]) -> tuple[str, ...]:
+def normalize_extensions(extensions: Iterable[str]) -> tuple[str, ...]:
+    """Lower-case the extensions and ensure each carries a leading dot."""
     normalized = []
     for ext in extensions:
         if not ext:
@@ -50,18 +51,32 @@ def _normalize_extensions(extensions: Iterable[str]) -> tuple[str, ...]:
     return tuple(normalized)
 
 
+def _stat_key(path: Path) -> tuple[float, int] | None:
+    """Return (mtime, size) for a path, or None when it cannot be stat'ed.
+
+    Part of every memo key below, so editing a file in place invalidates the
+    cached probe rather than returning the previous file's dimensions.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime, stat.st_size
+
+
 @lru_cache(maxsize=2048)
 def _resolve_media_resolution_cached(
     path_str: str,
     image_exts: tuple[str, ...],
     video_exts: tuple[str, ...],
+    stat_key: tuple[float, int],
 ) -> Resolution:
     path = Path(path_str)
     suffix = path.suffix.lower()
     if suffix in image_exts:
         return _read_image_resolution(path)
     if suffix in video_exts:
-        return _read_video_resolution(path)
+        return _read_video_resolution(path, stat_key)
     return Resolution()
 
 
@@ -77,13 +92,14 @@ def resolve_media_resolution(
     does not match the supplied extension lists.
     """
     path = Path(file_path)
-    if not path.exists():
+    stat_key = _stat_key(path)
+    if stat_key is None:
         logger.debug("Resolution requested for missing file: %s", file_path)
         return Resolution()
 
-    image_exts = _normalize_extensions(image_extensions)
-    video_exts = _normalize_extensions(video_extensions)
-    return _resolve_media_resolution_cached(str(path), image_exts, video_exts)
+    image_exts = normalize_extensions(image_extensions)
+    video_exts = normalize_extensions(video_extensions)
+    return _resolve_media_resolution_cached(str(path), image_exts, video_exts, stat_key)
 
 
 def get_file_resolution(
@@ -507,7 +523,7 @@ def get_image_hash(
     Returns a ``MultiHash`` containing both hash values, or None on failure.
     """
     path = Path(file_path)
-    video_exts = _normalize_extensions(video_extensions)
+    video_exts = normalize_extensions(video_extensions)
     try:
         if path.suffix.lower() in video_exts:
             thumbnail_path = extract_video_thumbnail(str(path))
@@ -546,53 +562,93 @@ def _read_image_resolution(path: Path) -> Resolution:
         return Resolution()
 
 
-def _read_video_resolution(path: Path) -> Resolution:
+@lru_cache(maxsize=4096)
+def _probe_video_cached(path_str: str, stat_key: tuple[float, int]) -> tuple[int, int, float]:
+    """
+    Probe width, height and duration for a video in a single ffprobe call.
+
+    Previously these were two separate subprocesses, one per value, so anything
+    wanting both paid twice. stat_key participates in the cache key only, so a
+    re-encode in place invalidates the memoised result.
+
+    Returns (0, 0, 0.0) when the file cannot be probed.
+    """
     cmd = [
         "ffprobe",
         "-v",
         "error",
         "-i",
-        str(path),
+        path_str,
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height",
+        "stream=width,height:format=duration",
         "-of",
         "json",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=5)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
     except (FileNotFoundError, subprocess.SubprocessError, subprocess.TimeoutExpired) as exc:
-        logger.warning("Unable to probe video %s: %s", path, exc)
+        logger.warning("Unable to probe video %s: %s", path_str, exc)
         if hasattr(exc, 'stderr') and exc.stderr:
             logger.debug("FFprobe stderr: %s", exc.stderr)
-        return Resolution()
+        return 0, 0, 0.0
 
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        logger.warning("Invalid ffprobe output for %s: %s", path, exc)
-        return Resolution()
+        logger.warning("Invalid ffprobe output for %s: %s", path_str, exc)
+        return 0, 0, 0.0
 
+    width = height = 0
     for stream in payload.get("streams", []):
-        width = int(stream.get("width") or 0)
-        height = int(stream.get("height") or 0)
-        if width > 0 and height > 0:
-            return Resolution(width, height)
+        stream_width = int(stream.get("width") or 0)
+        stream_height = int(stream.get("height") or 0)
+        if stream_width > 0 and stream_height > 0:
+            width, height = stream_width, stream_height
+            break
 
-    return Resolution()
+    duration = 0.0
+    duration_str = payload.get("format", {}).get("duration")
+    if duration_str:
+        try:
+            duration = float(duration_str)
+        except (ValueError, TypeError) as exc:
+            logger.warning("Invalid ffprobe duration output for %s: %s", path_str, exc)
+
+    return width, height, duration
+
+
+def probe_video_metadata(file_path: str) -> tuple[Resolution, float]:
+    """Return (resolution, duration) for a video from a single ffprobe invocation."""
+    path = Path(file_path)
+    stat_key = _stat_key(path)
+    if stat_key is None:
+        logger.debug("Video metadata requested for missing file: %s", file_path)
+        return Resolution(), 0.0
+
+    width, height, duration = _probe_video_cached(str(path), stat_key)
+    return Resolution(width, height), duration
+
+
+def _read_video_resolution(path: Path, stat_key: tuple[float, int]) -> Resolution:
+    width, height, _ = _probe_video_cached(str(path), stat_key)
+    return Resolution(width, height)
 
 
 def get_video_duration(file_path: str) -> float:
     """
     Extract video duration in seconds using ffprobe.
-    
+
     Returns 0.0 if duration cannot be determined.
     """
     path = Path(file_path)
-    if not path.exists():
+    stat_key = _stat_key(path)
+    if stat_key is None:
         logger.debug("Duration requested for missing file: %s", file_path)
         return 0.0
+
+    return _probe_video_cached(str(path), stat_key)[2]
 
     cmd = [
         "ffprobe",
@@ -712,15 +768,20 @@ def get_enhanced_video_score(
 
 
 def select_best_video_from_group(
-    video_group: list, 
-    video_extensions: Iterable[str]
+    video_group: list,
+    video_extensions: Iterable[str],
+    metadata_provider=None,
 ) -> str:
     """
     Select the best video from a group of duplicate videos using enhanced criteria.
-    
+
     Considers resolution, duration, file size, and thumbnail similarity.
     For videos with same resolution and similar thumbnails, prefers longer duration.
-    
+
+    Pass metadata_provider - a callable taking a path and returning
+    (Resolution, duration) - to supply cached values instead of re-probing every
+    candidate with ffprobe.
+
     Returns the path to the best video file.
     """
     if not video_group:
@@ -735,8 +796,10 @@ def select_best_video_from_group(
     video_metadata = []
     for video_path in video_group:
         try:
-            resolution = resolve_media_resolution(video_path, [], video_extensions)
-            duration = get_video_duration(video_path)
+            if metadata_provider is not None:
+                resolution, duration = metadata_provider(video_path)
+            else:
+                resolution, duration = probe_video_metadata(video_path)
             file_size = Path(video_path).stat().st_size if Path(video_path).exists() else 0
             
             video_metadata.append({

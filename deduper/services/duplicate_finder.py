@@ -277,15 +277,12 @@ class DuplicateFinder:
             duplicate_videos = []
             
             # Cache for resolution calculations to avoid repeated work
-            resolution_cache = {}
+            def get_media_meta(file_path):
+                """(resolution, duration) via the persistent cache - no re-probing."""
+                return cache.get_media_metadata(file_path, self.image_extensions, self.video_extensions)
+
             
-            def get_cached_resolution(file_path):
-                """Get resolution with caching to avoid repeated calculations."""
-                if file_path not in resolution_cache:
-                    resolution_cache[file_path] = resolve_media_resolution(
-                        file_path, tuple(self.image_extensions), tuple(self.video_extensions)
-                    )
-                return resolution_cache[file_path]
+
             
             # Process image groups
             total_image_groups = len([g for g in image_groups.values() if len(g) > 1])
@@ -301,17 +298,17 @@ class DuplicateFinder:
                         best_file = cached_best_file
                         logger.debug(f"Using cached best file for group {group_id}: {best_file}")
                     else:
-                        best_file = max(group, key=lambda x: get_file_resolution(x, tuple(self.image_extensions), tuple(self.video_extensions)))
+                        best_file = max(group, key=lambda x: get_media_meta(x)[0].pixel_count())
                     
                     # Get metadata for best file using cache
-                    best_resolution_obj = get_cached_resolution(best_file)
+                    best_resolution_obj, _ = get_media_meta(best_file)
                     best_size = get_file_size(best_file)
                     
                     # Get metadata for duplicate files using cache
                     duplicate_files_with_metadata = []
                     for f in group:
                         if f != best_file:
-                            resolution_obj = get_cached_resolution(f)
+                            resolution_obj, _ = get_media_meta(f)
                             size = get_file_size(f)
                             
                             # Check if this is an exact match (same hash, resolution, file size)
@@ -372,21 +369,21 @@ class DuplicateFinder:
                         logger.debug(f"Using cached best file for group {group_id}: {best_file}")
                     else:
                         # Use enhanced video selection logic
-                        best_file = select_best_video_from_group(group, tuple(self.video_extensions))
+                        best_file = select_best_video_from_group(
+                            group, tuple(self.video_extensions), metadata_provider=get_media_meta
+                        )
                         logger.debug(f"Selected best video using enhanced criteria: {best_file}")
                     
                     # Get metadata for best file using cache
-                    best_resolution_obj = get_cached_resolution(best_file)
+                    best_resolution_obj, best_duration = get_media_meta(best_file)
                     best_size = get_file_size(best_file)
-                    best_duration = get_video_duration(best_file)
                     
                     # Get metadata for duplicate files using cache
                     duplicate_files_with_metadata = []
                     for f in group:
                         if f != best_file:
-                            resolution_obj = get_cached_resolution(f)
+                            resolution_obj, duration = get_media_meta(f)
                             size = get_file_size(f)
-                            duration = get_video_duration(f)
                             
                             # Check if this is an exact match (same hash, resolution, file size)
                             is_exact_match = (
@@ -892,6 +889,10 @@ class DuplicateFinder:
         if progress_callback:
             progress_callback('auto_eliminating', 0, len(groups), 'Auto-eliminating exact matches...')
         
+        def get_resolution(file_path):
+            """Resolution via the persistent cache, avoiding repeated probes."""
+            return cache.get_media_metadata(file_path, self.image_extensions, self.video_extensions)[0]
+
         processed_groups = {}
         exact_matches_processed = 0
         total_files_processed = 0
@@ -906,8 +907,8 @@ class DuplicateFinder:
                 continue
             
             # Find the best file (highest resolution)
-            best_file = max(group_files, key=lambda x: get_file_resolution(x, tuple(self.image_extensions), tuple(self.video_extensions)))
-            best_resolution = resolve_media_resolution(best_file, tuple(self.image_extensions), tuple(self.video_extensions))
+            best_file = max(group_files, key=lambda x: get_resolution(x).pixel_count())
+            best_resolution = get_resolution(best_file)
             best_size = get_file_size(best_file)
             
             # Separate exact matches from similar matches
@@ -918,7 +919,7 @@ class DuplicateFinder:
                 if file_path == best_file:
                     continue
                     
-                file_resolution = resolve_media_resolution(file_path, tuple(self.image_extensions), tuple(self.video_extensions))
+                file_resolution = get_resolution(file_path)
                 file_size = get_file_size(file_path)
                 
                 # Check if this is an exact match (same hash, resolution, file size)

@@ -875,12 +875,16 @@ def get_cached_results(user_folder: str):
 
         # Helper to get file metadata
         def get_file_metadata(abs_path: str, is_video: bool) -> dict:
-            """Get resolution, size, and duration metadata for a file."""
+            """Get resolution, size, and duration metadata for a file.
+
+            Resolution and duration come from the persistent cache, so opening a
+            video-heavy folder does not re-probe every file with ffprobe.
+            """
             try:
-                resolution_obj = resolve_media_resolution(
+                resolution_obj, duration = cache.get_media_metadata(
                     abs_path,
-                    tuple(Config.IMAGE_EXTENSIONS),
-                    tuple(Config.VIDEO_EXTENSIONS)
+                    Config.IMAGE_EXTENSIONS,
+                    Config.VIDEO_EXTENSIONS
                 )
                 size = get_file_size(abs_path)
 
@@ -895,7 +899,6 @@ def get_cached_results(user_folder: str):
                 }
 
                 if is_video:
-                    duration = get_video_duration(abs_path)
                     metadata['duration'] = duration
                     metadata['duration_formatted'] = f"{duration:.1f}s" if duration > 0 else "Unknown"
 

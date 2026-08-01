@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from .logging_config import get_logger
-from .media import get_image_hash
+from .media import (
+    Resolution,
+    get_image_hash,
+    normalize_extensions,
+    probe_video_metadata,
+    resolve_media_resolution,
+)
 
 logger = get_logger(__name__)
 
@@ -150,6 +156,19 @@ class HashCache:
                 processed INTEGER NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL
             );
+            -- Probed dimensions and duration. Carries its own mtime/size rather
+            -- than reusing file_hashes: that keeps hash validity and metadata
+            -- validity independent, so reading metadata on a read-only path can
+            -- never make a stale hash look current.
+            CREATE TABLE IF NOT EXISTS media_metadata (
+                relative_path TEXT PRIMARY KEY,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                duration REAL NOT NULL,
+                mtime REAL NOT NULL,
+                size INTEGER NOT NULL,
+                updated_at REAL NOT NULL
+            );
         """)
         self._conn.commit()
         # Ensure meta exists and check version for auto-invalidation
@@ -283,6 +302,47 @@ class HashCache:
                 self._conn.commit()
         return h
 
+    def get_media_metadata(
+        self,
+        file_path: str,
+        image_extensions,
+        video_extensions,
+    ) -> tuple[Resolution, float]:
+        """
+        Return (resolution, duration) for a media file.
+
+        Values are persisted and reused while the file's mtime and size are
+        unchanged, so repeat scans and page loads neither re-decode images nor
+        re-run ffprobe. Duration is always 0.0 for non-video files.
+        """
+        rel = self._get_relative_path(file_path)
+        mtime, size = self._get_file_stats(file_path)
+
+        row = self._conn.execute(
+            "SELECT width, height, duration, mtime, size FROM media_metadata WHERE relative_path=?",
+            (rel,),
+        ).fetchone()
+        if row is not None and row[3] == mtime and row[4] == size:
+            return Resolution(row[0], row[1]), row[2]
+
+        video_exts = normalize_extensions(video_extensions)
+        if Path(file_path).suffix.lower() in video_exts:
+            resolution, duration = probe_video_metadata(file_path)
+        else:
+            resolution = resolve_media_resolution(file_path, image_extensions, video_extensions)
+            duration = 0.0
+
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO media_metadata "
+                "(relative_path, width, height, duration, mtime, size, updated_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (rel, resolution.width, resolution.height, duration, mtime, size, time.time()),
+            )
+            self._conn.commit()
+
+        return resolution, duration
+
     def update_file_stats(self, file_path: str) -> None:
         rel = self._get_relative_path(file_path)
         if os.path.exists(file_path):
@@ -296,6 +356,7 @@ class HashCache:
         else:
             with self._lock:
                 self._conn.execute("DELETE FROM file_hashes WHERE relative_path=?", (rel,))
+                self._conn.execute("DELETE FROM media_metadata WHERE relative_path=?", (rel,))
                 self._conn.commit()
 
     def cleanup_deleted_files(self, existing_files: set) -> None:
@@ -318,6 +379,7 @@ class HashCache:
                 chunk = del_rows[i : i + self._BATCH_CHUNK_SIZE]
                 with self._lock:
                     self._conn.executemany("DELETE FROM file_hashes WHERE relative_path=?", chunk)
+                    self._conn.executemany("DELETE FROM media_metadata WHERE relative_path=?", chunk)
                     self._conn.commit()
             logger.info(f"Cleaned up {len(to_del)} deleted files from cache")
 

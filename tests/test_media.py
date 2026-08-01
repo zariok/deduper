@@ -13,7 +13,7 @@ from PIL import Image
 from deduper.utils.media import (
     MultiHash,
     Resolution,
-    _normalize_extensions,
+    normalize_extensions,
     _resolve_media_resolution_cached,
     get_image_hash,
     get_video_duration,
@@ -25,13 +25,13 @@ from .conftest import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, requires_ffmpeg
 
 class TestNormalizeExtensions:
     def test_adds_leading_dot_and_lowercases(self):
-        assert _normalize_extensions(["JPG", ".PNG", "gif"]) == (".jpg", ".png", ".gif")
+        assert normalize_extensions(["JPG", ".PNG", "gif"]) == (".jpg", ".png", ".gif")
 
     def test_drops_empty_values_and_duplicates(self):
-        assert _normalize_extensions(["", ".jpg", "jpg"]) == (".jpg",)
+        assert normalize_extensions(["", ".jpg", "jpg"]) == (".jpg",)
 
     def test_accepts_a_set(self):
-        assert set(_normalize_extensions({".mp4", ".mov"})) == {".mp4", ".mov"}
+        assert set(normalize_extensions({".mp4", ".mov"})) == {".mp4", ".mov"}
 
 
 class TestResolution:
@@ -146,7 +146,6 @@ class TestImageResolution:
         )
         assert resolution == Resolution()
 
-    @pytest.mark.skip(reason="port: stat-keyed memo so in-place edits invalidate")
     def test_editing_a_file_in_place_invalidates_the_memoised_resolution(
         self, images_only_dir
     ):
@@ -189,7 +188,6 @@ class TestVideoProbing:
         duration = get_video_duration(os.path.join(media_dir, "vid_hi.mp4"))
         assert duration == pytest.approx(3.0, abs=0.5)
 
-    @pytest.mark.skip(reason="port: fix #3 single ffprobe for resolution + duration")
     def test_resolution_and_duration_share_one_probe(self, media_dir, count_ffprobe):
         """Upstream probes twice: once for dimensions, once for duration."""
         path = os.path.join(media_dir, "vid_hi.mp4")

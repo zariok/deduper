@@ -258,7 +258,6 @@ class TestVideoScanning:
         assert group["best_file"]["duration"] > 0
         assert group["best_file"]["duration_formatted"].endswith("s")
 
-    @pytest.mark.skip(reason="port: fix #3 combined ffprobe")
 
     def test_cold_scan_probes_each_video_once(self, media_dir, count_ffprobe):
         """Resolution and duration share a probe, and the probe result is cached."""
@@ -267,7 +266,6 @@ class TestVideoScanning:
         assert len(count_ffprobe) <= 2, f"expected <=2 probes for 2 videos, got {len(count_ffprobe)}"
         assert len(probed - {None}) <= 2
 
-    @pytest.mark.skip(reason="port: fix #3 persisted media metadata")
 
     def test_warm_rescan_runs_no_ffprobe(self, media_dir, count_ffprobe):
         """Video metadata is persisted, so an unchanged rescan spawns no subprocess."""
