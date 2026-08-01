@@ -31,7 +31,7 @@ As this was developed for a linux-based system, **symlink** implies the media is
 
 ## Requirements
 
-- Python 3.9 or higher (tested with Python 3.12.3)
+- Python 3.10 or higher (tested with Python 3.12.3)
 - FFmpeg (for video processing)
 
 ## Installation
@@ -75,14 +75,34 @@ The migration script converts all existing `.deduper` JSON cache files to the ne
 ### Basic Usage
 1.  Create a `data` directory and put your folders of images within it or set the environmental variable `DEDUPER_DATA_DIR`
 
-2. Start the application:
+2. Start the application. A `SECRET_KEY` is required, otherwise the app prints an
+   error and exits:
 ```bash
-python3 -m deduper
+SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')" python3 -m deduper
+```
+
+For local use you can instead set `DEDUPER_DEV=true`, which falls back to an
+insecure development key:
+```bash
+DEDUPER_DEV=true python3 -m deduper
 ```
 
 3. Open your web browser and navigate to `http://localhost:5000`
 
 4. Use the web interface to scan for duplicates and manage them
+
+### What happens on first run
+
+- Every scanned folder gets a hidden `.deduper.db` SQLite database holding
+  perceptual hashes, media dimensions and the groups found. Deleting it is safe -
+  it just forces a full rescan.
+- Videos get a `thumb-deduper.<name>.jpg` thumbnail alongside them, used for
+  hashing and for the web interface.
+- A background scanner pre-scans your folders so results load instantly when you
+  open them. It waits 5 minutes after a folder stops changing before rescanning,
+  so ongoing downloads or transfers are not scanned mid-flight.
+- Exact duplicates (identical hash, resolution *and* file size) are symlinked
+  automatically during a scan. Everything else waits for you to choose.
 
 ### Configuration Options
 
@@ -94,7 +114,8 @@ The application can be configured using environment variables:
 | `DEDUPER_HOST` | Host to bind the server to | 127.0.0.1 |
 | `DEDUPER_DATA_DIR` | Directory to store user data | ./data |
 | `DEDUPER_LOG_LEVEL` | Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL) | INFO |
-| `SECRET_KEY` | Flask secret key | 'dev' |
+| `SECRET_KEY` | Flask secret key. **Required** - the app exits if it is unset and `DEDUPER_DEV`/`FLASK_ENV` are not set | _(none)_ |
+| `DEDUPER_DEV` | Set to `true` to allow an insecure `'dev'` secret key for local use | unset |
 
 ### FFmpeg Installation
 
@@ -103,6 +124,26 @@ The application requires FFmpeg for video processing. Install it using:
 - macOS: `brew install ffmpeg`
 - Linux: `sudo apt-get update && sudo apt-get install ffmpeg`
 - Windows: Download from [ffmpeg.org](https://ffmpeg.org/download.html)
+
+## Development
+
+Install the development dependencies and run the test suite:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite generates real images and ffmpeg videos, then scans them end to end.
+Tests needing video skip automatically when `ffmpeg`/`ffprobe` are not on PATH:
+
+```bash
+pytest -k "not Video"     # skip everything requiring ffmpeg
+pytest --no-cov           # skip coverage reporting
+```
+
+Scanning is destructive, so every test works on a throwaway copy of its fixtures
+and writes nothing to your `data` directory.
 
 ## License
 
