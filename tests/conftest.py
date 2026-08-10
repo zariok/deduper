@@ -4,6 +4,7 @@ The environment is prepared before ``deduper`` is imported: Config reads several
 values at class-definition time, so setting them later has no effect.
 """
 
+import gc
 import os
 import shutil
 import subprocess
@@ -141,14 +142,17 @@ def clear_media_caches():
 
 @pytest.fixture(autouse=True)
 def close_sqlite_caches():
-    """Close pooled SQLite connections after every test.
+    """Close SQLite connections after every test.
 
-    HashCache instances are pooled per directory by get_hash_cache(), so without
-    this the pool hands a later test a connection onto a deleted tmp directory,
-    and open file descriptors accumulate across the run.
+    Two separate leaks to contain. Pooled instances (get_hash_cache) outlive the
+    test and would hand a later one a connection onto a deleted tmp directory.
+    Instances built directly with HashCache() are not in the pool at all, so they
+    are only closed by __del__ - collecting deterministically keeps a genuine
+    descriptor leak visible instead of drowning it in ResourceWarnings.
     """
     yield
     close_all_caches()
+    gc.collect()
 
 
 @pytest.fixture
