@@ -12,7 +12,7 @@ from ..services.duplicate_finder import DuplicateFinder
 from ..services.background_scanner import get_background_scanner, ScanStatus
 from ..config import Config
 from ..utils.setup import create_example_folder
-from ..utils.media import extract_video_thumbnail, resolve_media_resolution, get_video_duration
+from ..utils.media import extract_video_thumbnail
 from ..utils.helpers import get_file_size, format_file_size, create_symlink_and_remove_duplicate, find_symlinks_pointing_to
 from ..utils.hash_cache import HashCache, get_hash_cache
 from ..utils.logging_config import get_logger
@@ -969,6 +969,10 @@ def get_cached_results(user_folder: str):
                 duplicate_videos.append(group)
             else:
                 duplicate_images.append(group)
+
+        # Persist anything probed while building the response, otherwise a folder
+        # smaller than the flush threshold would re-probe on every page load
+        cache.flush_media_metadata()
 
         return jsonify({
             'cached': True,

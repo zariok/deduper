@@ -13,7 +13,9 @@ from deduper.utils.hash_cache import (
     get_hash_cache,
 )
 
-from .conftest import VIDEO_EXTENSIONS, gradient_image
+from deduper.utils.media import Resolution
+
+from .conftest import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, gradient_image
 
 
 class TestHashRoundTrip:
@@ -196,3 +198,82 @@ class TestCorruptDatabase:
         # Must recover rather than raise, and be usable afterwards
         cache.get_hash(os.path.join(images_only_dir, "img_a.png"), VIDEO_EXTENSIONS)
         assert cache.has_cached_hash("img_a.png")
+
+
+class TestMediaMetadata:
+    """The metadata cache is written from Flask request threads while the
+    background scanner scans, so it has to tolerate concurrent use."""
+
+    def test_buffered_value_is_visible_before_flush(self, images_only_dir):
+        cache = HashCache(images_only_dir)
+        path = os.path.join(images_only_dir, "img_a.png")
+        first = cache.get_media_metadata(path, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS)
+        second = cache.get_media_metadata(path, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS)
+        assert first == second == (Resolution(240, 240), 0.0)
+
+    def test_flush_persists_rows(self, images_only_dir):
+        cache = HashCache(images_only_dir)
+        cache.get_media_metadata(
+            os.path.join(images_only_dir, "img_a.png"), IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+        )
+        cache.flush_media_metadata()
+        close_all_caches()
+
+        db = os.path.join(images_only_dir, HashCache.DB_FILENAME)
+        with sqlite3.connect(db) as conn:
+            row = conn.execute(
+                "SELECT width, height FROM media_metadata WHERE relative_path='img_a.png'"
+            ).fetchone()
+        assert row == (240, 240)
+
+    def test_flush_is_safe_when_nothing_is_pending(self, images_only_dir):
+        HashCache(images_only_dir).flush_media_metadata()
+
+    def test_in_place_edit_invalidates_the_cached_metadata(self, images_only_dir):
+        path = os.path.join(images_only_dir, "img_a.png")
+        cache = HashCache(images_only_dir)
+        assert cache.get_media_metadata(path, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS)[0] == Resolution(240, 240)
+
+        time.sleep(0.01)
+        gradient_image(60, 60, 11).save(path)
+        assert cache.get_media_metadata(path, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS)[0] == Resolution(60, 60)
+
+    def test_missing_file_yields_unknown(self, images_only_dir):
+        cache = HashCache(images_only_dir)
+        resolution, duration = cache.get_media_metadata(
+            os.path.join(images_only_dir, "gone.png"), IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+        )
+        assert resolution == Resolution() and duration == 0.0
+
+    def test_concurrent_readers_do_not_corrupt_the_buffer(self, images_only_dir, tmp_path):
+        """Regression: the pending buffer was mutated without the lock, and flush
+        could clear it mid-iteration, raising sqlite3.InterfaceError."""
+        import threading
+
+        folder = os.path.realpath(tmp_path / "many")
+        os.makedirs(folder)
+        for i in range(40):
+            gradient_image(70, 70, i).save(os.path.join(folder, f"c{i}.png"))
+
+        cache = HashCache(folder)
+        errors: list[str] = []
+
+        def worker():
+            try:
+                for i in range(40):
+                    cache.get_media_metadata(
+                        os.path.join(folder, f"c{i}.png"),
+                        IMAGE_EXTENSIONS,
+                        VIDEO_EXTENSIONS,
+                    )
+            except Exception as exc:  # noqa: BLE001 - the point is to catch anything
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        cache.flush_media_metadata()
+
+        assert errors == [], f"concurrent access raised: {errors[:3]}"

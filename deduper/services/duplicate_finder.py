@@ -9,7 +9,7 @@ from typing import Callable, Any
 import imagehash
 from ..utils.bktree import BKTree
 from ..utils.helpers import get_file_size, format_file_size, create_symlink_and_remove_duplicate
-from ..utils.media import MultiHash, batch_extract_video_thumbnails, get_detailed_resolution, get_file_resolution, get_image_hash, resolve_media_resolution, select_best_video_from_group, get_video_duration
+from ..utils.media import MultiHash, batch_extract_video_thumbnails, get_image_hash, select_best_video_from_group
 from ..utils.hash_cache import HashCache, get_hash_cache
 from ..utils.logging_config import get_logger
 from ..utils.metrics import metrics, timer, increment_counter, set_gauge
@@ -431,6 +431,10 @@ class DuplicateFinder:
                         time.sleep(0)  # release GIL for HTTP threads
                         if progress_callback:
                             progress_callback('processing', processed_video_groups, total_video_groups, f'Processing video groups... {processed_video_groups}/{total_video_groups}')
+
+            # Persist metadata probed while building the results above, so the
+            # next scan and the next page load do not repeat the work
+            cache.flush_media_metadata()
 
             # Record final metrics
             total_duplicates = len(duplicate_images) + len(duplicate_videos)

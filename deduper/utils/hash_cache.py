@@ -44,6 +44,10 @@ def close_hash_cache(directory_path: str) -> None:
         cache = _cache_registry.pop(key, None)
         if cache:
             try:
+                cache.flush_media_metadata()
+            except Exception:
+                pass
+            try:
                 if cache._conn:
                     cache._conn.close()
                     cache._conn = None
@@ -55,6 +59,10 @@ def close_all_caches() -> None:
     """Close every pooled connection (call at shutdown)."""
     with _registry_lock:
         for cache in _cache_registry.values():
+            try:
+                cache.flush_media_metadata()
+            except Exception:
+                pass
             try:
                 if cache._conn:
                     cache._conn.close()
@@ -90,6 +98,8 @@ class HashCache:
         self.db_file = self.directory_path / self.DB_FILENAME
         self._conn: sqlite3.Connection | None = None
         self._lock = threading.Lock()
+        # Buffered media_metadata rows; see get_media_metadata / flush_media_metadata
+        self._pending_media_meta: dict[str, tuple] = {}
         try:
             self._init_db()
 
@@ -318,13 +328,25 @@ class HashCache:
         rel = self._get_relative_path(file_path)
         mtime, size = self._get_file_stats(file_path)
 
-        row = self._conn.execute(
-            "SELECT width, height, duration, mtime, size FROM media_metadata WHERE relative_path=?",
-            (rel,),
-        ).fetchone()
+        # The buffer is read before the table, so a value probed earlier in this
+        # scan is visible before it has been flushed. Both are read under the lock:
+        # this runs on Flask request threads while the background scanner writes,
+        # and the sqlite connection is shared.
+        with self._lock:
+            pending = self._pending_media_meta.get(rel)
+            if pending is not None and pending[3] == mtime and pending[4] == size:
+                return Resolution(pending[0], pending[1]), pending[2]
+
+            row = self._conn.execute(
+                "SELECT width, height, duration, mtime, size FROM media_metadata WHERE relative_path=?",
+                (rel,),
+            ).fetchone()
+
         if row is not None and row[3] == mtime and row[4] == size:
             return Resolution(row[0], row[1]), row[2]
 
+        # Probe outside the lock. ffprobe and image decoding take real time, and
+        # every status endpoint contends on this lock.
         video_exts = normalize_extensions(video_extensions)
         if Path(file_path).suffix.lower() in video_exts:
             resolution, duration = probe_video_metadata(file_path)
@@ -332,16 +354,49 @@ class HashCache:
             resolution = resolve_media_resolution(file_path, image_extensions, video_extensions)
             duration = 0.0
 
+        # Buffered rather than committed per row: this is called once per file in
+        # the results loops, and a commit apiece meant hundreds of transactions per
+        # scan. Losing the buffer on a crash costs only a re-probe.
         with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO media_metadata "
-                "(relative_path, width, height, duration, mtime, size, updated_at) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (rel, resolution.width, resolution.height, duration, mtime, size, time.time()),
+            self._pending_media_meta[rel] = (
+                resolution.width, resolution.height, duration, mtime, size
             )
-            self._conn.commit()
+            should_flush = len(self._pending_media_meta) >= self._BATCH_CHUNK_SIZE
+
+        # Outside the lock: flush takes it itself, and it is not reentrant
+        if should_flush:
+            self.flush_media_metadata()
 
         return resolution, duration
+
+    def flush_media_metadata(self) -> None:
+        """Write buffered media metadata. Safe to call when nothing is pending."""
+        # Swap the buffer out under the lock so a concurrent writer cannot mutate
+        # the dict while it is being drained
+        with self._lock:
+            if not self._pending_media_meta:
+                return
+            pending = self._pending_media_meta
+            self._pending_media_meta = {}
+
+        now = time.time()
+        rows = [
+            (rel, width, height, duration, mtime, size, now)
+            for rel, (width, height, duration, mtime, size) in pending.items()
+        ]
+
+        # Chunked like batch_update_hashes, so the lock is released between chunks
+        # and web-request threads are not blocked for the whole batch
+        for i in range(0, len(rows), self._BATCH_CHUNK_SIZE):
+            chunk = rows[i : i + self._BATCH_CHUNK_SIZE]
+            with self._lock:
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO media_metadata "
+                    "(relative_path, width, height, duration, mtime, size, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    chunk,
+                )
+                self._conn.commit()
 
     def update_file_stats(self, file_path: str) -> None:
         rel = self._get_relative_path(file_path)
@@ -358,8 +413,11 @@ class HashCache:
                 self._conn.execute("DELETE FROM file_hashes WHERE relative_path=?", (rel,))
                 self._conn.execute("DELETE FROM media_metadata WHERE relative_path=?", (rel,))
                 self._conn.commit()
+                self._pending_media_meta.pop(rel, None)
 
     def cleanup_deleted_files(self, existing_files: set) -> None:
+        # Flush first, so buffered rows for now-deleted files are not resurrected
+        self.flush_media_metadata()
         existing_rel = {self._get_relative_path(p) for p in existing_files}
         cur = self._conn.execute("SELECT relative_path FROM file_hashes")
         to_del = [r[0] for r in cur.fetchall() if r[0] not in existing_rel]
@@ -429,6 +487,7 @@ class HashCache:
         }
 
     def save(self) -> None:
+        self.flush_media_metadata()
         with self._lock:
             self._conn.execute("UPDATE meta SET value=? WHERE key='last_updated'", (str(time.time()),))
             self._conn.commit()
