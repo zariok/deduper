@@ -894,6 +894,8 @@ __all__ = [
     "get_file_resolution",
     "get_image_hash",
     "get_video_duration",
+    "normalize_extensions",
+    "probe_video_metadata",
     "compare_thumbnail_similarity",
     "get_enhanced_video_score",
     "select_best_video_from_group",
