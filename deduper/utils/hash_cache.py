@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from .logging_config import get_logger
-from .media import get_image_hash
+from .media import (
+    Resolution,
+    get_image_hash,
+    normalize_extensions,
+    probe_video_metadata,
+    resolve_media_resolution,
+)
 
 logger = get_logger(__name__)
 
@@ -38,6 +44,10 @@ def close_hash_cache(directory_path: str) -> None:
         cache = _cache_registry.pop(key, None)
         if cache:
             try:
+                cache.flush_media_metadata()
+            except Exception:
+                pass
+            try:
                 if cache._conn:
                     cache._conn.close()
                     cache._conn = None
@@ -49,6 +59,10 @@ def close_all_caches() -> None:
     """Close every pooled connection (call at shutdown)."""
     with _registry_lock:
         for cache in _cache_registry.values():
+            try:
+                cache.flush_media_metadata()
+            except Exception:
+                pass
             try:
                 if cache._conn:
                     cache._conn.close()
@@ -84,6 +98,8 @@ class HashCache:
         self.db_file = self.directory_path / self.DB_FILENAME
         self._conn: sqlite3.Connection | None = None
         self._lock = threading.Lock()
+        # Buffered media_metadata rows; see get_media_metadata / flush_media_metadata
+        self._pending_media_meta: dict[str, tuple] = {}
         try:
             self._init_db()
 
@@ -148,6 +164,19 @@ class HashCache:
                 group_id TEXT PRIMARY KEY,
                 files TEXT NOT NULL,
                 processed INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL
+            );
+            -- Probed dimensions and duration. Carries its own mtime/size rather
+            -- than reusing file_hashes: that keeps hash validity and metadata
+            -- validity independent, so reading metadata on a read-only path can
+            -- never make a stale hash look current.
+            CREATE TABLE IF NOT EXISTS media_metadata (
+                relative_path TEXT PRIMARY KEY,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                duration REAL NOT NULL,
+                mtime REAL NOT NULL,
+                size INTEGER NOT NULL,
                 updated_at REAL NOT NULL
             );
         """)
@@ -283,6 +312,92 @@ class HashCache:
                 self._conn.commit()
         return h
 
+    def get_media_metadata(
+        self,
+        file_path: str,
+        image_extensions,
+        video_extensions,
+    ) -> tuple[Resolution, float]:
+        """
+        Return (resolution, duration) for a media file.
+
+        Values are persisted and reused while the file's mtime and size are
+        unchanged, so repeat scans and page loads neither re-decode images nor
+        re-run ffprobe. Duration is always 0.0 for non-video files.
+        """
+        rel = self._get_relative_path(file_path)
+        mtime, size = self._get_file_stats(file_path)
+
+        # The buffer is read before the table, so a value probed earlier in this
+        # scan is visible before it has been flushed. Both are read under the lock:
+        # this runs on Flask request threads while the background scanner writes,
+        # and the sqlite connection is shared.
+        with self._lock:
+            pending = self._pending_media_meta.get(rel)
+            if pending is not None and pending[3] == mtime and pending[4] == size:
+                return Resolution(pending[0], pending[1]), pending[2]
+
+            row = self._conn.execute(
+                "SELECT width, height, duration, mtime, size FROM media_metadata WHERE relative_path=?",
+                (rel,),
+            ).fetchone()
+
+        if row is not None and row[3] == mtime and row[4] == size:
+            return Resolution(row[0], row[1]), row[2]
+
+        # Probe outside the lock. ffprobe and image decoding take real time, and
+        # every status endpoint contends on this lock.
+        video_exts = normalize_extensions(video_extensions)
+        if Path(file_path).suffix.lower() in video_exts:
+            resolution, duration = probe_video_metadata(file_path)
+        else:
+            resolution = resolve_media_resolution(file_path, image_extensions, video_extensions)
+            duration = 0.0
+
+        # Buffered rather than committed per row: this is called once per file in
+        # the results loops, and a commit apiece meant hundreds of transactions per
+        # scan. Losing the buffer on a crash costs only a re-probe.
+        with self._lock:
+            self._pending_media_meta[rel] = (
+                resolution.width, resolution.height, duration, mtime, size
+            )
+            should_flush = len(self._pending_media_meta) >= self._BATCH_CHUNK_SIZE
+
+        # Outside the lock: flush takes it itself, and it is not reentrant
+        if should_flush:
+            self.flush_media_metadata()
+
+        return resolution, duration
+
+    def flush_media_metadata(self) -> None:
+        """Write buffered media metadata. Safe to call when nothing is pending."""
+        # Swap the buffer out under the lock so a concurrent writer cannot mutate
+        # the dict while it is being drained
+        with self._lock:
+            if not self._pending_media_meta:
+                return
+            pending = self._pending_media_meta
+            self._pending_media_meta = {}
+
+        now = time.time()
+        rows = [
+            (rel, width, height, duration, mtime, size, now)
+            for rel, (width, height, duration, mtime, size) in pending.items()
+        ]
+
+        # Chunked like batch_update_hashes, so the lock is released between chunks
+        # and web-request threads are not blocked for the whole batch
+        for i in range(0, len(rows), self._BATCH_CHUNK_SIZE):
+            chunk = rows[i : i + self._BATCH_CHUNK_SIZE]
+            with self._lock:
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO media_metadata "
+                    "(relative_path, width, height, duration, mtime, size, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    chunk,
+                )
+                self._conn.commit()
+
     def update_file_stats(self, file_path: str) -> None:
         rel = self._get_relative_path(file_path)
         if os.path.exists(file_path):
@@ -296,9 +411,13 @@ class HashCache:
         else:
             with self._lock:
                 self._conn.execute("DELETE FROM file_hashes WHERE relative_path=?", (rel,))
+                self._conn.execute("DELETE FROM media_metadata WHERE relative_path=?", (rel,))
                 self._conn.commit()
+                self._pending_media_meta.pop(rel, None)
 
     def cleanup_deleted_files(self, existing_files: set) -> None:
+        # Flush first, so buffered rows for now-deleted files are not resurrected
+        self.flush_media_metadata()
         existing_rel = {self._get_relative_path(p) for p in existing_files}
         cur = self._conn.execute("SELECT relative_path FROM file_hashes")
         to_del = [r[0] for r in cur.fetchall() if r[0] not in existing_rel]
@@ -318,6 +437,7 @@ class HashCache:
                 chunk = del_rows[i : i + self._BATCH_CHUNK_SIZE]
                 with self._lock:
                     self._conn.executemany("DELETE FROM file_hashes WHERE relative_path=?", chunk)
+                    self._conn.executemany("DELETE FROM media_metadata WHERE relative_path=?", chunk)
                     self._conn.commit()
             logger.info(f"Cleaned up {len(to_del)} deleted files from cache")
 
@@ -367,6 +487,7 @@ class HashCache:
         }
 
     def save(self) -> None:
+        self.flush_media_metadata()
         with self._lock:
             self._conn.execute("UPDATE meta SET value=? WHERE key='last_updated'", (str(time.time()),))
             self._conn.commit()
@@ -471,8 +592,13 @@ class HashCache:
             abs_files = []
             for r in files:
                 p = self._get_absolute_path(r)
-                if not os.path.islink(p):
-                    abs_files.append(p)
+                # Drop symlinks - they point at the kept original - and drop paths
+                # that no longer exist. Testing islink alone is not enough: it is
+                # False for a missing path, so a deleted file stayed in its group on
+                # every later scan and was reported with zeroed resolution and size.
+                if os.path.islink(p) or not os.path.exists(p):
+                    continue
+                abs_files.append(p)
             if abs_files:
                 out[abs_rep] = abs_files
         return out

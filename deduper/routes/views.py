@@ -12,7 +12,7 @@ from ..services.duplicate_finder import DuplicateFinder
 from ..services.background_scanner import get_background_scanner, ScanStatus
 from ..config import Config
 from ..utils.setup import create_example_folder
-from ..utils.media import extract_video_thumbnail, resolve_media_resolution, get_video_duration
+from ..utils.media import extract_video_thumbnail
 from ..utils.helpers import get_file_size, format_file_size, create_symlink_and_remove_duplicate, find_symlinks_pointing_to
 from ..utils.hash_cache import HashCache, get_hash_cache
 from ..utils.logging_config import get_logger
@@ -875,12 +875,16 @@ def get_cached_results(user_folder: str):
 
         # Helper to get file metadata
         def get_file_metadata(abs_path: str, is_video: bool) -> dict:
-            """Get resolution, size, and duration metadata for a file."""
+            """Get resolution, size, and duration metadata for a file.
+
+            Resolution and duration come from the persistent cache, so opening a
+            video-heavy folder does not re-probe every file with ffprobe.
+            """
             try:
-                resolution_obj = resolve_media_resolution(
+                resolution_obj, duration = cache.get_media_metadata(
                     abs_path,
-                    tuple(Config.IMAGE_EXTENSIONS),
-                    tuple(Config.VIDEO_EXTENSIONS)
+                    Config.IMAGE_EXTENSIONS,
+                    Config.VIDEO_EXTENSIONS
                 )
                 size = get_file_size(abs_path)
 
@@ -895,7 +899,6 @@ def get_cached_results(user_folder: str):
                 }
 
                 if is_video:
-                    duration = get_video_duration(abs_path)
                     metadata['duration'] = duration
                     metadata['duration_formatted'] = f"{duration:.1f}s" if duration > 0 else "Unknown"
 
@@ -966,6 +969,10 @@ def get_cached_results(user_folder: str):
                 duplicate_videos.append(group)
             else:
                 duplicate_images.append(group)
+
+        # Persist anything probed while building the response, otherwise a folder
+        # smaller than the flush threshold would re-probe on every page load
+        cache.flush_media_metadata()
 
         return jsonify({
             'cached': True,
