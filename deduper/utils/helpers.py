@@ -126,13 +126,12 @@ def create_symlink_and_remove_duplicate(duplicate_path: str, best_file_path: str
         # Create relative symlink to the best file
         os.symlink(relative_path, duplicate_path)
         
-        # Also remove deduper thumbnail if it exists
-        directory = os.path.dirname(duplicate_path)
-        basename = os.path.basename(duplicate_path)
-        basename_stem = Path(basename).stem
-        deduper_thumb_path = os.path.join(directory, f"thumb-deduper.{basename_stem}.jpg")
-        if os.path.exists(deduper_thumb_path):
-            os.remove(deduper_thumb_path)
+        # Also remove deduper thumbnails if they exist
+        from .media import legacy_thumbnail_path_for, thumbnail_path_for
+
+        for thumb in (thumbnail_path_for(duplicate_path), legacy_thumbnail_path_for(duplicate_path)):
+            if thumb.exists():
+                thumb.unlink()
         
         logger.info(f"Successfully replaced {duplicate_path} with symlink to {best_file_path}")
         return True

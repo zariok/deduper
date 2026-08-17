@@ -1,6 +1,5 @@
 import os
 import urllib.parse
-from pathlib import Path
 from flask import Blueprint, render_template, jsonify, request, send_from_directory, abort, url_for, Response
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import HTTPException
@@ -59,6 +58,28 @@ def _release_cache(folder_path: str) -> None:
             # GC / __del__ once no request threads reference it.
     except Exception:
         pass
+
+
+def _refresh_folder_duplicate_count(folder: str, cache: HashCache) -> None:
+    """Push the post-edit duplicate count to the background scanner.
+
+    /manage-duplicate mutates the cache directly, so the scanner's in-memory
+    FolderState keeps the count from its last full scan and the folder dropdown
+    - which reads that field - goes on advertising duplicates the user has
+    already cleared.  Recompute from the cache we just updated and hand it over;
+    the scanner emits a folder_update and the client patches the one option.
+
+    Best-effort: a failure here costs a stale label, never the file operation
+    that already succeeded.
+    """
+    try:
+        scanner = get_background_scanner()
+        if scanner is None:
+            return
+        scanner.update_folder_duplicate_count(folder, cache.count_duplicate_groups())
+    except Exception as e:
+        logger.warning(f"Failed to refresh duplicate count for {folder}: {e}")
+
 
 # Global progress tracking
 progress_data = {}
@@ -315,6 +336,7 @@ def manage_duplicate():
                 cache.update_file_stats(full_file_path)
                 cache.remove_file_from_groups(full_file_path)
                 logger.debug(f"Updated cache after deleting {file_path}")
+                _refresh_folder_duplicate_count(folder, cache)
             except Exception as e:
                 logger.warning(f"Failed to update cache after deletion: {e}")
 
@@ -499,12 +521,12 @@ def manage_duplicate():
                         
                         os.symlink(relative_path, file_path)
                         
-                        # Also remove deduper thumbnail if it exists
-                        basename = os.path.basename(file_path)
-                        basename_stem = Path(basename).stem
-                        deduper_thumb_path = os.path.join(duplicate_dir, f"thumb-deduper.{basename_stem}.jpg")
-                        if os.path.exists(deduper_thumb_path):
-                            os.remove(deduper_thumb_path)
+                        # Also remove deduper thumbnails if they exist
+                        from deduper.utils.media import legacy_thumbnail_path_for, thumbnail_path_for
+
+                        for thumb in (thumbnail_path_for(file_path), legacy_thumbnail_path_for(file_path)):
+                            if thumb.exists():
+                                thumb.unlink()
                         
                         # Update cache to reflect the file deletion and symlink creation
                         try:
@@ -529,6 +551,7 @@ def manage_duplicate():
                 # Update cache to mark this group as processed
                 cache.mark_group_processed(group_id)
                 cache.save()
+                _refresh_folder_duplicate_count(folder, cache)
                 
                 result_message = f'Successfully processed {processed_count} duplicate files'
                 if errors:
@@ -566,23 +589,26 @@ def serve_thumbnail(filename):
         # For videos, look for the deduper thumbnail with thumb-deduper prefix
         if any(filename.lower().endswith(ext) for ext in Config.VIDEO_EXTENSIONS):
             # Get the directory and filename parts
+            from deduper.utils.media import legacy_thumbnail_path_for, thumbnail_path_for
+
             directory = os.path.dirname(filename)
             basename = os.path.basename(filename)
-            basename_stem = Path(basename).stem
-            deduper_thumb_path = os.path.join(Config.DATA_DIR, directory, f"thumb-deduper.{basename_stem}.jpg")
-            if os.path.exists(deduper_thumb_path):
-                return send_from_directory(Config.DATA_DIR, os.path.join(directory, f"thumb-deduper.{basename_stem}.jpg"))
-            else:
-                # Try to generate thumbnail on-demand for videos
-                from deduper.utils.media import extract_video_thumbnail
-                video_path = os.path.join(Config.DATA_DIR, filename)
-                if os.path.exists(video_path):
-                    thumbnail_path = extract_video_thumbnail(video_path)
-                    if thumbnail_path and os.path.exists(thumbnail_path):
-                        # Return the generated thumbnail
-                        return send_from_directory(Config.DATA_DIR, os.path.relpath(thumbnail_path, Config.DATA_DIR))
-                # If thumbnail generation fails, return 404
-                return jsonify({'error': 'Thumbnail not found'}), 404
+            # Fall back to the old stem-based name so thumbnails written before
+            # the collision fix keep serving until they are regenerated.
+            for builder in (thumbnail_path_for, legacy_thumbnail_path_for):
+                thumb_name = builder(basename).name
+                if os.path.exists(os.path.join(Config.DATA_DIR, directory, thumb_name)):
+                    return send_from_directory(Config.DATA_DIR, os.path.join(directory, thumb_name))
+            # Try to generate thumbnail on-demand for videos
+            from deduper.utils.media import extract_video_thumbnail
+            video_path = os.path.join(Config.DATA_DIR, filename)
+            if os.path.exists(video_path):
+                thumbnail_path = extract_video_thumbnail(video_path)
+                if thumbnail_path and os.path.exists(thumbnail_path):
+                    # Return the generated thumbnail
+                    return send_from_directory(Config.DATA_DIR, os.path.relpath(thumbnail_path, Config.DATA_DIR))
+            # If thumbnail generation fails, return 404
+            return jsonify({'error': 'Thumbnail not found'}), 404
         
         # For images, just serve the file
         return send_from_directory(Config.DATA_DIR, filename)

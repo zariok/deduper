@@ -88,6 +88,125 @@ class TestCachedResults:
             assert "img_a_copy.png" not in names
 
 
+@pytest.fixture
+def idle_scanner(monkeypatch):
+    """Install a BackgroundScanner singleton without starting its threads.
+
+    'testing' config skips the scanner entirely, but the dropdown count lives on
+    its FolderState, so the wiring is untestable without one.
+    """
+    from deduper.services import background_scanner as bg
+
+    def _install(data_dir: str) -> "bg.BackgroundScanner":
+        scanner = bg.BackgroundScanner(
+            data_dir=data_dir,
+            image_extensions=IMAGE_EXTENSIONS,
+            video_extensions=VIDEO_EXTENSIONS,
+        )
+        scanner._discover_folders()
+        monkeypatch.setattr(bg, "_background_scanner", scanner)
+        return scanner
+
+    return _install
+
+
+class TestDuplicateCountAfterManagement:
+    """Removing duplicates has to move the dropdown count immediately.
+
+    duplicate_count is otherwise only written by a full background scan, which is
+    STABILITY_WAIT_SECONDS + MIN_RESCAN_INTERVAL_SECONDS away at best.
+    """
+
+    def _first_duplicate(self, http):
+        payload = http.get("/cached-results/photos").get_json()
+        for group in payload["duplicate_images"]:
+            if group["duplicate_files"]:
+                return group
+        pytest.skip("fixture produced no group with a removable duplicate")
+
+    def test_delete_updates_the_scanner_count(self, client, images_only_dir, idle_scanner):
+        http, data_dir = client
+        folder = populate(data_dir, images_only_dir)
+        DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS).find_duplicates(folder)
+        scanner = idle_scanner(data_dir)
+
+        state = scanner.get_folder_status("photos")
+        state.duplicate_count = 99  # stand in for a count from an older scan
+        state.duplicate_count_time = 0
+
+        group = self._first_duplicate(http)
+        response = http.post(
+            "/manage-duplicate",
+            json={
+                "action": "delete",
+                "folder": "photos",
+                "file_path": group["duplicate_files"][0]["path"],
+                "best_file_path": group["best_file"]["path"],
+            },
+        )
+        assert response.status_code == 200
+
+        from deduper.utils.hash_cache import get_hash_cache
+
+        expected = get_hash_cache(folder).count_duplicate_groups()
+        assert state.duplicate_count == expected
+        assert state.duplicate_count != 99
+        assert state.duplicate_count_time > 0
+
+    def test_recounting_restores_freshness_on_a_stale_folder(self, client, images_only_dir, idle_scanner):
+        """A stale folder shows '(rescan needed)' rather than a count from before
+        the change - but recounting after the user's edits must earn the number
+        back, or the fix above would be erased 30s later by the change check."""
+        http, data_dir = client
+        folder = populate(data_dir, images_only_dir)
+        DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS).find_duplicates(folder)
+        scanner = idle_scanner(data_dir)
+
+        from deduper.routes.socketio_events import _serialize_folder_state
+        from deduper.services.background_scanner import ScanStatus
+
+        # Backdate the scan so the folder's real mtimes read as a later change,
+        # which is what the 30s check reacts to.
+        state = scanner.get_folder_status("photos")
+        state.last_scan_time = 0
+        state.last_modified_time = 0
+        state.duplicate_count_time = 0
+        scanner._check_folders_for_changes()
+
+        assert state.status is ScanStatus.STALE
+        assert _serialize_folder_state(state)["duplicate_count_fresh"] is False
+
+        group = self._first_duplicate(http)
+        http.post(
+            "/manage-duplicate",
+            json={
+                "action": "delete",
+                "folder": "photos",
+                "file_path": group["duplicate_files"][0]["path"],
+                "best_file_path": group["best_file"]["path"],
+            },
+        )
+
+        # Still stale — but the count was verified after the change, so it shows.
+        assert state.status is ScanStatus.STALE
+        assert _serialize_folder_state(state)["duplicate_count_fresh"] is True
+
+    def test_a_count_predating_a_change_is_not_fresh(self, client, images_only_dir, idle_scanner):
+        http, data_dir = client
+        folder = populate(data_dir, images_only_dir)
+        DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS).find_duplicates(folder)
+        scanner = idle_scanner(data_dir)
+
+        state = scanner.get_folder_status("photos")
+        state.duplicate_count = 4
+        state.duplicate_count_time = 100.0
+        state.last_modified_time = 200.0  # folder changed after we last counted
+
+        from deduper.routes.socketio_events import _serialize_folder_state
+
+        assert _serialize_folder_state(state)["duplicate_count_fresh"] is False
+
+
 @requires_ffmpeg
 class TestCachedResultsVideoMetadata:
     def test_reports_video_duration(self, client, media_dir):

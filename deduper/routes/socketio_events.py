@@ -37,6 +37,13 @@ def _serialize_folder_state(state) -> dict:
         'scan_total': state.scan_total,
         'scan_message': state.scan_message,
         'duplicate_count': state.duplicate_count,
+        # True when the count was computed at or after the newest change we know
+        # about, so a stale folder can still show a number the UI just verified
+        # instead of falling back to "(rescan needed)".
+        'duplicate_count_fresh': (
+            state.duplicate_count >= 0
+            and state.duplicate_count_time >= state.last_modified_time
+        ),
     }
 
 

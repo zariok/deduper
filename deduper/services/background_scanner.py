@@ -160,6 +160,9 @@ class FolderState:
     scan_start_time: float = 0
     # Track duplicate count: -1 = not yet scanned, 0+ = actual count
     duplicate_count: int = -1
+    # When duplicate_count was computed.  Compared against last_modified_time to
+    # tell a count that still matches the folder from one the folder has outrun.
+    duplicate_count_time: float = 0
 
 
 class BackgroundScanner:
@@ -445,6 +448,29 @@ class BackgroundScanner:
         """
         with self._lock:
             self._ui_activity_time = time.time()
+
+    def update_folder_duplicate_count(self, folder_name: str, duplicate_count: int) -> None:
+        """Record a duplicate count that was produced outside a background scan.
+
+        The UI removes duplicates through /manage-duplicate, which edits the
+        SQLite cache directly and never runs the scanner.  duplicate_count is
+        otherwise only written by _scan_folder and _discover_folders, so without
+        this the dropdown keeps showing the count from the last full scan - and a
+        rescan is at least STABILITY_WAIT_SECONDS + MIN_RESCAN_INTERVAL_SECONDS
+        away, longer while the user is still working in the folder.
+        """
+        with self._lock:
+            state = self._folder_states.get(folder_name)
+            if state is None:
+                return
+            # Stamp even when the number is unchanged: the folder mtime moved, so
+            # without a fresh stamp the label would decay to "(rescan needed)"
+            # despite the count having just been verified.
+            state.duplicate_count = duplicate_count
+            state.duplicate_count_time = time.time()
+
+        # Emit outside the lock - every status endpoint contends on it.
+        self._emit_folder_update(folder_name, state)
 
     def get_folders_needing_refresh(self) -> set[str]:
         """Get and clear the set of folders that were rescanned and need UI refresh."""
@@ -734,20 +760,25 @@ class BackgroundScanner:
         - last_scan_time: timestamp of last scan or 0
         - duplicate_count: number of duplicate groups or -1 if not scanned
         - file_count: number of files in groups or 0
+        - folder_mtime: newest media mtime, so the caller can seed
+          last_modified_time without a second scandir
         """
         default_result: dict[str, Any] = {
             'status': ScanStatus.PENDING,
             'last_scan_time': 0.0,
             'duplicate_count': -1,
-            'file_count': 0
+            'file_count': 0,
+            'folder_mtime': 0.0
         }
         status_map = {'pending': ScanStatus.PENDING, 'complete': ScanStatus.COMPLETE, 'stale': ScanStatus.STALE}
-        meta = HashCache.read_metadata(folder_path, self._get_folder_mtime(folder_path))
+        folder_mtime = self._get_folder_mtime(folder_path)
+        meta = HashCache.read_metadata(folder_path, folder_mtime)
         return {
             'status': status_map.get(meta['status'], ScanStatus.PENDING),
             'last_scan_time': meta['last_scan_time'],
             'duplicate_count': meta['duplicate_count'],
-            'file_count': meta['file_count']
+            'file_count': meta['file_count'],
+            'folder_mtime': folder_mtime
         }
 
     def _discover_folders(self):
@@ -771,6 +802,11 @@ class BackgroundScanner:
                                 status=cache_meta['status'],
                                 last_scan_time=cache_meta['last_scan_time'],
                                 duplicate_count=cache_meta['duplicate_count'],
+                                # The cached count is only as current as the scan
+                                # that produced it; seeding both stamps lets the
+                                # freshness test work before the first mtime check.
+                                duplicate_count_time=cache_meta['last_scan_time'],
+                                last_modified_time=cache_meta['folder_mtime'],
                                 file_count=cache_meta['file_count']
                             )
                             new_folders.append(f"{folder_name} ({cache_meta['status'].value})")
@@ -1016,6 +1052,7 @@ class BackgroundScanner:
                     video_count = sum(len(g.get('duplicate_files', [])) + 1 for g in (dup_videos or []))
                     st.file_count = image_count + video_count
                     st.duplicate_count = len(dup_images or []) + len(dup_videos or [])
+                    st.duplicate_count_time = st.last_scan_time
 
             with self._lock:
                 if folder_name == self._ui_active_folder:

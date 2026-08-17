@@ -64,12 +64,34 @@ Environment variables (see README.md for the full list):
 
 1. **Duplicate Detection Pipeline** (`deduper/services/duplicate_finder.py`)
    - Main class: `DuplicateFinder`
-   - Hashes with `MultiHash` (pHash + dHash); videos are hashed via a thumbnail
-     extracted at the 1s mark
-   - Groups files with a BK-tree, clustered by disjoint-set union
+   - Images hash to one `MultiHash` (pHash + dHash). **Videos hash to a
+     `VideoSignature`**: a run of frames sampled on an absolute-time grid
+   - Images group with a BK-tree, clustered by disjoint-set union
+   - Videos group in `_cluster_videos`, in two stages. Stage 1 indexes *every*
+     frame in the BK-tree and unions two videos when any single frame matches -
+     deliberately over-inclusive, because a start-trimmed copy shares no frame
+     *position* with its source. Stage 2 re-checks each candidate group with
+     `VideoSignature.aligned_distance` over the whole run and splits apart what
+     does not hold up, which is what rejects a shared intro. Nothing destructive
+     may key off stage 1 alone
+   - Videos are excluded from the incremental fast path: a signature is a
+     sequence and cannot be packed into the single-hash BK-tree. When any video
+     is new the video set is re-clustered from cached signatures, which costs no
+     re-hashing
    - Incremental grouping so unchanged files are not reprocessed
-   - Auto-eliminates exact matches (same hash, resolution and file size) in a
-     single pass, skipped entirely when nothing is new or changed
+   - Auto-eliminates **byte-identical** files in a single pass, skipped entirely
+     when nothing is new or changed. Identity is proven with a content digest,
+     never inferred from hash + resolution + size: distinct images do collide on
+     all three, and this pass deletes. Within each identical set one file is kept
+     and only its twins are replaced; sets that do not include the group's best
+     file still collapse to one member
+   - **Tombstones GIFs**: when a verified video group holds a GIF and a non-GIF
+     video, the GIF is symlinked to the best non-GIF member. A GIF rendered from
+     an mp4 is never byte-identical to it, so the pass above can never reclaim
+     one. The symlink is the point, not a side effect - a scraper checks whether
+     the path exists and will re-download if it does not. Disable with
+     `TOMBSTONE_GIFS = False`. This runs only after alignment verification, so a
+     shared intro cannot tombstone a GIF against the wrong video
    - Hashing runs on a module-level `ProcessPoolExecutor` using the **spawn**
      context - forking a process whose threads hold locks deadlocks the children.
      `shutdown_process_pool()` is registered for exit
@@ -83,7 +105,10 @@ Environment variables (see README.md for the full list):
    - `.deduper.db` per scanned directory. `.deduper` is the *legacy JSON* name,
      kept only so `scripts/migrate_deduper_to_sqlite.py` can find files to convert
    - Tables: `meta`, `file_hashes`, `grouping_results`, `best_files`, `groups`,
-     `media_metadata`
+     `media_metadata`, `content_hashes`
+   - `content_hashes` holds a blake2b digest of the file's bytes, written only
+     for files that already share a size with another member of their group -
+     a scan never reads every file's contents
    - Instances are **pooled** by resolved path via `get_hash_cache()`. Use that
      rather than constructing `HashCache` directly, and call `close_hash_cache()`
      / `close_all_caches()` to release file descriptors
@@ -114,7 +139,16 @@ Environment variables (see README.md for the full list):
 
 - **Symlink Strategy**: duplicates are replaced with relative symlinks to the group's best file
 - **Best File Selection**: images by highest resolution; videos by resolution, then duration, then size
-- **Thumbnails**: `thumb-deduper.<name>.jpg`, extracted at the 1s mark
+- **Thumbnails**: `thumb-deduper.<full filename>.jpg` - built by
+  `thumbnail_path_for()`, never by hand. Keyed on the whole name, not the stem:
+  `clip.mp4` and `clip.gif` share a stem, and a stem-based name made them race on
+  one file and let removing one delete the other's. `legacy_thumbnail_path_for()`
+  exists only so cleanup can remove pre-fix names
+- **Video frame offsets**: absolute, never percentages. A trim is an *offset*, so
+  percentage sampling maps two copies onto different content; the grid step comes
+  from a ladder so clips of similar length land on the same grid. The seek offset
+  is duration-aware - a fixed 1s seek was past the end of any clip of a second or
+  less, and those files were silently dropped from detection entirely
 - **Media metadata**: resolution and duration live in the `media_metadata` table
   and are reused while mtime and size are unchanged. A warm rescan or page load of
   a video folder should spawn **zero** ffprobe processes
@@ -186,8 +220,22 @@ about them:
 - Scanning twice produces identical groups and group IDs
 - An unchanged rescan runs zero exact-match passes and zero ffprobe calls
 - Exact matches become symlinks; similar-but-not-identical files do not
+- Two files sharing a hash, resolution *and* size but differing in bytes both
+  survive - the `lookalikes` fixture builds that collision on purpose. If it ever
+  stops grouping, the test says so rather than passing vacuously
+- An identical pair that is not the group's best file still collapses to one
 - A new near-duplicate joins an existing group, including one whose only member
   was previously unique
+- A GIF rendered from a video matches it and is tombstoned to it; the video keeps
+  its own thumbnail afterwards
+- A clip trimmed at the *start* still matches - the case a fixed-offset single
+  frame misses outright
+- Two clips sharing an opening then diverging are **not** merged
+- A sub-second clip is detected at all, and gets a thumbnail
+
+`tests/conftest.py` mirrors `config.py` in putting `.gif` in `VIDEO_EXTENSIONS`.
+It used to classify it as an image, so the suite exercised a rule the app does
+not have; keep the two in step.
 
 ### Changing the Hash Algorithm
 

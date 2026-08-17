@@ -5,6 +5,7 @@ replaced with symlinks, so every test scans a throwaway copy of the fixtures.
 """
 
 import os
+import shutil
 
 import pytest
 
@@ -100,6 +101,216 @@ class TestColdScan:
         assert cache.has_cached_hash("img_a.png"), (
             "scanning via a symlinked path stored keys the resolved cache cannot find"
         )
+
+
+def _pad_to_match(smaller: str, larger: str) -> None:
+    """Append nulls so two files share a byte count. PIL ignores data past IEND."""
+    gap = os.path.getsize(larger) - os.path.getsize(smaller)
+    assert gap > 0, "expected the first file to be the smaller one"
+    with open(smaller, "ab") as fh:
+        fh.write(b"\0" * gap)
+
+
+@pytest.fixture
+def lookalikes(tmp_path) -> str:
+    """A folder holding two images that every cheap test says are the same file.
+
+    Identical perceptual hash, identical resolution, identical byte count - and
+    visibly different content. This is the collision the old rule deleted on.
+    """
+    folder = tmp_path / "lookalikes"
+    folder.mkdir()
+
+    base = gradient_image(240, 240, 11)
+    a = folder / "twin_a.png"
+    base.save(a)
+
+    marked = base.copy()
+    pixels = marked.load()
+    for x in range(8):
+        for y in range(8):
+            pixels[x, y] = (255, 0, 0)  # a red corner block: plainly not the same image
+    b = folder / "twin_b.png"
+    marked.save(b)
+
+    _pad_to_match(str(a), str(b))
+    assert os.path.getsize(a) == os.path.getsize(b)
+    assert a.read_bytes() != b.read_bytes()
+    return str(folder)
+
+
+class TestOnlyIdenticalFilesAreRemoved:
+    """Auto-elimination deletes files, so it must prove identity, not infer it."""
+
+    def test_lookalikes_are_grouped_but_both_survive(self, lookalikes):
+        images, _ = scan(lookalikes)
+
+        # Guard the premise: if these stopped grouping, the test proves nothing.
+        group = find_group(images, "twin_a.png")
+        assert group is not None, "fixture no longer collides; the test is vacuous"
+        assert sorted(group_basenames(group)) == ["twin_a.png", "twin_b.png"]
+
+        for name in ("twin_a.png", "twin_b.png"):
+            path = os.path.join(lookalikes, name)
+            assert os.path.isfile(path) and not os.path.islink(path), (
+                f"{name} shares a hash, resolution and size with its pair but not its "
+                f"bytes - deleting it destroys a distinct image"
+            )
+
+    def test_lookalikes_are_not_flagged_as_exact_matches(self, lookalikes):
+        images, _ = scan(lookalikes)
+        group = find_group(images, "twin_a.png")
+        assert all(d["is_exact_match"] is False for d in group["duplicate_files"])
+
+    def test_one_of_each_identical_pair_is_kept(self, tmp_path):
+        """Identical files that are not the group's best still collapse to one.
+
+        The old pass compared every file against the best file alone, so a pair
+        that was identical to each other but smaller than the best survived intact.
+        """
+        folder = tmp_path / "nested"
+        folder.mkdir()
+        base = gradient_image(240, 240, 11)
+        base.save(folder / "big.png")
+        small = base.resize((120, 120))
+        small.save(folder / "small_one.png")
+        shutil.copy(folder / "small_one.png", folder / "small_two.png")
+
+        scan(str(folder))
+
+        assert os.path.isfile(folder / "big.png") and not os.path.islink(folder / "big.png")
+        survivors = [
+            n for n in ("small_one.png", "small_two.png")
+            if not os.path.islink(folder / n)
+        ]
+        links = [n for n in ("small_one.png", "small_two.png") if os.path.islink(folder / n)]
+        assert len(survivors) == 1, f"expected exactly one of the identical pair to remain, kept {survivors}"
+        assert len(links) == 1
+        assert os.path.realpath(folder / links[0]) == str(folder / survivors[0])
+
+    def test_the_kept_file_is_stable_across_scans(self, tmp_path):
+        folder = tmp_path / "stable"
+        folder.mkdir()
+        gradient_image(240, 240, 11).save(folder / "b_copy.png")
+        shutil.copy(folder / "b_copy.png", folder / "a_copy.png")
+
+        scan(str(folder))
+        kept = [n for n in ("a_copy.png", "b_copy.png") if not os.path.islink(folder / n)]
+        assert len(kept) == 1
+
+        scan(str(folder))
+        assert not os.path.islink(folder / kept[0]), "the survivor moved between scans"
+
+
+@requires_ffmpeg
+class TestVideoSignatureMatching:
+    """The signature exists so a video is judged on its whole length.
+
+    Every case here is one a single frame at a fixed 1s offset gets wrong:
+    it cannot see past a shared opening, cannot follow a start trim, and
+    cannot reach into a clip shorter than the offset itself.
+    """
+
+    def _links(self, folder):
+        return {n for n in os.listdir(folder) if os.path.islink(os.path.join(folder, n))}
+
+    def test_a_gif_rendered_from_a_video_matches_it(self, signature_dir):
+        _, videos = scan(signature_dir)
+        group = find_group(videos, "full.mp4")
+        assert group is not None
+        assert "full.gif" in group_basenames(group) or os.path.islink(
+            os.path.join(signature_dir, "full.gif")
+        ), "the gif was neither grouped with its source nor tombstoned to it"
+
+    def test_a_clip_trimmed_at_the_end_still_matches(self, signature_dir):
+        _, videos = scan(signature_dir)
+        group = find_group(videos, "full.mp4")
+        assert "trim_end.mp4" in group_basenames(group)
+
+    def test_a_clip_trimmed_at_the_start_still_matches(self, signature_dir):
+        """A fixed-offset single frame misses this outright: t=1s in the trim is
+        t=11s in the source, so the one sampled instant shows different content."""
+        _, videos = scan(signature_dir)
+        group = find_group(videos, "full.mp4")
+        assert "trim_start.mp4" in group_basenames(group)
+
+    def test_clips_sharing_an_opening_are_not_merged(self, signature_dir):
+        """Both start with the same 8s navy card, then diverge completely."""
+        _, videos = scan(signature_dir)
+        group = find_group(videos, "share_a.mp4")
+        if group is not None:
+            assert "share_b.mp4" not in group_basenames(group), (
+                "a shared opening was treated as the whole clip"
+            )
+        assert not os.path.islink(os.path.join(signature_dir, "share_b.mp4"))
+
+    def test_a_sub_second_clip_is_detected_at_all(self, signature_dir):
+        """0.6s: the old fixed 1s seek was past the end, so ffmpeg produced no
+        frame and the file was dropped from detection entirely."""
+        scan(signature_dir)
+        brief_gif = os.path.join(signature_dir, "brief.gif")
+        assert os.path.islink(brief_gif), (
+            "the sub-second gif was never matched to its source video"
+        )
+        assert os.path.realpath(brief_gif) == os.path.join(signature_dir, "brief.mp4")
+
+    def test_a_sub_second_clip_gets_a_thumbnail(self, signature_dir):
+        scan(signature_dir)
+        assert os.path.isfile(os.path.join(signature_dir, "thumb-deduper.brief.mp4.jpg"))
+
+    def test_the_video_keeps_its_thumbnail_after_its_gif_is_tombstoned(self, signature_dir):
+        """clip.mp4 and clip.gif share a stem, so a stem-named thumbnail was one
+        shared file: tombstoning the gif deleted the thumbnail the video needed,
+        and concurrent extraction raced on the same path before that."""
+        scan(signature_dir)
+        assert os.path.islink(os.path.join(signature_dir, "full.gif")), "premise: gif was tombstoned"
+        assert os.path.isfile(os.path.join(signature_dir, "thumb-deduper.full.mp4.jpg")), (
+            "the video lost its thumbnail when its gif was tombstoned"
+        )
+
+    def test_results_are_stable_across_rescans(self, signature_dir):
+        first, _ = scan(signature_dir), None
+        second, _ = scan(signature_dir), None
+        assert [group_basenames(g) for g in first[1]] == [group_basenames(g) for g in second[1]]
+
+
+@requires_ffmpeg
+class TestGifTombstoning:
+    def test_the_gif_becomes_a_symlink_to_the_video(self, signature_dir):
+        scan(signature_dir)
+        gif = os.path.join(signature_dir, "full.gif")
+        assert os.path.islink(gif), "gif was not tombstoned"
+        assert os.path.realpath(gif) == os.path.join(signature_dir, "full.mp4")
+
+    def test_the_video_itself_is_untouched(self, signature_dir):
+        scan(signature_dir)
+        mp4 = os.path.join(signature_dir, "full.mp4")
+        assert os.path.isfile(mp4) and not os.path.islink(mp4)
+
+    def test_the_tombstone_keeps_the_path_visible(self, signature_dir):
+        """The symlink is what a scraper checks, so the path must still exist."""
+        scan(signature_dir)
+        assert os.path.exists(os.path.join(signature_dir, "full.gif"))
+
+    def test_a_gif_is_not_tombstoned_against_unmatched_footage(self, signature_dir):
+        """Tombstoning runs only on groups alignment has already confirmed."""
+        scan(signature_dir)
+        gif = os.path.join(signature_dir, "full.gif")
+        assert os.path.realpath(gif) != os.path.join(signature_dir, "share_a.mp4")
+        assert os.path.realpath(gif) != os.path.join(signature_dir, "share_b.mp4")
+
+    def test_tombstoned_gifs_do_not_return_on_rescan(self, signature_dir):
+        scan(signature_dir)
+        links = self._links = {
+            n for n in os.listdir(signature_dir)
+            if os.path.islink(os.path.join(signature_dir, n))
+        }
+        scan(signature_dir)
+        still = {
+            n for n in os.listdir(signature_dir)
+            if os.path.islink(os.path.join(signature_dir, n))
+        }
+        assert links == still, "a rescan disturbed the tombstones"
 
 
 class TestWarmRescan:

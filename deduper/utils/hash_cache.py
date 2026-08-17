@@ -75,7 +75,28 @@ CACHE_FILENAME = ".deduper"
 # SQLite database filename
 DB_FILENAME = ".deduper.db"
 
-CACHE_VERSION = "2.2"  # 2.2: Multi-hash (pHash+dHash); old single-hash values invalid
+# 2.3: videos store a multi-frame VideoSignature instead of one thumbnail hash.
+# Images are unaffected in form, but the version gates the whole cache, so a
+# bump re-hashes both. That is the documented cost of changing hash production.
+CACHE_VERSION = "2.3"  # 2.3: Multi-frame video signatures; 2.2 single-frame video hashes invalid
+
+
+def _digest_file(file_path: str, chunk_size: int = 1024 * 1024) -> str | None:
+    """Hash a file's bytes, or return None if it cannot be read.
+
+    blake2b rather than md5: this decides whether a file gets deleted, and it is
+    faster than md5 on 64-bit builds anyway. Read in chunks so a multi-gigabyte
+    video does not land in memory.
+    """
+    h = hashlib.blake2b(digest_size=32)
+    try:
+        with open(file_path, "rb") as fh:
+            while chunk := fh.read(chunk_size):
+                h.update(chunk)
+    except OSError as e:
+        logger.warning(f"Could not read {file_path} for content hashing: {e}")
+        return None
+    return h.hexdigest()
 
 
 def _is_old_cache_format(data: dict[str, Any]) -> bool:
@@ -179,6 +200,17 @@ class HashCache:
                 size INTEGER NOT NULL,
                 updated_at REAL NOT NULL
             );
+            -- Digest of the file's actual bytes. Auto-elimination deletes files,
+            -- so it needs proof of identity: a perceptual hash plus matching
+            -- resolution and size is a proxy that distinct images do collide on.
+            -- Carries its own mtime/size for the same reason media_metadata does.
+            CREATE TABLE IF NOT EXISTS content_hashes (
+                relative_path TEXT PRIMARY KEY,
+                digest TEXT NOT NULL,
+                mtime REAL NOT NULL,
+                size INTEGER NOT NULL,
+                updated_at REAL NOT NULL
+            );
         """)
         self._conn.commit()
         # Ensure meta exists and check version for auto-invalidation
@@ -199,10 +231,21 @@ class HashCache:
                 f"Cache version mismatch ({old_version} -> {CACHE_VERSION}) "
                 f"in {self.directory_path}, invalidating stale data"
             )
+            # Only hash-derived data is invalid. best_files and groups are keyed
+            # on group_id, which _generate_group_id_from_files builds from sorted
+            # relative PATHS and never from hashes - so a change in how hashes are
+            # produced cannot invalidate a single one of those keys.
+            #
+            # Wiping them destroyed real user decisions on every algorithm bump:
+            # best_files holds the file the user chose to keep, and groups holds
+            # the processed flag marking what they had already worked through.
+            # Rows for groups whose membership genuinely changes get a new
+            # group_id and are simply never looked up again - inert, a few KB,
+            # and far cheaper than discarding the choices that still apply.
+            # invalidate_cache() still clears everything; that one is a user
+            # asking for a clean slate.
             self._conn.execute("DELETE FROM file_hashes")
             self._conn.execute("DELETE FROM grouping_results")
-            self._conn.execute("DELETE FROM best_files")
-            self._conn.execute("DELETE FROM groups")
             now = time.time()
             self._conn.executemany(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
@@ -284,9 +327,16 @@ class HashCache:
             self._conn.commit()
 
     def get_hash(self, file_path: str, video_extensions: set) -> Any | None:
-        from .media import MultiHash
+        """Return the cached perceptual hash, computing and storing it if absent.
+
+        Videos yield a multi-frame VideoSignature, images a MultiHash; both
+        serialize to one string, so the column is shared.
+        """
+        from .media import MultiHash, VideoSignature, get_video_signature
         if not os.path.exists(file_path):
             return None
+        is_video = Path(file_path).suffix.lower() in normalize_extensions(video_extensions)
+        decode = VideoSignature.from_str if is_video else MultiHash.from_str
         rel = self._get_relative_path(file_path)
         row = self._conn.execute(
             "SELECT hash_value, mtime, size FROM file_hashes WHERE relative_path = ?", (rel,)
@@ -295,11 +345,14 @@ class HashCache:
             mtime, size = self._get_file_stats(file_path)
             if row[1] == mtime and row[2] == size:
                 try:
-                    return MultiHash.from_str(row[0])
+                    return decode(row[0])
                 except Exception as e:
                     logger.warning(f"Error converting cached hash for {file_path}: {e}")
                     return None
-        h = get_image_hash(file_path, tuple(video_extensions))
+        h = (
+            get_video_signature(file_path) if is_video
+            else get_image_hash(file_path, tuple(video_extensions))
+        )
         if h is not None:
             mtime, size = self._get_file_stats(file_path)
             with self._lock:
@@ -398,6 +451,42 @@ class HashCache:
                 )
                 self._conn.commit()
 
+    def get_content_hash(self, file_path: str) -> str | None:
+        """
+        Return a digest of the file's bytes, or None if it cannot be read.
+
+        Persisted and reused while mtime and size are unchanged, so confirming a
+        duplicate costs one indexed SELECT on a warm rescan rather than a re-read.
+        Only ever called for files that already share a size with another member
+        of their group, so whole-folder scans do not read every file's contents.
+        """
+        rel = self._get_relative_path(file_path)
+        mtime, size = self._get_file_stats(file_path)
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT digest, mtime, size FROM content_hashes WHERE relative_path=?",
+                (rel,),
+            ).fetchone()
+
+        if row is not None and row[1] == mtime and row[2] == size:
+            return str(row[0])
+
+        # Read outside the lock: this walks the whole file, and every status
+        # endpoint contends on it.
+        digest = _digest_file(file_path)
+        if digest is None:
+            return None
+
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO content_hashes "
+                "(relative_path, digest, mtime, size, updated_at) VALUES (?,?,?,?,?)",
+                (rel, digest, mtime, size, time.time()),
+            )
+            self._conn.commit()
+        return digest
+
     def update_file_stats(self, file_path: str) -> None:
         rel = self._get_relative_path(file_path)
         if os.path.exists(file_path):
@@ -412,6 +501,7 @@ class HashCache:
             with self._lock:
                 self._conn.execute("DELETE FROM file_hashes WHERE relative_path=?", (rel,))
                 self._conn.execute("DELETE FROM media_metadata WHERE relative_path=?", (rel,))
+                self._conn.execute("DELETE FROM content_hashes WHERE relative_path=?", (rel,))
                 self._conn.commit()
                 self._pending_media_meta.pop(rel, None)
 
@@ -425,12 +515,14 @@ class HashCache:
             abs_path = self.directory_path / rel
             if abs_path.exists():
                 continue
-            thumb = abs_path.with_name(f"thumb-deduper.{abs_path.stem}.jpg")
-            if thumb.exists():
-                try:
-                    thumb.unlink()
-                except OSError as e:
-                    logger.warning(f"Failed to remove thumbnail {thumb}: {e}")
+            from .media import legacy_thumbnail_path_for, thumbnail_path_for
+
+            for thumb in (thumbnail_path_for(abs_path), legacy_thumbnail_path_for(abs_path)):
+                if thumb.exists():
+                    try:
+                        thumb.unlink()
+                    except OSError as e:
+                        logger.warning(f"Failed to remove thumbnail {thumb}: {e}")
         if to_del:
             del_rows = [(r,) for r in to_del]
             for i in range(0, len(del_rows), self._BATCH_CHUNK_SIZE):
@@ -438,6 +530,7 @@ class HashCache:
                 with self._lock:
                     self._conn.executemany("DELETE FROM file_hashes WHERE relative_path=?", chunk)
                     self._conn.executemany("DELETE FROM media_metadata WHERE relative_path=?", chunk)
+                    self._conn.executemany("DELETE FROM content_hashes WHERE relative_path=?", chunk)
                     self._conn.commit()
             logger.info(f"Cleaned up {len(to_del)} deleted files from cache")
 
@@ -602,6 +695,16 @@ class HashCache:
             if abs_files:
                 out[abs_rep] = abs_files
         return out
+
+    def count_duplicate_groups(self) -> int:
+        """Number of groups that still hold more than one real file.
+
+        Counted through get_cached_groups so symlinks and deleted paths drop out
+        exactly as they do when the folder view is rendered - the dropdown label
+        and the page the user is looking at must not disagree. read_metadata
+        counts the raw JSON instead, which is why it can report a higher number.
+        """
+        return sum(1 for files in self.get_cached_groups().values() if len(files) > 1)
 
     def set_cached_groups(self, groups: dict) -> None:
         now = time.time()

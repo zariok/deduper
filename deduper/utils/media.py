@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
@@ -19,6 +19,54 @@ logger = get_logger(__name__)
 # Shared thread pool for concurrent FFmpeg subprocess execution.
 # Threads are ideal here because each thread just waits on a subprocess.
 _ffmpeg_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ffmpeg")
+
+
+# --- Video signature sampling -------------------------------------------------
+# Frames are sampled on an ABSOLUTE grid, not at percentages of the duration.
+# A trimmed copy differs from its source by an offset, not by a scale factor, so
+# percentage sampling maps the two onto different content and misses the match;
+# an absolute grid keeps them commensurate and lets alignment recover the offset.
+SIGNATURE_MAX_FRAMES = 16
+
+# The step is chosen from a ladder rather than computed as duration/N, so two
+# clips of similar length land on the SAME grid and their frames line up. A
+# computed step would shift with every difference in duration.
+# Reaches far enough that even an hour-long file is sampled across its whole
+# length: without the long rungs the frame cap would confine every sample to the
+# opening minutes, which is exactly where videos resemble each other most.
+_STEP_LADDER = (1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0)
+
+# Below this, a grid is pointless - there is nothing to trim-align - so short
+# clips are sampled at fractions instead. This is also what rescues clips of 1s
+# and under, which the old fixed 1.0s seek could not reach at all.
+_SHORT_CLIP_SECONDS = 2.0
+_SHORT_CLIP_FRACTIONS = (0.25, 0.5, 0.75)
+
+
+def _frame_offsets(duration: float) -> tuple[list[float], float]:
+    """Return (absolute seek offsets, grid step) for sampling *duration*.
+
+    A step of 0.0 means the clip was too short for a grid and the offsets are
+    fractions of its length.
+    """
+    if duration <= 0:
+        return [0.0], 0.0
+
+    if duration < _SHORT_CLIP_SECONDS:
+        offsets = [round(duration * f, 3) for f in _SHORT_CLIP_FRACTIONS]
+        return [o for o in offsets if o < duration] or [0.0], 0.0
+
+    step = _STEP_LADDER[-1]
+    for candidate in _STEP_LADDER:
+        if int(duration // candidate) <= SIGNATURE_MAX_FRAMES:
+            step = candidate
+            break
+
+    count = min(int(duration // step), SIGNATURE_MAX_FRAMES)
+    # Offset by half a step so a leading black frame or slate is never the only
+    # thing sampled.
+    offsets = [round(step * i + step / 2, 3) for i in range(max(count, 1))]
+    return [o for o in offsets if o < duration] or [round(duration / 2, 3)], step
 
 
 @dataclass(frozen=True)
@@ -289,23 +337,161 @@ def check_all_requirements() -> tuple[bool, str]:
     return True, ""
 
 
+def _run_ffmpeg(cmd: list[str], timeout: int = 30) -> bool:
+    """Run an ffmpeg command, reporting success rather than raising."""
+    try:
+        subprocess.run(cmd, capture_output=True, check=True, timeout=timeout, text=True)
+        return True
+    except (FileNotFoundError, subprocess.SubprocessError, subprocess.TimeoutExpired) as exc:
+        logger.debug("ffmpeg failed (%s): %s", " ".join(cmd[:6]), exc)
+        return False
+
+
+def _hash_frame_files(paths: Iterable[Path]) -> list[MultiHash]:
+    """Hash each frame image, skipping any that will not decode."""
+    frames: list[MultiHash] = []
+    for path in paths:
+        try:
+            with Image.open(path) as frame:
+                frames.append(
+                    MultiHash(phash=imagehash.phash(frame), dhash=imagehash.dhash(frame))
+                )
+        except (UnidentifiedImageError, OSError) as exc:
+            logger.debug("Skipping undecodable frame %s: %s", path, exc)
+    return frames
+
+
+def get_video_signature(
+    video_path: str,
+    *,
+    width: int = 320,
+    duration: float | None = None,
+) -> VideoSignature | None:
+    """Sample a video on an absolute grid and hash every frame.
+
+    Pass *duration* to reuse an already-probed value instead of paying for
+    another ffprobe.
+
+    Frames are written to a temporary directory and discarded once hashed: the
+    signature lives in the cache, so keeping N images per video beside the
+    originals would litter every scanned folder for no gain. The single display
+    thumbnail is still produced separately by extract_video_thumbnail.
+    """
+    source = Path(video_path)
+    if not source.exists():
+        logger.debug("Cannot build signature, video missing: %s", video_path)
+        return None
+
+    if duration is None:
+        _, duration = probe_video_metadata(video_path)
+    offsets, step = _frame_offsets(duration)
+
+    with tempfile.TemporaryDirectory(prefix="deduper-sig-") as tmp:
+        tmp_dir = Path(tmp)
+        produced: list[Path] = []
+
+        if step > 0:
+            # One pass for the whole grid: seek to the first offset, then let the
+            # fps filter emit a frame every `step` seconds. N separate seeks would
+            # mean N ffmpeg spawns per video.
+            pattern = tmp_dir / "f_%03d.jpg"
+            ok = _run_ffmpeg([
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-ss", _format_timestamp(offsets[0]),
+                "-i", str(source),
+                # No -vsync: it was removed in ffmpeg 9, and passing it made this
+                # whole command fail, silently demoting every video to the
+                # per-offset fallback below. The fps filter already fixes the
+                # output rate, so the flag was never doing anything here.
+                "-vf", f"fps=1/{step:g},scale={width}:-2",
+                "-frames:v", str(len(offsets)),
+                "-f", "image2", str(pattern),
+            ])
+            if ok:
+                produced = sorted(tmp_dir.glob("f_*.jpg"))
+
+        if not produced:
+            # Short clips, and any video the grid pass could not read: seek each
+            # offset individually. There are only a handful either way.
+            for idx, offset in enumerate(offsets):
+                target = tmp_dir / f"s_{idx:03d}.jpg"
+                if _run_ffmpeg([
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-ss", _format_timestamp(offset),
+                    "-i", str(source),
+                    "-frames:v", "1",
+                    "-vf", f"scale={width}:-2",
+                    "-f", "image2", str(target),
+                ]) and target.exists() and target.stat().st_size > 0:
+                    produced.append(target)
+
+        frames = _hash_frame_files(produced)
+
+    if not frames:
+        logger.warning(
+            "No frames could be sampled from %s - SKIPPING from duplicate detection", source
+        )
+        return None
+
+    logger.debug("Signature for %s: %d frames, step=%gs", source, len(frames), step)
+    return VideoSignature(frames=tuple(frames), step=step)
+
+
+def thumbnail_path_for(media_path: str | Path) -> Path:
+    """Where the display thumbnail for *media_path* lives.
+
+    Keyed on the full filename, not the stem: clip.mp4 and clip.gif share a stem,
+    so a stem-based name made them fight over one file. Concurrent extraction
+    then raced on the same path and could leave neither with a thumbnail - and a
+    video beside a gif of itself is the normal case here, not a corner one.
+    """
+    source = Path(media_path)
+    return source.with_name(f"thumb-deduper.{source.name}.jpg")
+
+
+def legacy_thumbnail_path_for(media_path: str | Path) -> Path:
+    """The pre-collision-fix stem-based name, kept only so cleanup can remove it."""
+    source = Path(media_path)
+    return source.with_name(f"thumb-deduper.{source.stem}.jpg")
+
+
+def _thumbnail_offset(video_path: str, requested: float | None) -> float:
+    """Pick a seek offset that actually lands inside the clip.
+
+    A fixed 1.0s offset is past the end of any clip of a second or less, and
+    ffmpeg then produces nothing - such files used to end up with no thumbnail
+    at all. Short clips are sampled at their midpoint instead.
+    """
+    if requested is not None:
+        return requested
+    try:
+        _, duration = probe_video_metadata(video_path)
+    except Exception:
+        return 1.0
+    if duration <= 0:
+        return 0.0
+    return min(1.0, duration / 2)
+
+
 def extract_video_thumbnail(
     video_path: str,
     *,
-    timestamp_seconds: float = 1.0,
+    timestamp_seconds: float | None = None,
     width: int = 320,
 ) -> str | None:
     """
     Extract a single-frame thumbnail for the supplied video.
 
-    Returns the thumbnail path when successful, otherwise None.
+    *timestamp_seconds* defaults to a duration-aware offset; pass a value to
+    override it. Returns the thumbnail path when successful, otherwise None.
     """
     source = Path(video_path)
     if not source.exists():
         logger.debug("Cannot create thumbnail, video missing: %s", video_path)
         return None
+    timestamp_seconds = _thumbnail_offset(video_path, timestamp_seconds)
 
-    target = source.with_name(f"thumb-deduper.{source.stem}.jpg")
+    target = thumbnail_path_for(source)
     try:
         if target.exists() and target.stat().st_size > 0:
             # Validate that the existing thumbnail is a valid image
@@ -366,9 +552,29 @@ def extract_video_thumbnail(
             "1024",
             "-y",
             str(target),
-        ]
+        ],
+        # Last resort: the very first frame. The two attempts above share a seek
+        # offset, so when that offset is the problem - past the end, or on an
+        # unseekable stream - retrying it changes nothing. Starting at zero is
+        # the one thing that can still succeed.
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source),
+            "-frames:v",
+            "1",
+            "-vf",
+            f"scale={width}:-1",
+            "-f",
+            "image2",
+            "-y",
+            str(target),
+        ],
     ]
-    
+
     for attempt, cmd in enumerate(ffmpeg_options):
         try:
             # Increase timeout for problematic videos
@@ -400,7 +606,7 @@ def extract_video_thumbnail(
 def batch_extract_video_thumbnails(
     video_paths: list[str],
     *,
-    timestamp_seconds: float = 1.0,
+    timestamp_seconds: float | None = None,
     width: int = 320,
     progress_callback: object | None = None,
 ) -> dict[str, str | None]:
@@ -418,7 +624,7 @@ def batch_extract_video_thumbnails(
 
     for vp in video_paths:
         source = Path(vp)
-        target = source.with_name(f"thumb-deduper.{source.stem}.jpg")
+        target = thumbnail_path_for(source)
         if target.exists() and target.stat().st_size > 0 and _is_valid_image(target):
             results[vp] = str(target)  # already cached on disk
         else:
@@ -510,6 +716,97 @@ class MultiHash:
     def __int__(self) -> int:
         """Not meaningful, but required by some legacy code paths that do int(hash)."""
         return int(str(self.phash), 16)
+
+
+# Average per-frame distance below which an aligned overlap counts as the same
+# footage. Frames of one video re-encoded, rescaled or turned into a GIF land at
+# 0-1; frames of different footage land in the thirties.
+SIGNATURE_MATCH_DISTANCE = 6.0
+
+# An overlap shorter than this proves nothing: two unrelated videos sharing a
+# title card would otherwise "align" on that one frame.
+SIGNATURE_MIN_OVERLAP = 3
+
+
+@dataclass(frozen=True)
+class VideoSignature:
+    """An ordered run of frame hashes sampled from a video on an absolute grid.
+
+    A single frame cannot tell two videos apart when they open the same way -
+    a shared slate, logo or black leader makes distinct footage hash identically
+    - and it cannot recognise a copy whose start was trimmed, because the one
+    sampled instant lands on different content. A sequence fixes both: shared
+    openings disagree once the frames move past them, and a trim shows up as a
+    constant index offset that alignment recovers.
+
+    ``step`` is the grid spacing in seconds, or 0.0 for a clip too short to grid.
+    String serialization: ``"<step>#<frame>;<frame>;..."``
+    """
+    frames: tuple[MultiHash, ...]
+    step: float = 0.0
+
+    def __len__(self) -> int:
+        return len(self.frames)
+
+    @property
+    def representative(self) -> MultiHash:
+        """The frame standing in for the whole clip where one hash is required."""
+        return self.frames[0]
+
+    def aligned_distance(self, other: "VideoSignature") -> float:
+        """Best mean per-frame distance over any whole-frame alignment.
+
+        Slides the two runs past each other and scores the best overlap, so a
+        copy trimmed by a whole number of grid steps still matches. Returns
+        ``inf`` when no alignment achieves the minimum overlap.
+        """
+        a, b = self.frames, other.frames
+        if not a or not b:
+            return float("inf")
+
+        # An overlap can never exceed the shorter run, so a short clip is held to
+        # its own length rather than being failed outright.
+        need = min(SIGNATURE_MIN_OVERLAP, len(a), len(b))
+        best = float("inf")
+        for offset in range(-(len(b) - 1), len(a)):
+            total = 0
+            count = 0
+            for i in range(max(0, offset), min(len(a), offset + len(b))):
+                total += a[i].max_distance(b[i - offset])
+                count += 1
+            if count >= need:
+                best = min(best, total / count)
+        return best
+
+    def matches(self, other: "VideoSignature") -> bool:
+        """Whether two clips are the same footage under the aligned criterion."""
+        return self.aligned_distance(other) <= SIGNATURE_MATCH_DISTANCE
+
+    # ------ Serialization ------
+    def __str__(self) -> str:
+        return f"{self.step:g}#" + ";".join(str(f) for f in self.frames)
+
+    @classmethod
+    def from_str(cls, s: str) -> "VideoSignature":
+        """Deserialize ``"<step>#<frame>;<frame>;..."``.
+
+        A string with no ``#`` is a single pre-signature hash from an older
+        cache; it loads as a one-frame signature so nothing has to be re-hashed
+        before it can be read.
+        """
+        step_part, sep, frames_part = s.partition("#")
+        if not sep:
+            return cls(frames=(MultiHash.from_str(s),), step=0.0)
+        frames = tuple(
+            MultiHash.from_str(part) for part in frames_part.split(";") if part
+        )
+        if not frames:
+            raise ValueError(f"video signature carries no frames: {s!r}")
+        try:
+            step = float(step_part)
+        except ValueError:
+            step = 0.0
+        return cls(frames=frames, step=step)
 
 
 def get_image_hash(
@@ -872,17 +1169,29 @@ def _is_valid_image(image_path: Path) -> bool:
 
 
 def _format_timestamp(seconds: float) -> str:
-    safe_seconds = max(0, int(seconds))
-    delta = timedelta(seconds=safe_seconds)
-    total_seconds = int(delta.total_seconds())
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    """Format an ffmpeg seek offset, keeping sub-second precision.
+
+    This used to truncate with int(), so every offset below 1s formatted as
+    00:00:00 and offsets could only ever land on whole seconds. Clips of 1s or
+    shorter therefore had no reachable frame and were dropped from detection
+    entirely - see _frame_offsets, which relies on fractional seeks.
+    """
+    safe = max(0.0, float(seconds))
+    hours, remainder = divmod(safe, 3600.0)
+    minutes, secs = divmod(remainder, 60.0)
+    return f"{int(hours):02d}:{int(minutes):02d}:{secs:06.3f}"
 
 
 __all__ = [
     "MultiHash",
     "Resolution",
+    "VideoSignature",
+    "SIGNATURE_MATCH_DISTANCE",
+    "SIGNATURE_MIN_OVERLAP",
+    "SIGNATURE_MAX_FRAMES",
+    "get_video_signature",
+    "thumbnail_path_for",
+    "legacy_thumbnail_path_for",
     "batch_extract_video_thumbnails",
     "check_ffmpeg",
     "check_ffprobe",

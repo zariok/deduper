@@ -103,6 +103,64 @@ class TestBestFileSelection:
         assert HashCache(images_only_dir).get_best_file("group1") == target
 
 
+class TestCacheVersionInvalidation:
+    """A version bump means the hashes are stale, not the user's choices.
+
+    Group IDs come from sorted relative paths, never from hashes, so nothing
+    keyed on a group ID is invalidated by a change in hash production.
+    """
+
+    def _bump_version(self, folder: str) -> None:
+        """Rewrite the stored version so the next open sees a mismatch."""
+        close_hash_cache(folder)
+        conn = sqlite3.connect(os.path.join(folder, ".deduper.db"))
+        conn.execute("UPDATE meta SET value='0.0-old' WHERE key='version'")
+        conn.commit()
+        conn.close()
+
+    def test_hashes_are_discarded(self, images_only_dir):
+        cache = HashCache(images_only_dir)
+        cache.get_hash(os.path.join(images_only_dir, "img_a.png"), VIDEO_EXTENSIONS)
+        cache.save()
+        assert cache.has_cached_hash("img_a.png")
+
+        self._bump_version(images_only_dir)
+        assert not HashCache(images_only_dir).has_cached_hash("img_a.png")
+
+    def test_the_chosen_best_file_survives(self, images_only_dir):
+        target = os.path.join(images_only_dir, "img_a_small.png")
+        cache = HashCache(images_only_dir)
+        cache.set_best_file("group1", target)
+        cache.save()
+
+        self._bump_version(images_only_dir)
+        assert HashCache(images_only_dir).get_best_file("group1") == target, (
+            "a hash-algorithm bump discarded a selection the user made by hand"
+        )
+
+    def test_processed_groups_stay_processed(self, images_only_dir):
+        cache = HashCache(images_only_dir)
+        members = [os.path.join(images_only_dir, n) for n in ("img_a.png", "img_a_small.png")]
+        cache.set_group_files("g1", members)
+        cache.mark_group_processed("g1")
+        cache.save()
+
+        self._bump_version(images_only_dir)
+        reopened = HashCache(images_only_dir)
+        assert reopened.get_cache_stats()["processed_groups"] == 1, (
+            "groups the user had already worked through came back as unhandled"
+        )
+
+    def test_an_explicit_clear_still_wipes_everything(self, images_only_dir):
+        """invalidate_cache is a user asking for a clean slate, unlike a bump."""
+        cache = HashCache(images_only_dir)
+        cache.set_best_file("group1", os.path.join(images_only_dir, "img_a.png"))
+        cache.save()
+
+        cache.invalidate_cache()
+        assert cache.get_best_file("group1") is None
+
+
 class TestGroups:
     def test_round_trips_groups(self, images_only_dir):
         cache = HashCache(images_only_dir)
@@ -151,6 +209,40 @@ class TestGroups:
 
         cache.remove_file_from_groups(other)
         assert cache.get_cached_groups() == {kept: [kept]}
+
+
+class TestDuplicateGroupCount:
+    """count_duplicate_groups drives the folder dropdown label, so it has to
+    agree with get_cached_groups rather than with the raw stored rows."""
+
+    def test_counts_groups_holding_more_than_one_file(self, images_only_dir):
+        cache = HashCache(images_only_dir)
+        a = os.path.join(images_only_dir, "img_a.png")
+        b = os.path.join(images_only_dir, "img_a_small.png")
+        c = os.path.join(images_only_dir, "img_b.png")
+        cache.set_cached_groups({a: [a, b], c: [c]})
+
+        assert cache.count_duplicate_groups() == 1
+
+    def test_drops_to_zero_once_the_duplicate_is_symlinked(self, images_only_dir):
+        cache = HashCache(images_only_dir)
+        kept = os.path.join(images_only_dir, "img_a.png")
+        dup = os.path.join(images_only_dir, "img_a_copy.png")
+        cache.set_cached_groups({kept: [kept, dup]})
+        assert cache.count_duplicate_groups() == 1
+
+        os.remove(dup)
+        os.symlink("img_a.png", dup)
+        assert cache.count_duplicate_groups() == 0
+
+    def test_ignores_a_member_removed_from_the_group(self, images_only_dir):
+        cache = HashCache(images_only_dir)
+        kept = os.path.join(images_only_dir, "img_a.png")
+        dup = os.path.join(images_only_dir, "img_a_small.png")
+        cache.set_cached_groups({kept: [kept, dup]})
+
+        cache.remove_file_from_groups(dup)
+        assert cache.count_duplicate_groups() == 0
 
 
 class TestCleanup:
