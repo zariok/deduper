@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, TypedDict
 
 import imagehash
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .logging_config import get_logger
 
@@ -603,6 +604,69 @@ def extract_video_thumbnail(
     return None
 
 
+IMAGE_THUMBNAIL_SIZE = 320
+
+# The scraper that fills these folders (saviorpy, build-thumbs.py) already
+# writes a thumbnail beside every download: "thumb.<name>" for an image, in
+# the image's own format, and "thumb.<name>.jpg" for a video. Serving that is
+# free, so it is checked before deduper builds anything of its own.
+SCRAPER_THUMB_PREFIX = "thumb."
+
+
+def scraper_thumbnail_path_for(media_path: str | Path, video_extensions: Iterable[str] = ()) -> Path:
+    """Where the scraper's own thumbnail for *media_path* would be."""
+    source = Path(media_path)
+    if source.suffix.lower() in normalize_extensions(video_extensions):
+        return source.with_name(f"{SCRAPER_THUMB_PREFIX}{source.name}.jpg")
+    return source.with_name(f"{SCRAPER_THUMB_PREFIX}{source.name}")
+
+
+def _usable(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def extract_image_thumbnail(image_path: str, *, size: int = IMAGE_THUMBNAIL_SIZE) -> str | None:
+    """Return a display thumbnail for an image, building one only as a last resort.
+
+    The results page used to serve the original file into a 200px card, so a
+    folder of phone photos pushed hundreds of megabytes through the browser on
+    every load. Preference order: the scraper's own thumb.<name>, then a
+    thumbnail deduper built earlier (thumb-deduper.<name>.jpg, the video naming
+    scheme, which the scanner and change detector already skip), then build
+    one. Written to a temporary name and renamed, so concurrent requests never
+    serve a half-written file.
+    """
+    source = Path(image_path)
+    scraper_thumb = scraper_thumbnail_path_for(source)
+    if _usable(scraper_thumb):
+        return str(scraper_thumb)
+    target = thumbnail_path_for(source)
+    if _usable(target):
+        return str(target)
+    if not source.exists():
+        return None
+
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    try:
+        with Image.open(source) as image:
+            # Draft mode lets the JPEG decoder skip DCT coefficients it will
+            # throw away anyway; this is a display thumbnail, not a hash input
+            image.draft("RGB", (size * 2, size * 2))
+            oriented = ImageOps.exif_transpose(image) or image
+            thumb = oriented.convert("RGB")
+            thumb.thumbnail((size, size), Image.Resampling.LANCZOS)
+            thumb.save(tmp, "JPEG", quality=85, optimize=True)
+        os.replace(tmp, target)
+        return str(target)
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        logger.warning("Unable to build thumbnail for %s: %s", source, exc)
+        tmp.unlink(missing_ok=True)
+        return None
+
+
 def batch_extract_video_thumbnails(
     video_paths: list[str],
     *,
@@ -709,7 +773,7 @@ class MultiHash:
         return cls(phash=ph, dhash=ph)
 
     # ------ Comparison helpers (for BK-tree distance function) ------
-    def __sub__(self, other: "MultiHash") -> int:  # type: ignore[override]
+    def __sub__(self, other: "MultiHash") -> int:
         """Hamming distance used by BK-tree: max of both hash distances."""
         return self.max_distance(other)
 
@@ -947,36 +1011,6 @@ def get_video_duration(file_path: str) -> float:
 
     return _probe_video_cached(str(path), stat_key)[2]
 
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-i",
-        str(path),
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "json",
-    ]
-    
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
-    except (FileNotFoundError, subprocess.SubprocessError, subprocess.TimeoutExpired) as exc:
-        logger.warning("Unable to probe video duration %s: %s", path, exc)
-        if hasattr(exc, 'stderr') and exc.stderr:
-            logger.debug("FFprobe stderr: %s", exc.stderr)
-        return 0.0
-
-    try:
-        payload = json.loads(result.stdout)
-        duration_str = payload.get("format", {}).get("duration")
-        if duration_str:
-            return float(duration_str)
-    except (json.JSONDecodeError, ValueError, TypeError) as exc:
-        logger.warning("Invalid ffprobe duration output for %s: %s", path, exc)
-    
-    return 0.0
-
 
 def compare_thumbnail_similarity(video_path1: str, video_path2: str, video_extensions: Iterable[str]) -> float:
     """
@@ -1064,10 +1098,18 @@ def get_enhanced_video_score(
         return 0.0
 
 
+class _VideoMeta(TypedDict):
+    path: str
+    resolution: Resolution
+    duration: float
+    file_size: int
+    pixel_count: int
+
+
 def select_best_video_from_group(
-    video_group: list,
+    video_group: list[str],
     video_extensions: Iterable[str],
-    metadata_provider=None,
+    metadata_provider: Callable[[str], tuple[Resolution, float]] | None = None,
 ) -> str:
     """
     Select the best video from a group of duplicate videos using enhanced criteria.
@@ -1090,7 +1132,7 @@ def select_best_video_from_group(
     logger.debug(f"Selecting best video from group of {len(video_group)} videos")
     
     # First, get basic metadata for all videos
-    video_metadata = []
+    video_metadata: list[_VideoMeta] = []
     for video_path in video_group:
         try:
             if metadata_provider is not None:
@@ -1121,7 +1163,7 @@ def select_best_video_from_group(
     video_metadata.sort(key=lambda x: x['pixel_count'], reverse=True)
     
     # Group by resolution
-    resolution_groups = {}
+    resolution_groups: dict[tuple[int, int], list[_VideoMeta]] = {}
     for video in video_metadata:
         res_key = (video['resolution'].width, video['resolution'].height)
         if res_key not in resolution_groups:

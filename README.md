@@ -14,13 +14,21 @@ As this was developed for a linux-based system, **symlink** implies the media is
 ### Images
 - Uses perceptual hashing to detect simlar images
 - Groups images with similar hash values
-- Compares resolution, file size and other metadata to determine the "best" file
+- Ranks copies by measured quality to pick the "best" file: real picture detail
+  (an upscale has more pixels than its source but no more detail), JPEG
+  compression level and lossless formats, with penalties for copies carrying a
+  burned-in overlay or a colour filter. Hover the ⓘ next to "Best File" to see why
 
 ### Videos
 - Extracts thumbnail frame at 1s mark
 - Groups videos with simlar thumbnails and metadata
 - Uses perceptual hashing to detect simlilar videos based on thumbnail
 - Compares video resolution, duration and file size to determine the "best" file
+- Serves 320px thumbnails for images as well as videos, so a page of results
+  does not download every original
+- Flags modified copies with an icon over the thumbnail - 🔤 text/watermark
+  overlay, 🎨 colour filter, ✂️ different framing, 🔍 upscaled or soft,
+  🗜️ heavily compressed - hover for what was detected
 
 ### Buttons Actions
 ❤️ - Sets selected item as new "best", symlinks all other files to selection
@@ -101,7 +109,7 @@ DEDUPER_DEV=true python3 -m deduper
 - A background scanner pre-scans your folders so results load instantly when you
   open them. It waits 5 minutes after a folder stops changing before rescanning,
   so ongoing downloads or transfers are not scanned mid-flight.
-- Exact duplicates (identical hash, resolution *and* file size) are symlinked
+- Exact duplicates (byte-identical, proven by a content digest) are symlinked
   automatically during a scan. Everything else waits for you to choose.
 
 ### Configuration Options

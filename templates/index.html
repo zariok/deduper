@@ -148,6 +148,7 @@
         .media-detail-row {
             display: flex;
             justify-content: space-between;
+            gap: 6px;
             margin-bottom: 4px;
         }
         .media-detail-label {
@@ -155,6 +156,65 @@
         }
         .media-detail-value {
             color: #888;
+        }
+        .media-detail-value[data-tip] {
+            cursor: help;
+            border-bottom: 1px dotted #bbb;
+        }
+        /* Flags over the thumbnail: what was detected about this copy. The
+           text appears on hover; the card clips overflow, so it opens upward
+           over the image and stays narrower than the card. */
+        .mod-badges {
+            position: absolute;
+            top: 122px;
+            right: 5px;
+            display: flex;
+            gap: 4px;
+            z-index: 5;
+        }
+        .mod-badge {
+            position: relative;
+            background: rgba(255, 255, 255, 0.92);
+            border: 1px solid #ccc;
+            border-radius: 12px;
+            padding: 1px 6px;
+            font-size: 13px;
+            line-height: 18px;
+            cursor: help;
+        }
+        .mod-badge.penalised {
+            border-color: #dc3545;
+            background: #fff0f1;
+        }
+        .mod-badge[data-tip]:hover::after {
+            content: attr(data-tip);
+            position: absolute;
+            bottom: 130%;
+            right: 0;
+            width: max-content;
+            max-width: 170px;
+            white-space: normal;
+            background: #333;
+            color: #fff;
+            font-size: 11px;
+            line-height: 1.35;
+            padding: 6px 8px;
+            border-radius: 4px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+            z-index: 20;
+        }
+        .best-why {
+            font-size: 14px;
+            font-weight: normal;
+            color: #888;
+            cursor: help;
+            margin-left: 4px;
+        }
+        .best-source {
+            font-size: 12px;
+            font-weight: normal;
+            color: #b8860b;
+            margin-left: 6px;
         }
         
         /* Responsive design */
@@ -1599,6 +1659,51 @@
             }
         }
 
+        function escapeAttr(text) {
+            return String(text == null ? '' : text)
+                .replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+                .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        const MODIFICATION_ICONS = { overlay: '🔤', color: '🎨', framing: '✂️' };
+
+        // Badges over the thumbnail: group-relative modifications the scanner
+        // detected (overlay, filter, framing) plus this copy's own weaknesses
+        // (soft/upscaled, heavy compression). Hover for the explanation.
+        function renderBadges(file) {
+            const badges = [];
+            (file.modifications || []).forEach(mod => {
+                const icon = MODIFICATION_ICONS[mod.kind] || '⚠️';
+                const cls = mod.penalised ? 'mod-badge penalised' : 'mod-badge';
+                badges.push(`<span class="${cls}" data-tip="${escapeAttr(mod.label + ': ' + mod.detail)}" aria-label="${escapeAttr(mod.label)}">${icon}</span>`);
+            });
+            const quality = file.quality || {};
+            if (typeof quality.detail === 'number' && quality.detail < 0.6) {
+                badges.push(`<span class="mod-badge penalised" data-tip="${escapeAttr('Low detail: ' + quality.detail_label + '. Only ~' + Math.round(quality.detail * 100) + '% of this resolution carries real picture.')}" aria-label="Low detail">🔍</span>`);
+            }
+            const q = /q≈(\d+)/.exec(quality.codec || '');
+            if (q && Number(q[1]) < 60) {
+                badges.push(`<span class="mod-badge" data-tip="${escapeAttr('Heavily compressed: ' + quality.codec)}" aria-label="Heavily compressed">🗜️</span>`);
+            }
+            return badges.length ? `<div class="mod-badges">${badges.join('')}</div>` : '';
+        }
+
+        function renderQualityRow(file) {
+            const quality = file.quality || {};
+            if (!quality.summary) return '';
+            let value;
+            if (typeof quality.effective_megapixels === 'number') {
+                value = `${quality.effective_megapixels} MP · ${quality.codec}`;
+            } else {
+                value = quality.summary;
+            }
+            return `
+                <div class="media-detail-row">
+                    <span class="media-detail-label">Quality:</span>
+                    <span class="media-detail-value" data-tip="${escapeAttr(quality.summary)}" title="${escapeAttr(quality.summary)}">${escapeAttr(value)}</span>
+                </div>`;
+        }
+
         // Render duplicate groups
         function renderDuplicateGroups(duplicates, type, replace = true) {
             const container = document.getElementById(`${type}-container`);
@@ -1624,13 +1729,20 @@
                 // Best file
                 const bestFile = document.createElement('div');
                 bestFile.className = 'best-file-section';
+                const bestWhy = group.best_reason
+                    ? `<span class="best-why" title="${escapeAttr('Why this one: ' + group.best_reason)}">ⓘ</span>`
+                    : '';
+                const bestSource = group.best_source === 'manual'
+                    ? '<span class="best-source">your pick</span>'
+                    : '';
                 bestFile.innerHTML = `
-                    <h3>Best File:</h3>
+                    <h3>Best File:${bestWhy}${bestSource}</h3>
                     <div class="media-item">
                         <a href="${group.best_file.full}" target="_blank">
                             <div class="image-placeholder">Loading...</div>
                             <img data-src="${group.best_file.thumb}" alt="Best file">
                         </a>
+                        ${renderBadges(group.best_file)}
                         <div class="media-info">
                             <div class="media-filename">${group.best_file.full.split('/').pop()}</div>
                             <div class="media-details">
@@ -1642,6 +1754,7 @@
                                     <span class="media-detail-label">Size:</span>
                                     <span class="media-detail-value">${group.best_file.size_formatted}</span>
                                 </div>
+                                ${renderQualityRow(group.best_file)}
                             </div>
                         </div>
                         <button class="golden-heart-btn" 
@@ -1669,6 +1782,7 @@
                                         <div class="image-placeholder">Loading...</div>
                                         <img data-src="${file.thumb}" alt="Duplicate file">
                                     </a>
+                                    ${renderBadges(file)}
                                 `}
                                 <div class="media-info">
                                     <div class="media-filename">${file.full.split('/').pop()}</div>
@@ -1681,6 +1795,7 @@
                                             <span class="media-detail-label">Size:</span>
                                             <span class="media-detail-value">${file.size_formatted}</span>
                                         </div>
+                                        ${renderQualityRow(file)}
                                     </div>
                                 </div>
                                 <button class="heart-btn" 

@@ -4,8 +4,9 @@ Metrics collection for monitoring application performance.
 
 import time
 import threading
-from typing import Any
 from collections import defaultdict, deque
+from types import TracebackType
+from typing import Any, Callable, ParamSpec, TypeVar
 from .logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -17,12 +18,14 @@ class MetricsCollector:
     def __init__(self, max_history: int = 1000):
         self.max_history = max_history
         self._lock = threading.Lock()
-        self._metrics = defaultdict(lambda: deque(maxlen=max_history))
-        self._counters = defaultdict(int)
-        self._gauges = defaultdict(float)
-        self._timers = defaultdict(list)
+        self._metrics: defaultdict[str, deque[dict[str, Any]]] = defaultdict(
+            lambda: deque(maxlen=max_history)
+        )
+        self._counters: defaultdict[str, int] = defaultdict(int)
+        self._gauges: defaultdict[str, float] = defaultdict(float)
+        self._timers: defaultdict[str, list[float]] = defaultdict(list)
         
-    def increment_counter(self, name: str, value: int = 1, tags: dict[str, str] | None = None):
+    def increment_counter(self, name: str, value: int = 1, tags: dict[str, str] | None = None) -> None:
         """Increment a counter metric."""
         with self._lock:
             key = self._format_key(name, tags)
@@ -34,7 +37,7 @@ class MetricsCollector:
             })
             logger.debug(f"Counter {name} incremented by {value}")
     
-    def set_gauge(self, name: str, value: float, tags: dict[str, str] | None = None):
+    def set_gauge(self, name: str, value: float, tags: dict[str, str] | None = None) -> None:
         """Set a gauge metric value."""
         with self._lock:
             key = self._format_key(name, tags)
@@ -46,7 +49,7 @@ class MetricsCollector:
             })
             logger.debug(f"Gauge {name} set to {value}")
     
-    def record_timer(self, name: str, duration: float, tags: dict[str, str] | None = None):
+    def record_timer(self, name: str, duration: float, tags: dict[str, str] | None = None) -> None:
         """Record a timer metric."""
         with self._lock:
             key = self._format_key(name, tags)
@@ -100,7 +103,7 @@ class MetricsCollector:
                 'timestamp': time.time()
             }
     
-    def reset_metrics(self):
+    def reset_metrics(self) -> None:
         """Reset all metrics."""
         with self._lock:
             self._counters.clear()
@@ -125,13 +128,18 @@ class TimerContext:
         self.metrics = metrics
         self.name = name
         self.tags = tags
-        self.start_time = None
+        self.start_time: float | None = None
     
-    def __enter__(self):
+    def __enter__(self) -> "TimerContext":
         self.start_time = time.time()
         return self
     
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         if self.start_time:
             duration = time.time() - self.start_time
             self.metrics.record_timer(self.name, duration, self.tags)
@@ -141,10 +149,19 @@ class TimerContext:
 metrics = MetricsCollector()
 
 
-def timer(name: str, tags: dict[str, str] | None = None):
-    """Decorator for timing function execution."""
-    def decorator(func):
-        def wrapper(*args, **kwargs):
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def timer(name: str, tags: dict[str, str] | None = None) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Decorator for timing function execution.
+
+    Typed with ParamSpec so the decorated function keeps its signature: an
+    untyped decorator would strip the annotations from everything it wraps,
+    including find_duplicates and the main routes.
+    """
+    def decorator(func: Callable[P, R]) -> Callable[P, R]:
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             with TimerContext(metrics, name, tags):
                 return func(*args, **kwargs)
         # Preserve the original function's metadata for Flask
@@ -156,17 +173,17 @@ def timer(name: str, tags: dict[str, str] | None = None):
     return decorator
 
 
-def increment_counter(name: str, value: int = 1, tags: dict[str, str] | None = None):
+def increment_counter(name: str, value: int = 1, tags: dict[str, str] | None = None) -> None:
     """Convenience function to increment a counter."""
     metrics.increment_counter(name, value, tags)
 
 
-def set_gauge(name: str, value: float, tags: dict[str, str] | None = None):
+def set_gauge(name: str, value: float, tags: dict[str, str] | None = None) -> None:
     """Convenience function to set a gauge."""
     metrics.set_gauge(name, value, tags)
 
 
-def record_timer(name: str, duration: float, tags: dict[str, str] | None = None):
+def record_timer(name: str, duration: float, tags: dict[str, str] | None = None) -> None:
     """Convenience function to record a timer."""
     metrics.record_timer(name, duration, tags)
 

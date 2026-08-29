@@ -5,7 +5,7 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
-from typing import Callable, Any
+from typing import Any, Callable, Iterable
 import imagehash
 from ..utils.bktree import BKTree
 from ..utils.helpers import get_file_size, format_file_size, create_symlink_and_remove_duplicate
@@ -24,6 +24,7 @@ from ..utils.media import (
 from ..utils.hash_cache import HashCache, get_hash_cache
 from ..utils.logging_config import get_logger
 from ..utils.metrics import metrics, timer, increment_counter, set_gauge
+from .quality_analysis import analyze_group, exact_match_checker, prime_group_analyses
 
 logger = get_logger(__name__)
 
@@ -187,7 +188,7 @@ def _get_process_pool() -> ProcessPoolExecutor:
     return _process_pool
 
 
-def shutdown_process_pool():
+def shutdown_process_pool() -> None:
     """Shut down the shared process pool, killing child processes."""
     global _process_pool
     if _process_pool is not None:
@@ -198,7 +199,7 @@ def shutdown_process_pool():
 class DuplicateFinder:
     _BKTREE_CHUNK_SIZE = 10_000
 
-    def __init__(self, image_extensions, video_extensions):
+    def __init__(self, image_extensions: Iterable[str], video_extensions: Iterable[str]):
         self.image_extensions = image_extensions
         self.video_extensions = video_extensions
 
@@ -379,6 +380,11 @@ class DuplicateFinder:
                 if progress_callback:
                     progress_callback('auto_eliminating', 0, 1, 'Auto-eliminating exact matches...')
 
+                # The pass keeps the group's best twin, so it needs each
+                # group ranked; rank them all on the pool first rather than
+                # one at a time inline
+                self._prime_analyses(list(image_groups.values()) + list(video_groups.values()), cache, progress_callback)
+
                 # Process exact matches for image groups
                 if image_groups:
                     logger.info("Processing exact matches for image groups...")
@@ -402,31 +408,24 @@ class DuplicateFinder:
             # Add progress callback for final processing phase
             if progress_callback:
                 progress_callback('processing', 0, 1, 'Building final duplicate list...')
+
+            # Membership changed for any group the pass above collapsed, and a
+            # cache written before analysis existed has none at all
+            self._prime_analyses(list(image_groups.values()) + list(video_groups.values()), cache, progress_callback)
             
             # Process groups to find best files with resolution caching
-            duplicate_images = []
-            duplicate_videos = []
+            duplicate_images: list[dict[str, Any]] = []
+            duplicate_videos: list[dict[str, Any]] = []
             
             # Cache for resolution calculations to avoid repeated work
-            def get_media_meta(file_path):
+            def get_media_meta(file_path: str) -> tuple[Resolution, float]:
                 """(resolution, duration) via the persistent cache - no re-probing."""
                 return cache.get_media_metadata(file_path, self.image_extensions, self.video_extensions)
 
-            _best_digests: dict[str, str | None] = {}
-
-            def is_byte_identical(file_path: str, best_file: str, size: int, best_size: int) -> bool:
-                """Whether *file_path* holds the same bytes as *best_file*.
-
-                Reports what the auto-elimination pass acts on, so the UI cannot
-                label a file an exact match that the scanner declined to remove.
-                Guarded on size, so a plain near-duplicate never reads a file.
-                """
-                if file_path == best_file or size != best_size:
-                    return False
-                if best_file not in _best_digests:
-                    _best_digests[best_file] = cache.get_content_hash(best_file)
-                best_digest = _best_digests[best_file]
-                return best_digest is not None and cache.get_content_hash(file_path) == best_digest
+            # Byte identity, reported exactly as the auto-elimination pass acts
+            # on it, so the UI cannot label a file an exact match that the
+            # scanner declined to remove
+            is_byte_identical = exact_match_checker(cache)
 
             # Process image groups
             total_image_groups = len([g for g in image_groups.values() if len(g) > 1])
@@ -434,16 +433,14 @@ class DuplicateFinder:
             
             for group in image_groups.values():
                 if len(group) > 1:
-                    # Check if there's a cached best file selection for this group
+                    # Ranked by measured quality, not pixel count - see
+                    # quality_analysis. A best file chosen by hand still wins.
                     group_id = self._get_group_id(group, cache)
-                    cached_best_file = cache.get_best_file(group_id)
-                    
-                    if cached_best_file and cached_best_file in group:
-                        best_file = cached_best_file
-                        logger.debug(f"Using cached best file for group {group_id}: {best_file}")
-                    else:
-                        best_file = max(group, key=lambda x: get_media_meta(x)[0].pixel_count())
-                    
+                    analysis = analyze_group(
+                        group, cache, self.image_extensions, self.video_extensions, group_id
+                    )
+                    best_file = analysis.best_file
+                    logger.debug(f"Best image for group {group_id}: {best_file} ({analysis.best_reason})")
                     # Get metadata for best file using cache
                     best_resolution_obj, _ = get_media_meta(best_file)
                     best_size = get_file_size(best_file)
@@ -467,7 +464,8 @@ class DuplicateFinder:
                                 },
                                 'size': size,
                                 'size_formatted': format_file_size(size),
-                                'is_exact_match': is_exact_match
+                                'is_exact_match': is_exact_match,
+                                **analysis.report_for(f)
                             })
                     
                     # Store group information in cache
@@ -475,6 +473,8 @@ class DuplicateFinder:
                     
                     duplicate_images.append({
                         'group_id': group_id,
+                        'best_reason': analysis.best_reason,
+                        'best_source': analysis.best_source,
                         'best_file': {
                             'path': cache._get_relative_path(best_file),
                             'resolution': {
@@ -483,7 +483,8 @@ class DuplicateFinder:
                                 'label': best_resolution_obj.label()
                             },
                             'size': best_size,
-                            'size_formatted': format_file_size(best_size)
+                            'size_formatted': format_file_size(best_size),
+                            **analysis.report_for(best_file)
                         },
                         'duplicate_files': duplicate_files_with_metadata
                     })
@@ -500,20 +501,12 @@ class DuplicateFinder:
             
             for group in video_groups.values():
                 if len(group) > 1:
-                    # Check if there's a cached best file selection for this group
                     group_id = self._get_group_id(group, cache)
-                    cached_best_file = cache.get_best_file(group_id)
-                    
-                    if cached_best_file and cached_best_file in group:
-                        best_file = cached_best_file
-                        logger.debug(f"Using cached best file for group {group_id}: {best_file}")
-                    else:
-                        # Use enhanced video selection logic
-                        best_file = select_best_video_from_group(
-                            group, tuple(self.video_extensions), metadata_provider=get_media_meta
-                        )
-                        logger.debug(f"Selected best video using enhanced criteria: {best_file}")
-                    
+                    analysis = analyze_group(
+                        group, cache, self.image_extensions, self.video_extensions, group_id
+                    )
+                    best_file = analysis.best_file
+                    logger.debug(f"Best video for group {group_id}: {best_file} ({analysis.best_reason})")
                     # Get metadata for best file using cache
                     best_resolution_obj, best_duration = get_media_meta(best_file)
                     best_size = get_file_size(best_file)
@@ -539,7 +532,8 @@ class DuplicateFinder:
                                 'size_formatted': format_file_size(size),
                                 'duration': duration,
                                 'duration_formatted': f"{duration:.1f}s" if duration > 0 else "Unknown",
-                                'is_exact_match': is_exact_match
+                                'is_exact_match': is_exact_match,
+                                **analysis.report_for(f)
                             })
                     
                     # Store group information in cache
@@ -547,6 +541,8 @@ class DuplicateFinder:
                     
                     duplicate_videos.append({
                         'group_id': group_id,
+                        'best_reason': analysis.best_reason,
+                        'best_source': analysis.best_source,
                         'best_file': {
                             'path': cache._get_relative_path(best_file),
                             'resolution': {
@@ -557,7 +553,8 @@ class DuplicateFinder:
                             'size': best_size,
                             'size_formatted': format_file_size(best_size),
                             'duration': best_duration,
-                            'duration_formatted': f"{best_duration:.1f}s" if best_duration > 0 else "Unknown"
+                            'duration_formatted': f"{best_duration:.1f}s" if best_duration > 0 else "Unknown",
+                            **analysis.report_for(best_file)
                         },
                         'duplicate_files': duplicate_files_with_metadata
                     })
@@ -591,7 +588,9 @@ class DuplicateFinder:
             increment_counter('duplicate_detection_errors')
             return [], []
     
-    def _group_files_by_hash_parallel(self, file_paths, video_extensions, threshold=5):
+    def _group_files_by_hash_parallel(
+        self, file_paths: list[str], video_extensions: Iterable[str], threshold: int = 5
+    ) -> dict[str, list[str]]:
         """Group files by perceptual hash using parallel processing.
 
         Uses MultiHash comparison: two files match only when both pHash
@@ -603,7 +602,7 @@ class DuplicateFinder:
         pool = _get_process_pool()
         logger.info("Using persistent process pool for parallel processing")
 
-        hash_func = partial(self._get_file_hash, video_extensions=video_extensions)
+        hash_func = partial(self._get_file_hash, video_extensions=normalize_extensions(video_extensions))
         futures = {pool.submit(hash_func, fp): fp for fp in file_paths}
         hash_by_path = {}
         for future in as_completed(futures):
@@ -640,7 +639,15 @@ class DuplicateFinder:
         logger.info(f"Found {duplicate_count} duplicate groups")
         return groups
     
-    def _group_files_by_hash_with_cache(self, file_paths, video_extensions, cache, progress_callback=None, threshold=5, is_video=False):
+    def _group_files_by_hash_with_cache(
+        self,
+        file_paths: list[str],
+        video_extensions: Iterable[str],
+        cache: HashCache,
+        progress_callback: Callable | None = None,
+        threshold: int = 5,
+        is_video: bool = False,
+    ) -> dict[str, list[str]]:
         """Group files by perceptual hash using cache-aware parallel processing.
 
         *is_video* selects the clustering path: videos carry a multi-frame
@@ -656,25 +663,26 @@ class DuplicateFinder:
         if progress_callback:
             progress_callback('hashing', 0, len(file_paths), 'Calculating hashes (using cache where possible)...')
         
-        # First, check cache for all files to identify which ones need processing
+        # First, check cache for all files to identify which ones need processing.
+        # One SELECT for the table rather than three queries per file.
         files_to_process = []
         cached_hashes = {}
         cached_files = 0
+        stored = cache.get_file_hash_rows()
         
         for cache_idx, file_path in enumerate(file_paths):
-            relative_path = cache._get_relative_path(file_path)
-            has_cached = cache.has_cached_hash(relative_path) and cache._is_file_unchanged(file_path)
+            row = stored.get(cache._get_relative_path(file_path))
+            if row is not None:
+                cached_hash_str, mtime, size = row
+                if (mtime, size) != cache._get_file_stats(file_path):
+                    row = None
 
-            if has_cached:
-                cached_hash_str = cache.get_cached_hash_str(relative_path)
-                if cached_hash_str:
-                    try:
-                        cached_hashes[file_path] = decode(cached_hash_str)
-                        cached_files += 1
-                    except Exception as e:
-                        logger.warning(f"Error loading cached hash for {file_path}: {e}")
-                        files_to_process.append(file_path)
-                else:
+            if row is not None and cached_hash_str:
+                try:
+                    cached_hashes[file_path] = decode(cached_hash_str)
+                    cached_files += 1
+                except Exception as e:
+                    logger.warning(f"Error loading cached hash for {file_path}: {e}")
                     files_to_process.append(file_path)
             else:
                 files_to_process.append(file_path)
@@ -777,7 +785,7 @@ class DuplicateFinder:
     
     def _incremental_grouping(self, existing_image_groups: dict, existing_video_groups: dict,
                             image_files: list[str], video_files: list[str], new_files: set[str],
-                            cache, progress_callback: Callable | None = None) -> tuple[dict, dict]:
+                            cache: HashCache, progress_callback: Callable | None = None) -> tuple[dict, dict]:
         """Group newly seen files against the files already known to the cache.
 
         Builds a BK-tree over every known file - not only group representatives -
@@ -825,11 +833,14 @@ class DuplicateFinder:
                     file_to_group[os.path.normpath(member)] = rep_path
 
         # --- Build BK-trees over every known file, grouped or not ---
+        stored = cache.get_file_hash_rows()
+
         def _build_tree(known_files: list[str]) -> tuple[BKTree, int]:
             tree: BKTree = BKTree(_packed_distance)
             indexed = 0
             for file_path in known_files:
-                hash_str = cache.get_cached_hash_str(cache._get_relative_path(file_path))
+                row = stored.get(cache._get_relative_path(file_path))
+                hash_str = row[0] if row else None
                 if not hash_str:
                     continue
                 try:
@@ -899,10 +910,10 @@ class DuplicateFinder:
         return image_groups, video_groups
     
     @staticmethod
-    def _has_valid_cached_hash(file_path: str, cache) -> bool:
+    def _has_valid_cached_hash(file_path: str, cache: HashCache) -> bool:
         """Report whether the cache already holds a usable hash for this file."""
         relative_path = cache._get_relative_path(file_path)
-        return cache.has_cached_hash(relative_path) and cache._is_file_unchanged(file_path)
+        return bool(cache.has_cached_hash(relative_path) and cache._is_file_unchanged(file_path))
 
     @staticmethod
     def _get_file_hash(file_path: str, video_extensions: tuple[str, ...]) -> Any | None:
@@ -1146,7 +1157,21 @@ class DuplicateFinder:
         }
     
     
-    def _get_group_id(self, group, cache):
+    def _prime_analyses(self, groups: list[list[str]], cache: HashCache, progress_callback: Callable | None) -> None:
+        """Rank every group lacking a current analysis, fanned out on the pool."""
+        pending = [g for g in groups if len(g) > 1]
+        if not pending:
+            return
+        if progress_callback:
+            progress_callback('processing', 0, len(pending), f'Ranking {len(pending)} groups by quality...')
+        started = time.time()
+        analysed = prime_group_analyses(
+            pending, cache, self.image_extensions, self.video_extensions, executor=_get_process_pool()
+        )
+        if analysed:
+            logger.info(f"Analysed {analysed} group(s) for quality in {time.time() - started:.2f}s")
+
+    def _get_group_id(self, group: list[str], cache: HashCache) -> str:
         """Generate a consistent group ID based on the relative paths of files in the group."""
         # Use a more efficient approach with frozenset for consistent ordering
         # and avoid repeated string operations
@@ -1226,7 +1251,7 @@ class DuplicateFinder:
         logger.info(f"Tombstoned {tombstoned} GIF(s)")
         return processed_groups
 
-    def _process_exact_matches_automatically(self, groups: dict[str, list[str]], cache, progress_callback: Callable | None = None) -> dict[str, list[str]]:
+    def _process_exact_matches_automatically(self, groups: dict[str, list[str]], cache: HashCache, progress_callback: Callable | None = None) -> dict[str, list[str]]:
         """
         Automatically process exact matches by creating symlinks and removing them from groups.
         
@@ -1243,10 +1268,6 @@ class DuplicateFinder:
         if progress_callback:
             progress_callback('auto_eliminating', 0, len(groups), 'Auto-eliminating exact matches...')
         
-        def get_resolution(file_path):
-            """Resolution via the persistent cache, avoiding repeated probes."""
-            return cache.get_media_metadata(file_path, self.image_extensions, self.video_extensions)[0]
-
         processed_groups = {}
         exact_matches_processed = 0
         total_files_processed = 0
@@ -1269,8 +1290,15 @@ class DuplicateFinder:
                 processed_groups[group_id] = group_files
                 continue
 
-            # Find the best file (highest resolution)
-            best_file = max(group_files, key=lambda x: get_resolution(x).pixel_count())
+            # The group's best by measured quality (or the user's pick), so the
+            # surviving twin is the file the results will show as best
+            # Keyed by the md5 group id, not by this dict's representative
+            # path, so the verdict primed on the pool is found rather than
+            # recomputed inline
+            best_file = analyze_group(
+                group_files, cache, self.image_extensions, self.video_extensions,
+                self._get_group_id(group_files, cache),
+            ).best_file
 
             removable: list[tuple[str, str]] = []  # (duplicate, keeper) pairs
             for identical in identical_sets:

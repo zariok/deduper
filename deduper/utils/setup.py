@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from ..config import Config
 
-def create_example_folder():
+def create_example_folder() -> str:
     """Create an example folder in the data directory."""
     example_folder = Config.DATA_DIR / 'example'
     example_folder.mkdir(exist_ok=True)

@@ -43,7 +43,7 @@ built once per session; the whole run takes a few seconds.
 ### Code Quality Tools
 ```bash
 isort deduper/
-mypy deduper/
+mypy deduper/     # strict; passes with zero errors - keep it that way
 ```
 
 **Do not run `black deduper/` as a drive-by.** The codebase does not conform -
@@ -100,12 +100,45 @@ Environment variables (see README.md for the full list):
      directory and mismatched paths produce unusable `../../..` cache keys
    - Yields the GIL periodically during clustering so HTTP threads stay responsive
 
-2. **Hash Cache** (`deduper/utils/hash_cache.py`)
+2. **Best-File Selection** (`deduper/utils/quality.py`,
+   `deduper/services/quality_analysis.py`)
+   - `analyze_group` is the *only* path that decides a group's best file. The
+     scan pipeline, the exact-match pass and `/cached-results` all call it;
+     `/cached-results` used to take `abs_files[0]`, which is what showed a
+     smaller copy as best after a background pre-scan
+   - Images rank by `pixel_count * bandwidth**2.5 * codec_factor * penalties`.
+     **Bandwidth** is the fraction of Nyquist that still carries picture, read
+     off a radial power spectrum of native pixels: an upscale or blur has a cliff
+     at the resolution it came from, so a 2x upscale scores *below* its source.
+     JPEG quality is estimated from the luminance quantisation table (Pillow
+     returns it in natural order); lossless formats score 1.0
+   - **Modifications** are group-relative and only exist for images: overlay
+     (a small dense region that differs and is either edge-dense - text/logo -
+     or flattened - bar/box/blur - relative to that copy's own surroundings),
+     colour filter (warmth/luminance/saturation/contrast shift vs the group
+     median; with only two copies both are reported and neither penalised),
+     framing (aspect differs). Videos keep `select_best_video_from_group`
+     (resolution, duration, size) and get no modification flags: their
+     thumbnails come from duration-dependent offsets
+   - Per-file measurements cache in `quality_metrics` (own mtime/size plus
+     `QUALITY_VERSION`; bump it when a measurement changes meaning). The group
+     verdict caches in `group_analysis` under a fingerprint of member paths,
+     mtimes and sizes. A warm rescan or page load decodes nothing
+   - **Analysis runs on the process pool.** `prime_group_analyses` fans the
+     groups lacking a verdict out to the hashing pool (`analyze_image_files`
+     is the picklable worker); `analyze_group` then just reads the cache. It
+     ran inline once and cost ten times the hashing on a cold scan. Each file
+     is decoded *once* (`decode_for_analysis`): the comparison copy is reduced
+     from the same raster the bandwidth is measured on
+   - A best file the user picked (`best_files`) still wins; the payload says
+     `best_source: "manual"`
+
+3. **Hash Cache** (`deduper/utils/hash_cache.py`)
    - Class: `HashCache`, **SQLite-backed**
    - `.deduper.db` per scanned directory. `.deduper` is the *legacy JSON* name,
      kept only so `scripts/migrate_deduper_to_sqlite.py` can find files to convert
    - Tables: `meta`, `file_hashes`, `grouping_results`, `best_files`, `groups`,
-     `media_metadata`, `content_hashes`
+     `media_metadata`, `content_hashes`, `quality_metrics`, `group_analysis`
    - `content_hashes` holds a blake2b digest of the file's bytes, written only
      for files that already share a size with another member of their group -
      a scan never reads every file's contents
@@ -115,20 +148,20 @@ Environment variables (see README.md for the full list):
    - `CACHE_VERSION` mismatch wipes hashes, groupings, best files and groups
    - `read_metadata()` is a static, connection-free reader for the scanner
 
-3. **Media Handling** (`deduper/utils/media.py`)
+4. **Media Handling** (`deduper/utils/media.py`)
    - `MultiHash.__sub__` is `max(phash_distance, dhash_distance)`: a pair counts
      as similar only when **both** hashes agree
    - One `ffprobe` call returns width, height and duration together
    - Probe memos are keyed on `(path, mtime, size)` so an in-place edit invalidates
 
-4. **Flask Web Interface** (`deduper/routes/views.py`, `deduper/routes/socketio_events.py`)
+5. **Flask Web Interface** (`deduper/routes/views.py`, `deduper/routes/socketio_events.py`)
    - Blueprint `main`, plus Socket.IO events for live progress and scanner status
    - `socketio` is initialised in `app.py` with `async_mode="threading"`
    - Key routes: `/`, `/scan/<folder>`, `/cached-results/<folder>`,
      `/manage-duplicate`, `/data/<filename>`, `/thumb/<filename>`,
      `/scanner/status`, `/scanner/folder/<folder>/status`
 
-5. **Background Scanner** (`deduper/services/background_scanner.py`)
+6. **Background Scanner** (`deduper/services/background_scanner.py`)
    - Class: `BackgroundScanner`, daemon thread started at app startup
    - Pre-scans folders so results are cached before the user opens them
    - Waits 5 minutes after a folder stops changing before rescanning; minimum
@@ -138,9 +171,10 @@ Environment variables (see README.md for the full list):
 ### Key Technical Details
 
 - **Symlink Strategy**: duplicates are replaced with relative symlinks to the group's best file
-- **Best File Selection**: images by highest resolution; videos by resolution, then duration, then size
-- **Thumbnails**: `thumb-deduper.<full filename>.jpg` - built by
-  `thumbnail_path_for()`, never by hand. Keyed on the whole name, not the stem:
+- **Best File Selection**: images by measured quality (see component 2), never
+  by pixel count alone; videos by resolution, then duration, then size
+- **Thumbnails**: `thumb-deduper.<full filename>.jpg` for videos *and* images -
+  built by `thumbnail_path_for()`, never by hand. Keyed on the whole name, not the stem:
   `clip.mp4` and `clip.gif` share a stem, and a stem-based name made them race on
   one file and let removing one delete the other's. `legacy_thumbnail_path_for()`
   exists only so cleanup can remove pre-fix names
@@ -168,10 +202,12 @@ deduper/
 │   └── socketio_events.py   # WebSocket events
 ├── services/
 │   ├── duplicate_finder.py  # Detection pipeline
+│   ├── quality_analysis.py  # Best-file choice + modification flags, cached per group
 │   └── background_scanner.py
 └── utils/
     ├── bktree.py, hash_cache.py, helpers.py
     ├── logging_config.py, media.py, metrics.py, setup.py
+    └── quality.py           # Bandwidth, JPEG quality, overlay/filter detection
 
 scripts/migrate_deduper_to_sqlite.py   # one-time JSON -> SQLite migration
 
@@ -181,12 +217,13 @@ tests/
 ├── test_hash_cache.py         # SQLite round-trip, pooling, groups
 ├── test_media.py              # Hashing, probing, MultiHash
 ├── test_performance_paths.py  # Guards for the optimised paths
+├── test_quality.py            # Bandwidth, JPEG quality, overlay/filter/framing, ranking
 └── test_views.py              # HTTP endpoints
 ```
 
 ### Dependencies
 
-Flask, flask-socketio, Pillow, imagehash, and FFmpeg (external).
+Flask, flask-socketio, Pillow, imagehash, numpy, and FFmpeg (external).
 
 ## Development Guidelines
 
@@ -199,6 +236,9 @@ Flask, flask-socketio, Pillow, imagehash, and FFmpeg (external).
 - `get_cached_groups()` drops both symlinks **and** paths that no longer exist.
   `islink` alone is False for a missing path, which once kept deleted files in
   their group forever
+- Query through `self._db`, never `self._conn`. `_conn` is Optional only so
+  closing can set it to None; `_db` raises a clear error on a closed cache and
+  is what keeps the module mypy-clean. Close with `_close_connection()`
 - `media_metadata` rows carry their own mtime/size rather than reusing
   `file_hashes`. Keep it that way: sharing the stamp would let a metadata read on
   a read-only path mark a stale *hash* as current
@@ -232,6 +272,8 @@ about them:
   frame misses outright
 - Two clips sharing an opening then diverging are **not** merged
 - A sub-second clip is detected at all, and gets a thumbnail
+- An original beats its own upscale; a watermarked copy is flagged and loses to
+  a clean one; `/cached-results` names the same best file as the scan
 
 `tests/conftest.py` mirrors `config.py` in putting `.gif` in `VIDEO_EXTENSIONS`.
 It used to classify it as an image, so the suite exercised a rule the app does
@@ -259,6 +301,15 @@ correctness quietly:
   equivalent - taking only the pHash distance would widen what counts as a
   duplicate and cause wrong deletions
 - Warm rescans and page loads spawn no ffprobe processes
+- A warm rescan decodes nothing for quality and submits nothing to the pool
+- The hashing phase reads the `file_hashes` table once (`get_file_hash_rows`),
+  not three queries per file; `_get_relative_path` strips the directory prefix
+  rather than calling `os.path.relpath`, which was 40% of a warm rescan
+- `/thumb/` never serves an image original. The scraper that fills these
+  folders (saviorpy `build-thumbs.py`) already writes `thumb.<name>` beside
+  each image and `thumb.<name>.jpg` beside each video; `extract_image_thumbnail`
+  serves that when present and only builds a 320px `thumb-deduper.<name>.jpg`
+  when it is missing. Both prefixes are skipped by the walk
 - Images are decoded once per hash, not twice
 - The background scanner never holds `self._lock` across filesystem I/O; every
   status endpoint contends on that lock

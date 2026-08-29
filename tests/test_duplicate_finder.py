@@ -498,3 +498,99 @@ class TestVideoScanning:
         for group in images:
             for name in group_basenames(group):
                 assert not name.startswith("thumb-deduper.")
+
+
+class TestQualityBestSelection:
+    """Best is the copy with the most picture, not the most pixels."""
+
+    @staticmethod
+    def _scan(folder: str) -> list[dict]:
+        images, _ = DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS).find_duplicates(folder)
+        return images
+
+    def test_an_original_beats_its_upscale(self, tmp_path):
+        from PIL import Image
+
+        from .test_quality import textured_image
+
+        folder = tmp_path / "up"
+        folder.mkdir()
+        original = textured_image(320, 240)
+        original.save(folder / "orig.png")
+        original.resize((960, 720), Image.Resampling.BICUBIC).save(folder / "orig_big.png")
+
+        (group,) = self._scan(os.path.realpath(folder))
+        assert os.path.basename(group["best_file"]["path"]) == "orig.png"
+        assert group["best_file"]["resolution"]["label"] == "320x240"
+        assert group["best_reason"]
+        (upscale,) = group["duplicate_files"]
+        assert upscale["quality"]["detail"] < 0.6
+        assert "upscaled" in upscale["quality"]["detail_label"]
+
+    def test_a_watermarked_copy_is_flagged_and_not_best(self, tmp_path):
+        from .test_quality import textured_image, watermark
+
+        folder = tmp_path / "wm"
+        folder.mkdir()
+        original = textured_image()
+        original.save(folder / "clean.jpg", quality=92)
+        watermark(original).save(folder / "marked.jpg", quality=92)
+
+        (group,) = self._scan(os.path.realpath(folder))
+        assert os.path.basename(group["best_file"]["path"]) == "clean.jpg"
+        assert group["best_file"]["modifications"] == []
+        (marked,) = group["duplicate_files"]
+        (flag,) = marked["modifications"]
+        assert flag["kind"] == "overlay" and flag["penalised"] is True
+
+    def test_a_manual_choice_still_wins(self, tmp_path):
+        from PIL import Image
+
+        from deduper.utils.hash_cache import get_hash_cache
+
+        from .test_quality import textured_image
+
+        folder = tmp_path / "manual"
+        folder.mkdir()
+        original = textured_image(320, 240)
+        original.save(folder / "orig.png")
+        original.resize((960, 720), Image.Resampling.BICUBIC).save(folder / "orig_big.png")
+        folder = os.path.realpath(folder)
+
+        (group,) = self._scan(folder)
+        get_hash_cache(folder).set_best_file(group["group_id"], os.path.join(folder, "orig_big.png"))
+
+        (group,) = self._scan(folder)
+        assert os.path.basename(group["best_file"]["path"]) == "orig_big.png"
+        assert group["best_source"] == "manual"
+
+    def test_analysis_is_cached_between_scans(self, tmp_path, monkeypatch):
+        from PIL import Image
+
+        from deduper.services import quality_analysis
+
+        from .test_quality import textured_image
+
+        folder = tmp_path / "cached"
+        folder.mkdir()
+        original = textured_image(320, 240)
+        original.save(folder / "orig.png")
+        original.resize((640, 480), Image.Resampling.BICUBIC).save(folder / "orig_big.png")
+        folder = os.path.realpath(folder)
+        self._scan(folder)
+
+        def fail(*args, **kwargs):
+            raise AssertionError("a warm rescan must not decode images for quality")
+
+        class NoPool:
+            submit = fail
+
+        from deduper.services import duplicate_finder
+        from deduper.utils import hash_cache
+
+        # Inline paths, and the pool: a warm rescan must submit nothing either
+        monkeypatch.setattr(quality_analysis, "decode_for_analysis", fail)
+        monkeypatch.setattr(hash_cache, "measure_image_quality", fail)
+        monkeypatch.setattr(duplicate_finder, "_get_process_pool", lambda: NoPool())
+        (group,) = self._scan(folder)
+        assert os.path.basename(group["best_file"]["path"]) == "orig.png"

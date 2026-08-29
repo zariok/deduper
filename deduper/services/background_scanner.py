@@ -76,7 +76,7 @@ def _setup_scanner_file_logger() -> logging.Logger:
     return _scanner_file_logger
 
 
-def scanner_log(level: str, message: str, exc_info: bool = False):
+def scanner_log(level: str, message: str, exc_info: bool = False) -> None:
     """Log to both the main logger and the dedicated scanner file log."""
     # Log to main logger
     log_func = getattr(logger, level.lower(), logger.info)
@@ -251,7 +251,7 @@ class BackgroundScanner:
         # Pending ScanTask objects keyed by folder_name for cancellation
         self._pending_tasks: dict[str, ScanTask] = {}
 
-    def start(self):
+    def start(self) -> None:
         """Start the dispatcher thread and worker pool."""
         if self._thread is not None and self._thread.is_alive():
             logger.warning("Background scanner already running")
@@ -280,7 +280,7 @@ class BackgroundScanner:
         self._thread.start()
         logger.info(f"Background scanner started ({self.NUM_SCAN_WORKERS} workers)")
 
-    def stop(self):
+    def stop(self) -> None:
         """Stop the dispatcher and all worker threads."""
         self._stop_event.set()
 
@@ -397,7 +397,7 @@ class BackgroundScanner:
             logger.debug(f"User scan started for {folder_name}")
             return True
 
-    def mark_user_scan_complete(self, folder_name: str):
+    def mark_user_scan_complete(self, folder_name: str) -> None:
         """Mark that a user has finished scanning a folder."""
         with self._lock:
             self._user_scanning_folders.discard(folder_name)
@@ -408,7 +408,7 @@ class BackgroundScanner:
                 state.last_scan_time = time.time()
             logger.debug(f"User scan complete for {folder_name}")
 
-    def prioritize_folder(self, folder_name: str):
+    def prioritize_folder(self, folder_name: str) -> None:
         """Mark a folder as high priority for immediate scanning.
 
         Call this when a user navigates to a folder to bump it to front of queue.
@@ -426,7 +426,7 @@ class BackgroundScanner:
                     self._enqueue_folder(folder_name, ScanPriority.USER)
                     logger.debug(f"Prioritized folder for scanning: {folder_name}")
 
-    def set_ui_active_folder(self, folder_name: str | None):
+    def set_ui_active_folder(self, folder_name: str | None) -> None:
         """Set the folder currently being viewed in the UI.
 
         The background scanner will skip rescanning this folder until the user
@@ -441,7 +441,7 @@ class BackgroundScanner:
             if folder_name:
                 self._folders_needing_refresh.discard(folder_name)
 
-    def mark_ui_activity(self):
+    def mark_ui_activity(self) -> None:
         """Mark that the user has interacted with the current folder.
 
         Call this when user performs actions like deleting duplicates.
@@ -487,12 +487,12 @@ class BackgroundScanner:
                 return True
             return False
 
-    def register_progress_callback(self, folder_name: str, callback: Callable):
+    def register_progress_callback(self, folder_name: str, callback: Callable) -> None:
         """Register a callback to receive progress updates for a folder scan."""
         with self._lock:
             self._progress_callbacks[folder_name] = callback
 
-    def unregister_progress_callback(self, folder_name: str):
+    def unregister_progress_callback(self, folder_name: str) -> None:
         """Unregister a progress callback."""
         with self._lock:
             self._progress_callbacks.pop(folder_name, None)
@@ -516,7 +516,7 @@ class BackgroundScanner:
                 'is_background_scan': is_bg
             }
 
-    def _set_scanner_state(self, state: ScannerState, message: str, next_action_time: float = 0):
+    def _set_scanner_state(self, state: ScannerState, message: str, next_action_time: float = 0) -> None:
         """Update the scanner state (thread-safe) and push via WebSocket."""
         with self._lock:
             self._scanner_state = state
@@ -539,7 +539,7 @@ class BackgroundScanner:
         except Exception:
             pass  # WebSocket not yet initialized during startup
 
-    def _emit_folder_update(self, folder_name: str, state=None):
+    def _emit_folder_update(self, folder_name: str, state: "FolderState | None" = None) -> None:
         """Push a single-folder status change to WebSocket subscribers.
 
         If *state* is not provided, it will be looked up under the lock.
@@ -588,7 +588,7 @@ class BackgroundScanner:
     # Dispatcher loop  (was _scanner_loop — now only discovers & enqueues)
     # ------------------------------------------------------------------
 
-    def _scanner_loop(self):
+    def _scanner_loop(self) -> None:
         """Dispatcher: discover folders, detect changes, and enqueue scan tasks."""
         scanner_log('info', "="*60)
         scanner_log('info', "Background scanner dispatcher STARTED")
@@ -703,7 +703,7 @@ class BackgroundScanner:
     # Worker loop  (Phase 3.1: runs in each worker thread)
     # ------------------------------------------------------------------
 
-    def _worker_loop(self):
+    def _worker_loop(self) -> None:
         """Worker thread: pull scan tasks from the queue and execute them."""
         thread_name = threading.current_thread().name
         scanner_log('info', f"[{thread_name}] Worker started")
@@ -781,7 +781,7 @@ class BackgroundScanner:
             'folder_mtime': folder_mtime
         }
 
-    def _discover_folders(self):
+    def _discover_folders(self) -> None:
         """Discover all user folders in the data directory and initialize state from cache."""
         try:
             if not os.path.exists(self.data_dir):
@@ -821,7 +821,7 @@ class BackgroundScanner:
         except Exception as e:
             scanner_log('error', f"Error discovering folders: {e}", exc_info=True)
 
-    def _check_folders_for_changes(self):
+    def _check_folders_for_changes(self) -> None:
         """Check all folders for file changes."""
         current_time = time.time()
 
@@ -868,7 +868,7 @@ class BackgroundScanner:
             # Don't use folder's own mtime as baseline — it changes when
             # any child file is added/removed (e.g. external .json updates).
             # Instead, only consider actual media file mtimes.
-            max_mtime = 0
+            max_mtime = 0.0
 
             # Check immediate children (files and subdirs).
             # Use context manager to close the directory handle promptly —
@@ -911,7 +911,7 @@ class BackgroundScanner:
         time_since_activity = current_time - self._ui_activity_time
         return time_since_activity < self.STABILITY_WAIT_SECONDS
 
-    def _scan_folder(self, folder_name: str):
+    def _scan_folder(self, folder_name: str) -> None:
         """Scan a folder for duplicates with timeout protection.
 
         Called by worker threads.  The actual DuplicateFinder runs inside
@@ -950,14 +950,14 @@ class BackgroundScanner:
         }
         scan_complete = threading.Event()
 
-        def run_scan():
+        def run_scan() -> None:
             """Sub-thread: run the actual DuplicateFinder scan."""
             try:
                 scanner_log('info', f"[{folder_name}] Scan sub-thread STARTED")
 
                 last_log_time = [time.time()]
 
-                def progress_callback(status: str, current: int, total: int, message: str):
+                def progress_callback(status: str, current: int, total: int, message: str) -> None:
                     with self._lock:
                         folder_state = self._folder_states.get(folder_name)
                         if folder_state:
@@ -1110,7 +1110,7 @@ class BackgroundScanner:
         except Exception:
             pass
 
-    def _handle_scan_failure(self, folder_name: str, error_message: str):
+    def _handle_scan_failure(self, folder_name: str, error_message: str) -> None:
         """Handle a scan failure with retry tracking."""
         with self._lock:
             state = self._folder_states.get(folder_name)
@@ -1165,7 +1165,7 @@ def init_background_scanner(
     return _background_scanner
 
 
-def stop_background_scanner():
+def stop_background_scanner() -> None:
     """Stop the global background scanner."""
     global _background_scanner
 

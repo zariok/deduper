@@ -6,9 +6,11 @@ from werkzeug.exceptions import HTTPException
 import json
 import threading
 import time
-from typing import Any
-from ..services.duplicate_finder import DuplicateFinder
+from typing import Any, Iterator
+from flask.typing import ResponseReturnValue
+from ..services.duplicate_finder import DuplicateFinder, _get_process_pool
 from ..services.background_scanner import get_background_scanner, ScanStatus
+from ..services.quality_analysis import analyze_group, exact_match_checker, prime_group_analyses
 from ..config import Config
 from ..utils.setup import create_example_folder
 from ..utils.media import extract_video_thumbnail
@@ -82,7 +84,7 @@ def _refresh_folder_duplicate_count(folder: str, cache: HashCache) -> None:
 
 
 # Global progress tracking
-progress_data = {}
+progress_data: dict[str, dict[str, Any]] = {}
 progress_lock = threading.Lock()
 
 def update_progress(session_id: str, status: str, current: int = 0, total: int = 0, message: str = "") -> None:
@@ -117,7 +119,7 @@ def get_progress(session_id: str) -> dict[str, Any]:
 
 @bp.route('/')
 @timer('page_index')
-def index():
+def index() -> ResponseReturnValue:
     """Render the main page with user folders."""
     try:
         logger.info("Rendering main page")
@@ -142,9 +144,9 @@ def index():
         return render_template('index.html', user_folders=[], error=str(e))
 
 @bp.route('/progress/<session_id>')
-def progress_stream(session_id):
+def progress_stream(session_id: str) -> ResponseReturnValue:
     """Stream progress updates via Server-Sent Events."""
-    def generate():
+    def generate() -> Iterator[str]:
         start_time = time.time()
         timeout = 300  # 5 minute timeout to prevent infinite loops
         last_progress_time = time.time()
@@ -182,7 +184,7 @@ def progress_stream(session_id):
 
 @bp.route('/scan/<path:user_folder>')
 @timer('scan_folder')
-def scan_folder(user_folder: str):
+def scan_folder(user_folder: str) -> ResponseReturnValue:
     """Scan a user folder for duplicates."""
     # URL decode the folder name to handle special characters
     decoded_folder = urllib.parse.unquote(user_folder)
@@ -233,19 +235,13 @@ def scan_folder(user_folder: str):
         finder = DuplicateFinder(Config.IMAGE_EXTENSIONS, Config.VIDEO_EXTENSIONS)
         duplicate_images, duplicate_videos = finder.find_duplicates(folder_path, progress_callback=lambda status, current, total, message: update_progress(session_id, status, current, total, message))
 
-        # Ensure we have valid lists
-        if duplicate_images is None:
-            duplicate_images = []
-        if duplicate_videos is None:
-            duplicate_videos = []
-
         logger.info(f"Found {len(duplicate_images)} image groups and {len(duplicate_videos)} video groups")
 
         # Mark as complete
         update_progress(session_id, 'complete', 100, 100, f'Found {len(duplicate_images)} image groups and {len(duplicate_videos)} video groups')
 
         # Convert file paths to URLs
-        def convert_to_urls(duplicates):
+        def convert_to_urls(duplicates: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for group in duplicates:
                 # Get the full file URL for best file (path is now relative)
                 best_file_path = group['best_file']['path']
@@ -289,7 +285,7 @@ def scan_folder(user_folder: str):
         _release_cache(folder_path)
 
 @bp.route('/manage-duplicate', methods=['POST'])
-def manage_duplicate():
+def manage_duplicate() -> ResponseReturnValue:
     """Handle duplicate file management."""
     _cache_folder_path = None  # track for FD cleanup in finally
     try:
@@ -575,7 +571,7 @@ def manage_duplicate():
 
 
 @bp.route('/data/<path:filename>')
-def serve_file(filename):
+def serve_file(filename: str) -> ResponseReturnValue:
     """Serve files from the data directory."""
     try:
         return send_from_directory(Config.DATA_DIR, filename)
@@ -583,7 +579,7 @@ def serve_file(filename):
         return jsonify({'error': str(e)}), 404
 
 @bp.route('/thumb/<path:filename>')
-def serve_thumbnail(filename):
+def serve_thumbnail(filename: str) -> ResponseReturnValue:
     """Serve thumbnails from the data directory."""
     try:
         # For videos, look for the deduper thumbnail with thumb-deduper prefix
@@ -610,7 +606,12 @@ def serve_thumbnail(filename):
             # If thumbnail generation fails, return 404
             return jsonify({'error': 'Thumbnail not found'}), 404
         
-        # For images, just serve the file
+        # Images get a cached thumbnail too; the original is the fallback
+        from deduper.utils.media import extract_image_thumbnail
+        image_path = os.path.join(Config.DATA_DIR, filename)
+        thumbnail_path = extract_image_thumbnail(image_path)
+        if thumbnail_path:
+            return send_from_directory(Config.DATA_DIR, os.path.relpath(thumbnail_path, Config.DATA_DIR))
         return send_from_directory(Config.DATA_DIR, filename)
     except Exception as e:
         return jsonify({'error': str(e)}), 404
@@ -618,7 +619,7 @@ def serve_thumbnail(filename):
     
 
 @bp.route('/cache/<path:user_folder>/clear', methods=['POST'])
-def clear_cache(user_folder):
+def clear_cache(user_folder: str) -> ResponseReturnValue:
     """Clear cache for a folder."""
     folder_path = None
     try:
@@ -638,7 +639,7 @@ def clear_cache(user_folder):
             _release_cache(folder_path)
 
 @bp.route('/cache/<path:user_folder>/live-stats')
-def live_cache_stats(user_folder):
+def live_cache_stats(user_folder: str) -> ResponseReturnValue:
     """Get live cache statistics with real-time updates.
 
     This endpoint uses read-only file access to avoid blocking when a scan is running.
@@ -680,7 +681,7 @@ def live_cache_stats(user_folder):
 
 
 @bp.route('/scanner/status')
-def scanner_status():
+def scanner_status() -> ResponseReturnValue:
     """Get the status of the background scanner and all folders."""
     try:
         scanner = get_background_scanner()
@@ -722,7 +723,7 @@ def scanner_status():
 
 
 @bp.route('/scanner/folder/<path:user_folder>/status')
-def folder_scan_status(user_folder: str):
+def folder_scan_status(user_folder: str) -> ResponseReturnValue:
     """Get the background scan status for a specific folder."""
     try:
         decoded_folder = urllib.parse.unquote(user_folder)
@@ -760,7 +761,7 @@ def folder_scan_status(user_folder: str):
 
 
 @bp.route('/scanner/folder/<path:user_folder>/prioritize', methods=['POST'])
-def prioritize_folder_scan(user_folder: str):
+def prioritize_folder_scan(user_folder: str) -> ResponseReturnValue:
     """Prioritize a folder for immediate background scanning."""
     try:
         decoded_folder = urllib.parse.unquote(user_folder)
@@ -784,7 +785,7 @@ def prioritize_folder_scan(user_folder: str):
 
 
 @bp.route('/scanner/ui-active-folder', methods=['POST'])
-def set_ui_active_folder():
+def set_ui_active_folder() -> ResponseReturnValue:
     """Set the folder currently being viewed in the UI.
 
     The background scanner will skip rescanning this folder until the user
@@ -813,7 +814,7 @@ def set_ui_active_folder():
 
 
 @bp.route('/scanner/ui-activity', methods=['POST'])
-def mark_ui_activity():
+def mark_ui_activity() -> ResponseReturnValue:
     """Mark that the user has interacted with the current folder.
 
     Call this when user performs actions like deleting duplicates.
@@ -837,7 +838,7 @@ def mark_ui_activity():
 
 
 @bp.route('/scanner/check-refresh/<path:user_folder>')
-def check_folder_refresh(user_folder: str):
+def check_folder_refresh(user_folder: str) -> ResponseReturnValue:
     """Check if a folder needs to be refreshed after background rescan."""
     try:
         decoded_folder = urllib.parse.unquote(user_folder)
@@ -861,7 +862,7 @@ def check_folder_refresh(user_folder: str):
 
 @bp.route('/cached-results/<path:user_folder>')
 @timer('cached_results')
-def get_cached_results(user_folder: str):
+def get_cached_results(user_folder: str) -> ResponseReturnValue:
     """Get cached duplicate results without triggering a new scan.
 
     This endpoint returns results from the cache if available,
@@ -898,6 +899,14 @@ def get_cached_results(user_folder: str):
 
         duplicate_images = []
         duplicate_videos = []
+        is_byte_identical = exact_match_checker(cache)
+
+        # A cache written before quality analysis existed has no verdicts yet;
+        # rank those groups on the pool rather than one by one in this request
+        prime_group_analyses(
+            [files for files in grouping_results.values() if len(files) > 1],
+            cache, Config.IMAGE_EXTENSIONS, Config.VIDEO_EXTENSIONS, executor=_get_process_pool(),
+        )
 
         # Helper to get file metadata
         def get_file_metadata(abs_path: str, is_video: bool) -> dict:
@@ -943,10 +952,14 @@ def get_cached_results(user_folder: str):
             if len(abs_files) <= 1:
                 continue
 
+            # The same ranking the scan uses. Taking abs_files[0] here, as this
+            # route once did, showed whichever member happened to be listed
+            # first as "best" - often the smaller copy.
             group_id = cache._generate_group_id_from_files(abs_files)
-            best_file_path = cache.get_best_file(group_id)
-            if not best_file_path or not os.path.exists(best_file_path) or os.path.islink(best_file_path):
-                best_file_path = abs_files[0]
+            analysis = analyze_group(
+                abs_files, cache, Config.IMAGE_EXTENSIONS, Config.VIDEO_EXTENSIONS, group_id
+            )
+            best_file_path = analysis.best_file
 
             # Determine if this is a video group
             is_video = any(best_file_path.lower().endswith(ext) for ext in Config.VIDEO_EXTENSIONS)
@@ -955,14 +968,17 @@ def get_cached_results(user_folder: str):
             best_rel_path = os.path.relpath(best_file_path, folder_path)
             best_metadata = get_file_metadata(best_file_path, is_video)
 
-            group = {
+            group: dict[str, Any] = {
                 'group_id': group_id,
+                'best_reason': analysis.best_reason,
+                'best_source': analysis.best_source,
                 'best_file': {
                     'path': best_rel_path,
                     'full': url_for('main.serve_file', filename=os.path.join(decoded_folder, best_rel_path)),
                     'thumb': url_for('main.serve_thumbnail', filename=os.path.join(decoded_folder, best_rel_path)),
                     'original_path': best_rel_path,
-                    **best_metadata
+                    **best_metadata,
+                    **analysis.report_for(best_file_path)
                 },
                 'duplicate_files': []
             }
@@ -975,11 +991,10 @@ def get_cached_results(user_folder: str):
                 rel_path = os.path.relpath(abs_path, folder_path)
                 dup_metadata = get_file_metadata(abs_path, is_video)
 
-                # Check if this is an exact match
-                is_exact_match = (
-                    dup_metadata['resolution']['width'] == best_metadata['resolution']['width'] and
-                    dup_metadata['resolution']['height'] == best_metadata['resolution']['height'] and
-                    dup_metadata['size'] == best_metadata['size']
+                # Byte-identical, the same test the scan applies - resolution
+                # plus size is a proxy that distinct files do collide on
+                is_exact_match = is_byte_identical(
+                    abs_path, best_file_path, dup_metadata['size'], best_metadata['size']
                 )
 
                 group['duplicate_files'].append({
@@ -988,7 +1003,8 @@ def get_cached_results(user_folder: str):
                     'thumb': url_for('main.serve_thumbnail', filename=os.path.join(decoded_folder, rel_path)),
                     'original_path': rel_path,
                     'is_exact_match': is_exact_match,
-                    **dup_metadata
+                    **dup_metadata,
+                    **analysis.report_for(abs_path)
                 })
 
             if is_video:
@@ -1017,8 +1033,8 @@ def get_cached_results(user_folder: str):
 
 
 @bp.errorhandler(Exception)
-def handle_error(e):
+def handle_error(e: Exception) -> ResponseReturnValue:
     """Handle all errors."""
     if isinstance(e, HTTPException):
-        return jsonify({'error': e.description}), e.code
+        return jsonify({'error': e.description}), e.code or 500
     return jsonify({'error': str(e)}), 500 

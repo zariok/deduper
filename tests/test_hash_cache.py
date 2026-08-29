@@ -369,3 +369,60 @@ class TestMediaMetadata:
         cache.flush_media_metadata()
 
         assert errors == [], f"concurrent access raised: {errors[:3]}"
+
+
+class TestQualityAndAnalysisPersistence:
+    def test_quality_is_measured_once_per_file(self, images_only_dir, monkeypatch):
+        from deduper.utils import hash_cache as module
+
+        calls = []
+        real = module.measure_image_quality
+
+        def counting(path):
+            calls.append(str(path))
+            return real(path)
+
+        monkeypatch.setattr(module, "measure_image_quality", counting)
+        cache = HashCache(images_only_dir)
+        target = os.path.join(images_only_dir, "img_a.png")
+        first = cache.get_image_quality(target)
+        second = cache.get_image_quality(target)
+        assert first == second
+        assert calls == [target]
+        assert HashCache(images_only_dir).get_image_quality(target) == first
+        assert calls == [target]
+
+    def test_a_changed_file_is_measured_again(self, images_only_dir, monkeypatch):
+        from deduper.utils import hash_cache as module
+
+        calls = []
+        real = module.measure_image_quality
+        monkeypatch.setattr(module, "measure_image_quality", lambda p: (calls.append(p), real(p))[1])
+        cache = HashCache(images_only_dir)
+        target = os.path.join(images_only_dir, "img_a.png")
+        cache.get_image_quality(target)
+        os.utime(target, (1, 1))
+        cache.get_image_quality(target)
+        assert len(calls) == 2
+
+    def test_group_analysis_is_bound_to_its_fingerprint(self, images_only_dir):
+        cache = HashCache(images_only_dir)
+        files = [os.path.join(images_only_dir, n) for n in ("img_a.png", "img_a_small.png")]
+        fingerprint = cache.group_fingerprint(files)
+        cache.set_group_analysis("g1", fingerprint, {"best_file": files[0]})
+        assert cache.get_group_analysis("g1", fingerprint) == {"best_file": files[0]}
+
+        os.utime(files[1], (1, 1))
+        assert cache.get_group_analysis("g1", cache.group_fingerprint(files)) is None
+        assert cache.get_group_analysis("g1", fingerprint) == {"best_file": files[0]}
+
+    def test_deleting_a_file_drops_its_quality_row(self, images_only_dir):
+        cache = HashCache(images_only_dir)
+        target = os.path.join(images_only_dir, "img_a_copy.png")
+        cache.get_image_quality(target)
+        os.remove(target)
+        cache.update_file_stats(target)
+        row = cache._db.execute(
+            "SELECT 1 FROM quality_metrics WHERE relative_path=?", ("img_a_copy.png",)
+        ).fetchone()
+        assert row is None

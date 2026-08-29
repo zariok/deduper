@@ -305,3 +305,116 @@ class TestIndex:
         assert os.listdir(data_dir) == []
         assert http.get("/").status_code == 200
         assert os.listdir(data_dir), "an example folder should be created"
+
+
+class TestCachedResultsAgreeWithTheScan:
+    def test_best_file_matches_the_scan_and_carries_quality(self, client, tmp_path):
+        """The page-load path once took the first member as best. It must rank."""
+        from PIL import Image
+
+        from .test_quality import textured_image
+
+        http, data_dir = client
+        source = tmp_path / "src"
+        source.mkdir()
+        original = textured_image(320, 240)
+        # Named so the upscale sorts first: that is the copy the old code showed
+        original.resize((960, 720), Image.Resampling.BICUBIC).save(source / "a_big.png")
+        original.save(source / "b_orig.png")
+        folder = populate(data_dir, str(source))
+
+        (scanned,) = DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS).find_duplicates(folder)[0]
+        payload = http.get("/cached-results/photos").get_json()
+        (cached,) = payload["duplicate_images"]
+
+        assert os.path.basename(cached["best_file"]["path"]) == "b_orig.png"
+        assert cached["best_file"]["path"] == scanned["best_file"]["path"]
+        assert cached["best_reason"] == scanned["best_reason"]
+        assert cached["best_file"]["quality"]["summary"]
+        (dup,) = cached["duplicate_files"]
+        assert dup["quality"]["detail"] < 0.6
+        assert dup["modifications"] == []
+
+    def test_exact_match_means_identical_bytes(self, client, images_only_dir, monkeypatch):
+        """Same resolution and size is not enough; the scan proves identity, so must the page."""
+        from deduper.services import duplicate_finder
+
+        http, data_dir = client
+        folder = populate(data_dir, images_only_dir)
+        # Keep the twins on disk so the page has a same-size pair to judge
+        monkeypatch.setattr(
+            duplicate_finder.DuplicateFinder,
+            "_process_exact_matches_automatically",
+            lambda self, groups, cache, progress_callback=None: groups,
+        )
+        DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS).find_duplicates(folder)
+
+        payload = http.get("/cached-results/photos").get_json()
+        (group,) = payload["duplicate_images"]
+        flags = {os.path.basename(d["path"]): d["is_exact_match"] for d in group["duplicate_files"]}
+        assert flags["img_a_small.png"] is False
+        copy_flags = [v for k, v in flags.items() if k in ("img_a.png", "img_a_copy.png")]
+        assert copy_flags == [True]
+
+
+class TestImageThumbnails:
+    def test_thumbnail_is_reduced_cached_and_invisible_to_the_scanner(self, client, tmp_path):
+        """A results page must not pull full originals into 200px cards."""
+        import io
+
+        from PIL import Image
+
+        from .test_quality import textured_image
+
+        http, data_dir = client
+        source = tmp_path / "src"
+        source.mkdir()
+        textured_image(1600, 1200).save(source / "big.jpg", quality=92)
+        folder = populate(data_dir, str(source))
+
+        response = http.get("/thumb/photos/big.jpg")
+        assert response.status_code == 200
+        with Image.open(io.BytesIO(response.data)) as thumb:
+            assert max(thumb.size) == 320
+        assert len(response.data) < os.path.getsize(os.path.join(folder, "big.jpg")) / 10
+
+        cached = os.path.join(folder, "thumb-deduper.big.jpg.jpg")
+        assert os.path.exists(cached)
+        stamp = os.path.getmtime(cached)
+        assert http.get("/thumb/photos/big.jpg").status_code == 200
+        assert os.path.getmtime(cached) == stamp, "second request must reuse the file"
+
+        # The thumbnail beside the original is not itself a scan candidate
+        finder = DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS)
+        images, _ = finder.find_duplicates(folder)
+        assert images == []
+        from deduper.utils.hash_cache import HashCache
+
+        assert HashCache(folder).get_file_hash_rows().keys() == {"big.jpg"}
+
+    def test_unreadable_image_falls_back_to_the_original(self, client, tmp_path):
+        http, data_dir = client
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / "broken.jpg").write_bytes(b"not a jpeg")
+        populate(data_dir, str(source))
+        response = http.get("/thumb/photos/broken.jpg")
+        assert response.status_code == 200
+        assert response.data == b"not a jpeg"
+
+    def test_the_scrapers_own_thumbnail_is_preferred(self, client, tmp_path):
+        """saviorpy writes thumb.<name> beside every download; serve it, build nothing."""
+        from .test_quality import textured_image
+
+        http, data_dir = client
+        source = tmp_path / "src"
+        source.mkdir()
+        textured_image(1600, 1200).save(source / "big.jpg", quality=92)
+        textured_image(200, 150, seed=7).save(source / "thumb.big.jpg", quality=80)
+        folder = populate(data_dir, str(source))
+
+        response = http.get("/thumb/photos/big.jpg")
+        assert response.status_code == 200
+        with open(os.path.join(folder, "thumb.big.jpg"), "rb") as handle:
+            assert response.data == handle.read()
+        assert not os.path.exists(os.path.join(folder, "thumb-deduper.big.jpg.jpg"))

@@ -1,6 +1,10 @@
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from flask import Flask
 
 class Config:
     # Flask settings
@@ -34,7 +38,7 @@ class Config:
     VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.gif', '.webm', '.flv', '.wmv', '.m4v'}
     
     @classmethod
-    def init_app(cls, app):
+    def init_app(cls, app: "Flask") -> None:
         """Initialize the application configuration."""
         # Create necessary directories with proper permissions
         for directory in [cls.DATA_DIR, cls.TEMPLATES_DIR, cls.STATIC_DIR]:
