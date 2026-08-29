@@ -588,57 +588,6 @@ class DuplicateFinder:
             increment_counter('duplicate_detection_errors')
             return [], []
     
-    def _group_files_by_hash_parallel(
-        self, file_paths: list[str], video_extensions: Iterable[str], threshold: int = 5
-    ) -> dict[str, list[str]]:
-        """Group files by perceptual hash using parallel processing.
-
-        Uses MultiHash comparison: two files match only when both pHash
-        and dHash distances are within *threshold*.
-        """
-        if not file_paths:
-            return {}
-
-        pool = _get_process_pool()
-        logger.info("Using persistent process pool for parallel processing")
-
-        hash_func = partial(self._get_file_hash, video_extensions=normalize_extensions(video_extensions))
-        futures = {pool.submit(hash_func, fp): fp for fp in file_paths}
-        hash_by_path = {}
-        for future in as_completed(futures):
-            fp = futures[future]
-            try:
-                hash_by_path[fp] = future.result()
-            except Exception:
-                hash_by_path[fp] = None
-
-        logger.debug("Grouping similar files (multi-hash)...")
-        groups: dict[str, list[str]] = {}
-        # Store (representative_path, representative_hash) for comparison
-        rep_hashes: list[tuple[str, Any]] = []
-
-        for file_path in file_paths:
-            file_hash = hash_by_path.get(file_path)
-            if file_hash is None:
-                continue
-
-            found_group = None
-            for rep_path, rep_hash in rep_hashes:
-                # MultiHash.__sub__ returns max(pHash_dist, dHash_dist)
-                if (file_hash - rep_hash) < threshold:
-                    found_group = rep_path
-                    break
-
-            if found_group is not None:
-                groups[found_group].append(file_path)
-            else:
-                groups[file_path] = [file_path]
-                rep_hashes.append((file_path, file_hash))
-
-        duplicate_count = len([g for g in groups.values() if len(g) > 1])
-        logger.info(f"Found {duplicate_count} duplicate groups")
-        return groups
-    
     def _group_files_by_hash_with_cache(
         self,
         file_paths: list[str],
