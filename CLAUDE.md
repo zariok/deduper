@@ -106,12 +106,18 @@ Environment variables (see README.md for the full list):
      scan pipeline, the exact-match pass and `/cached-results` all call it;
      `/cached-results` used to take `abs_files[0]`, which is what showed a
      smaller copy as best after a background pre-scan
-   - Images rank by `pixel_count * bandwidth**2.5 * codec_factor * penalties`.
-     **Bandwidth** is the fraction of Nyquist that still carries picture, read
-     off a radial power spectrum of native pixels: an upscale or blur has a cliff
-     at the resolution it came from, so a 2x upscale scores *below* its source.
-     JPEG quality is estimated from the luminance quantisation table (Pillow
-     returns it in natural order); lossless formats score 1.0
+   - Images rank by `pixel_count * bandwidth**3 * codec_factor * penalties`.
+     **Bandwidth** is the fraction of the image's resolution that holds real
+     detail, judged octave by octave with `genuineness()`: the image's
+     high-frequency energy over that of its own copy resampled down and back
+     up. Self-calibrated on purpose - an absolute spectrum cutoff labelled
+     genuine DSLR frames "upscaled", because real optics roll off far earlier
+     than the synthetic images it was tuned on. Calibration numbers are in
+     `quality.py`; retune only against real photos, then bump `QUALITY_VERSION`.
+     Known gap: a 1.25-1.5x upscale of a very sharp image reads like a soft
+     genuine photo; 2x and beyond are caught. JPEG quality is estimated from the
+     luminance quantisation table (Pillow returns it in natural order);
+     lossless formats score 1.0
    - **Modifications** are group-relative and only exist for images: overlay
      (a small dense region that differs and is either edge-dense - text/logo -
      or flattened - bar/box/blur - relative to that copy's own surroundings),

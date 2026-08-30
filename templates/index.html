@@ -157,8 +157,10 @@
         .media-detail-value {
             color: #888;
         }
-        .media-detail-value[data-tip] {
+        [data-tip] {
             cursor: help;
+        }
+        .media-detail-value[data-tip] {
             border-bottom: 1px dotted #bbb;
         }
         /* Flags over the thumbnail: what was detected about this copy. The
@@ -186,22 +188,23 @@
             border-color: #dc3545;
             background: #fff0f1;
         }
-        .mod-badge[data-tip]:hover::after {
-            content: attr(data-tip);
-            position: absolute;
-            bottom: 130%;
-            right: 0;
-            width: max-content;
-            max-width: 170px;
-            white-space: normal;
+        /* One tooltip element on <body>, positioned with fixed coordinates:
+           the cards clip their overflow, so anything rendered inside them was
+           cropped at the image edge. */
+        .tip-float {
+            position: fixed;
+            display: none;
+            max-width: 280px;
             background: #333;
             color: #fff;
-            font-size: 11px;
-            line-height: 1.35;
-            padding: 6px 8px;
+            font-size: 12px;
+            line-height: 1.4;
+            padding: 8px 10px;
             border-radius: 4px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.25);
-            z-index: 20;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            z-index: 1000;
+            pointer-events: none;
+            white-space: normal;
         }
         .best-why {
             font-size: 14px;
@@ -1247,7 +1250,7 @@
                                         console.log(`Second fallback: Force loading ${stillLoadingImages2.length} remaining images`);
                                         stillLoadingImages2.forEach(img => {
                                             const src = img.getAttribute('data-src');
-                                            if (src && !loadedImages.has(src)) {
+                                            if (src && !img.dataset.queued) {
                                                 console.log(`Force loading image: ${src}`);
                                                 loadingQueue.push({ img, src });
                                             }
@@ -1659,6 +1662,36 @@
             }
         }
 
+        // Shared hover tooltip for every [data-tip] element. Lives on <body>
+        // and is positioned in viewport coordinates, so a card's overflow
+        // clipping cannot crop it; flips below the element near the top edge.
+        const tipFloat = document.createElement('div');
+        tipFloat.className = 'tip-float';
+        document.body.appendChild(tipFloat);
+
+        function showTip(target) {
+            tipFloat.textContent = target.dataset.tip;
+            tipFloat.style.display = 'block';
+            const rect = target.getBoundingClientRect();
+            const tip = tipFloat.getBoundingClientRect();
+            let left = rect.left + rect.width / 2 - tip.width / 2;
+            left = Math.max(8, Math.min(left, window.innerWidth - tip.width - 8));
+            let top = rect.top - tip.height - 8;
+            if (top < 8) top = rect.bottom + 8;
+            tipFloat.style.left = `${left}px`;
+            tipFloat.style.top = `${top}px`;
+        }
+
+        document.addEventListener('mouseover', event => {
+            const target = event.target.closest('[data-tip]');
+            if (target) showTip(target);
+        });
+        document.addEventListener('mouseout', event => {
+            const target = event.target.closest('[data-tip]');
+            if (target && !target.contains(event.relatedTarget)) tipFloat.style.display = 'none';
+        });
+        window.addEventListener('scroll', () => { tipFloat.style.display = 'none'; }, true);
+
         function escapeAttr(text) {
             return String(text == null ? '' : text)
                 .replace(/&/g, '&amp;').replace(/"/g, '&quot;')
@@ -1700,7 +1733,7 @@
             return `
                 <div class="media-detail-row">
                     <span class="media-detail-label">Quality:</span>
-                    <span class="media-detail-value" data-tip="${escapeAttr(quality.summary)}" title="${escapeAttr(quality.summary)}">${escapeAttr(value)}</span>
+                    <span class="media-detail-value" data-tip="${escapeAttr(quality.summary)}">${escapeAttr(value)}</span>
                 </div>`;
         }
 
@@ -1730,7 +1763,7 @@
                 const bestFile = document.createElement('div');
                 bestFile.className = 'best-file-section';
                 const bestWhy = group.best_reason
-                    ? `<span class="best-why" title="${escapeAttr('Why this one: ' + group.best_reason)}">ⓘ</span>`
+                    ? `<span class="best-why" data-tip="${escapeAttr('Why this one: ' + group.best_reason)}">ⓘ</span>`
                     : '';
                 const bestSource = group.best_source === 'manual'
                     ? '<span class="best-source">your pick</span>'
@@ -1859,7 +1892,7 @@
                     
                     if (isVisible) {
                         // Load immediately if already visible
-                        if (src && !loadedImages.has(src)) {
+                        if (src && !img.dataset.queued) {
                             console.log(`renderDuplicateGroups: Loading immediately visible new image: ${src}`);
                             loadingQueue.push({ img, src });
                         }
@@ -2264,7 +2297,7 @@
                         
                         console.log(`Image intersecting: ${src}`);
                         
-                        if (src && !loadedImages.has(src)) {
+                        if (src && !img.dataset.queued) {
                             // Add to loading queue instead of loading immediately
                             loadingQueue.push({ img, src });
                             console.log(`Added to loading queue: ${src}`);
@@ -2311,11 +2344,14 @@
                 batch.forEach(({ img, src }, index) => {
                     console.log(`processBatch: Processing image ${index + 1}/${batch.length}: ${src}`);
                     
-                    if (loadedImages.has(src)) {
+                    // Judge the element, not the URL: a re-render creates new <img>
+                    // elements for URLs seen before, and a URL-keyed skip left
+                    // them on "Loading..." for good.
+                    if (!img.hasAttribute('data-src') || img.dataset.queued) {
                         console.log(`processBatch: Skipping already loaded image: ${src}`);
-                        return; // Skip if already loaded
+                        return;
                     }
-                    
+                    img.dataset.queued = '1';
                     loadedImages.add(src);
                     console.log(`processBatch: Loading image: ${src}`);
                     
@@ -2379,7 +2415,7 @@
                 if (isVisible) {
                     // Load immediately if already visible
                     const src = img.getAttribute('data-src');
-                    if (src && !loadedImages.has(src)) {
+                    if (src && !img.dataset.queued) {
                         console.log(`Loading immediately visible image: ${src}`);
                         loadingQueue.push({ img, src });
                     }
@@ -2411,7 +2447,7 @@
                     visibleCount++;
                     const src = img.getAttribute('data-src');
                     console.log(`Checking visible image: ${src}, already loaded: ${loadedImages.has(src)}`);
-                    if (src && !loadedImages.has(src)) {
+                    if (src && !img.dataset.queued) {
                         loadingQueue.push({ img, src });
                         console.log(`Added visible image to loading queue: ${src}`);
                     } else if (src && loadedImages.has(src)) {

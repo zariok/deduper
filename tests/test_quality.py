@@ -19,7 +19,7 @@ from deduper.utils.quality import (
     load_comparison_image,
     measure_image_quality,
     rank_images,
-    spectral_bandwidth,
+    detail_bandwidth,
 )
 
 
@@ -89,22 +89,32 @@ def original() -> Image.Image:
 
 class TestBandwidth:
     def test_an_original_is_full_detail(self, original):
-        assert spectral_bandwidth(gray(original)) >= 0.84
+        assert detail_bandwidth(gray(original)) >= 0.9
 
     def test_a_downscale_is_still_full_detail(self, original):
         small = original.resize((320, 240), Image.Resampling.LANCZOS)
-        assert spectral_bandwidth(gray(small)) >= 0.84
+        assert detail_bandwidth(gray(small)) >= 0.9
 
     def test_a_two_times_upscale_stops_at_half(self, original):
         small = original.resize((320, 240), Image.Resampling.LANCZOS)
         up = small.resize((640, 480), Image.Resampling.BICUBIC)
-        assert 0.4 <= spectral_bandwidth(gray(up)) <= 0.6
+        assert 0.3 <= detail_bandwidth(gray(up)) <= 0.65
+
+    def test_a_four_times_upscale_stops_at_a_quarter(self, original):
+        small = original.resize((160, 120), Image.Resampling.LANCZOS)
+        up = small.resize((640, 480), Image.Resampling.BICUBIC)
+        assert 0.1 <= detail_bandwidth(gray(up)) <= 0.35
 
     def test_a_blur_loses_detail(self, original):
-        assert spectral_bandwidth(gray(original.filter(ImageFilter.GaussianBlur(2)))) < 0.6
+        assert detail_bandwidth(gray(original.filter(ImageFilter.GaussianBlur(2)))) < 0.6
+
+    def test_a_soft_but_genuine_image_is_not_called_an_upscale(self, original):
+        """Real camera JPEGs roll off early; a mild blur must not read as an upscale."""
+        soft = original.filter(ImageFilter.GaussianBlur(0.6))
+        assert detail_bandwidth(gray(soft)) >= 0.7
 
     def test_a_tiny_image_is_not_judged(self):
-        assert spectral_bandwidth(np.zeros((64, 64), dtype=np.float32)) == 1.0
+        assert detail_bandwidth(np.zeros((64, 64), dtype=np.float32)) == 1.0
 
 
 class TestJpegQuality:
@@ -124,7 +134,7 @@ class TestMeasure:
         assert (q.width, q.height) == (640, 480)
         assert q.format == "PNG"
         assert q.codec_factor == 1.0
-        assert q.bandwidth >= 0.84
+        assert q.bandwidth >= 0.9
         assert "lossless" in q.summary()
 
     def test_upscale_has_fewer_effective_pixels_than_its_source(self, original, tmp_path):

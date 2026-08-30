@@ -5,14 +5,16 @@ upscaled copy has more pixels and less picture than its source, and two files of
 the same size can differ by a heavily compressed JPEG, a colour filter or a
 burned-in watermark. This module measures what a file actually carries:
 
-* **Detail bandwidth** - the fraction of the image's own Nyquist frequency that
-  still holds picture information, read off the radial power spectrum. Natural
-  images carry roughly equal energy per octave; an upscale or a blur has none
-  above the resolution it was scaled from, so the spectrum falls off a cliff at
-  that point. ``pixel_count * bandwidth**2`` is the resolution the file
-  effectively has. JPEG artifacts are deliberately *not* captured here (block
-  edges put energy back at high frequency); compression is read from the
-  quantisation tables instead.
+* **Detail bandwidth** - the fraction of the image's own resolution that still
+  holds picture information. Each octave is tested against a synthetic 2x
+  upscale of the image's own half-size copy: a genuine image carries several
+  times the high-frequency energy of that upscale, while an upscaled or
+  blurred copy carries about the same. The test is self-calibrated - a soft
+  photo and its upscale both compare against their own content - which an
+  absolute spectrum threshold was not: real camera JPEGs roll off early enough
+  that a 3504x2336 DSLR frame measured as "upscaled". ``pixel_count *
+  bandwidth**2`` is the resolution the file effectively has. Compression is
+  read from the JPEG quantisation tables, not from here.
 * **Codec quality** - lossless formats score 100, JPEGs are estimated from the
   luminance quantisation table's scale against the standard table.
 * **Modifications** - group-relative: an overlay (watermark, caption, logo) is
@@ -42,27 +44,34 @@ from .logging_config import get_logger
 logger = get_logger(__name__)
 
 # Bump when the measurements change meaning, so cached rows are recomputed.
-QUALITY_VERSION = 1
+QUALITY_VERSION = 2
 
 # --- Detail bandwidth ---------------------------------------------------------
-# Spectrum rings are log-spaced, this many per octave, from 1/16 to 1.0 of the
-# Nyquist frequency. The lowest octave is the reference every other ring is
-# measured against; bandwidth ends at the first ring whose energy falls under
-# BANDWIDTH_CUTOFF of it.
-_RINGS_PER_OCTAVE = 4
-_RING_COUNT = 4 * _RINGS_PER_OCTAVE
-_REFERENCE_RINGS = _RINGS_PER_OCTAVE  # rings in [1/16, 1/8)
-_FIRST_JUDGED_RING = _RINGS_PER_OCTAVE  # bandwidth can fall no lower than 1/8
-BANDWIDTH_CUTOFF = 0.2
-# Native pixels are sampled in tiles rather than decoded into one huge FFT.
-_TILE = 512
-# Below this the spectrum has too few bins per ring to say anything.
+# genuineness(image, c): the image's high-frequency (Laplacian) energy over
+# that of its own copy resampled down to c of its size and back up. Real
+# content in the band above c scores well above 1; an empty band (an upscale,
+# a blur) scores about 1. Self-calibrated: a soft photo and its upscale are
+# both judged against their own content, which an absolute spectrum cutoff
+# was not - real camera JPEGs roll off early enough that a DSLR frame read as
+# "upscaled". Calibrated on real photos and their derivatives:
+#   c=0.5  genuine 2.7-9.0   2x upscales 1.35-1.78   1.5x upscales 1.6-2.7
+#   c=0.8  genuine 1.55-2.65 (sensor noise always fills the top of the band)
+#          upscales of 1.25x and more 1.12-1.48, a 0.6px blur 1.3-1.7
+# A 1.25-1.5x upscale of a very sharp image overlaps a soft genuine photo at
+# c=0.5 and is only partly caught by the c=0.8 probe; 2x and beyond are caught.
+_HALF_EMPTY, _HALF_FULL = 1.6, 2.8
+_TOP_EMPTY, _TOP_FULL = 1.25, 1.6
+# Octaves are tested from the top down until one holds real detail
+_MAX_OCTAVES = 3
+# Native pixels are sampled in tiles rather than differenced whole.
+_TILE = 768
+# Below this there is too little to judge.
 _MIN_JUDGEABLE_SIDE = 128
 
-# pixel_count * bandwidth**2 is the information a file carries; the extra half
-# power is a thumb on the scale so an original beats its own upscale, whose
-# effective pixels are otherwise equal to the source's plus interpolation blur.
-DETAIL_EXPONENT = 2.5
+# pixel_count * bandwidth**2 is the information a file carries; the extra power
+# is a thumb on the scale so an original beats its own upscale, whose effective
+# pixels are otherwise equal to the source's plus interpolation blur.
+DETAIL_EXPONENT = 3.0
 
 # --- Codec ------------------------------------------------------------------
 # IJG standard luminance quantisation table, natural order. Pillow returns
@@ -154,11 +163,11 @@ class ImageQuality:
         return 0.75 + 0.25 * self.codec_quality / 100.0
 
     def detail_label(self) -> str:
-        if self.bandwidth >= 0.84:
+        if self.bandwidth >= 0.9:
             return "full detail"
-        if self.bandwidth >= 0.6:
+        if self.bandwidth >= 0.7:
             return "slightly soft"
-        if self.bandwidth >= 0.4:
+        if self.bandwidth >= 0.45:
             return "soft - likely upscaled ~2x or blurred"
         return "very soft - likely upscaled or heavily blurred"
 
@@ -250,42 +259,62 @@ def _tiles(gray: NDArray[np.float32]) -> list[NDArray[np.float32]]:
     return tiles
 
 
-def spectral_bandwidth(gray: NDArray[np.float32]) -> float:
-    """Fraction of Nyquist (1/8 .. 1.0) below which the image holds real detail.
+def _high_frequency_energy(gray: Image.Image) -> float:
+    """Mean squared 4-neighbour Laplacian over sample tiles."""
+    array = np.asarray(gray, dtype=np.float32)
+    total = 0.0
+    for tile in _tiles(array):
+        lap = (
+            4.0 * tile[1:-1, 1:-1]
+            - tile[:-2, 1:-1]
+            - tile[2:, 1:-1]
+            - tile[1:-1, :-2]
+            - tile[1:-1, 2:]
+        )
+        total += float(np.mean(lap * lap))
+    return total
 
+
+def genuineness(gray: Image.Image, cutoff: float = 0.5) -> float:
+    """How much more detail *gray* holds above *cutoff* of its resolution than
+    a copy resampled down to that size and back up. ~1 means the band is empty.
+    """
+    w, h = gray.size
+    down = gray.resize(
+        (max(1, int(w * cutoff)), max(1, int(h * cutoff))), Image.Resampling.LANCZOS
+    )
+    resampled = down.resize((w, h), Image.Resampling.BICUBIC)
+    return _high_frequency_energy(gray) / (_high_frequency_energy(resampled) + 1e-6)
+
+
+def _unit(value: float, empty: float, full: float) -> float:
+    return min(1.0, max(0.0, (value - empty) / (full - empty)))
+
+
+def detail_bandwidth(gray: NDArray[np.float32] | Image.Image) -> float:
+    """Fraction of the image's resolution (1/8 .. 1.0) that holds real detail.
+
+    Octaves are judged from the top down. An empty top octave halves the
+    bandwidth and the next octave is judged. A real one is scaled by how real
+    it is, and by the c=0.8 probe for the last stretch below full resolution.
     Returns 1.0 for images too small to judge.
     """
-    h, w = gray.shape
-    if min(h, w) < _MIN_JUDGEABLE_SIDE:
-        return 1.0
-
-    tiles = _tiles(gray)
-    th, tw = tiles[0].shape
-    window = np.outer(np.hanning(th), np.hanning(tw)).astype(np.float32)
-    # Frequencies as a fraction of Nyquist on each axis, so a non-square tile
-    # still maps its corners to r > 1 and its axes to r = 1.
-    fy = np.fft.fftfreq(th)[:, None] * 2.0
-    fx = np.fft.rfftfreq(tw)[None, :] * 2.0
-    radius = np.sqrt(fx ** 2 + fy ** 2)
-    valid = (radius >= 2.0 ** (-_RING_COUNT / _RINGS_PER_OCTAVE)) & (radius < 1.0)
-    ring_index = (
-        np.floor(np.log2(radius[valid]) * _RINGS_PER_OCTAVE).astype(np.int64) + _RING_COUNT
+    image = gray if isinstance(gray, Image.Image) else Image.fromarray(
+        np.clip(gray, 0, 255).astype(np.uint8), "L"
     )
-
-    energy = np.zeros(_RING_COUNT, dtype=np.float64)
-    for tile in tiles:
-        centred = (tile - float(tile.mean())) * window
-        power = np.abs(np.fft.rfft2(centred)) ** 2
-        energy += np.bincount(ring_index, weights=power[valid], minlength=_RING_COUNT)[:_RING_COUNT]
-
-    reference = float(np.median(energy[:_REFERENCE_RINGS]))
-    if reference <= 0.0:
-        return 1.0
-    relative = energy / reference
-    for index in range(_FIRST_JUDGED_RING, _RING_COUNT):
-        if relative[index] < BANDWIDTH_CUTOFF:
-            return float(2.0 ** ((index - _RING_COUNT) / _RINGS_PER_OCTAVE))
-    return 1.0
+    bandwidth = 1.0
+    for _ in range(_MAX_OCTAVES):
+        if min(image.size) < _MIN_JUDGEABLE_SIDE:
+            break
+        half = _unit(genuineness(image, 0.5), _HALF_EMPTY, _HALF_FULL)
+        if half == 0.0:
+            bandwidth *= 0.5
+            image = image.reduce(2)
+            continue
+        top = _unit(genuineness(image, 0.8), _TOP_EMPTY, _TOP_FULL)
+        bandwidth *= (0.5 + 0.5 * half) * (0.67 + 0.33 * top)
+        break
+    return bandwidth
 
 
 _ORIENTATION_TAG = 0x0112
@@ -327,9 +356,9 @@ def decode_for_analysis(
             if measure:
                 codec_quality = estimate_jpeg_quality(image) if fmt == "JPEG" else None
                 width, height = image.size
-                gray = np.asarray(image.convert("L"), dtype=np.float32)
-                quality = ImageQuality(width, height, spectral_bandwidth(gray), codec_quality, fmt)
-                del gray
+                quality = ImageQuality(
+                    width, height, detail_bandwidth(image.convert("L")), codec_quality, fmt
+                )
             else:
                 image.draft("RGB", (size * 2, size * 2))
             oriented = _oriented(image)
