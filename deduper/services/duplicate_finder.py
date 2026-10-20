@@ -5,14 +5,26 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
-from typing import Callable, Any
+from typing import Any, Callable, Iterable
 import imagehash
 from ..utils.bktree import BKTree
 from ..utils.helpers import get_file_size, format_file_size, create_symlink_and_remove_duplicate
-from ..utils.media import MultiHash, batch_extract_video_thumbnails, get_image_hash, select_best_video_from_group
+from ..utils.media import (
+    SIGNATURE_MATCH_DISTANCE,
+    SIGNATURE_MIN_OVERLAP,
+    MultiHash,
+    Resolution,
+    VideoSignature,
+    batch_extract_video_thumbnails,
+    get_image_hash,
+    get_video_signature,
+    normalize_extensions,
+    select_best_video_from_group,
+)
 from ..utils.hash_cache import HashCache, get_hash_cache
 from ..utils.logging_config import get_logger
 from ..utils.metrics import metrics, timer, increment_counter, set_gauge
+from .quality_analysis import analyze_group, exact_match_checker, prime_group_analyses
 
 logger = get_logger(__name__)
 
@@ -36,6 +48,121 @@ def _packed_distance(a: tuple[int, int], b: tuple[int, int]) -> int:
     innermost level of every BK-tree query and dominates clustering time.
     """
     return max((a[0] ^ b[0]).bit_count(), (a[1] ^ b[1]).bit_count())
+
+# A GIF rendered from a video is redundant with it: same footage, far larger,
+# no audio, 256 colours. When the two are confirmed to be the same footage the
+# GIF is replaced by a symlink to the video - which reclaims the space while
+# leaving the path in place, so a scraper still sees the file and will not
+# re-download it. Set False to leave GIFs for manual review instead.
+TOMBSTONE_GIFS = True
+GIF_SUFFIX = ".gif"
+
+
+class _UnionFind:
+    """Disjoint-set over paths, with path compression and union by rank.
+
+    Iterative on purpose: the inline version in _cluster_with_bktree recurses,
+    which is fine there but would risk a deep chain when every frame of every
+    video is unioned into the same structure.
+    """
+
+    def __init__(self) -> None:
+        self._parent: dict[str, str] = {}
+        self._rank: dict[str, int] = {}
+
+    def find(self, item: str) -> str:
+        parent = self._parent
+        parent.setdefault(item, item)
+        root = item
+        while parent[root] != root:
+            root = parent[root]
+        while parent[item] != root:  # compress
+            parent[item], item = root, parent[item]
+        return root
+
+    def union(self, a: str, b: str) -> None:
+        root_a, root_b = self.find(a), self.find(b)
+        if root_a == root_b:
+            return
+        rank_a = self._rank.setdefault(root_a, 0)
+        rank_b = self._rank.setdefault(root_b, 0)
+        if rank_a < rank_b:
+            self._parent[root_a] = root_b
+        elif rank_a > rank_b:
+            self._parent[root_b] = root_a
+        else:
+            self._parent[root_b] = root_a
+            self._rank[root_a] = rank_a + 1
+
+
+def _packed_matches(
+    a: list[tuple[int, int]],
+    b: list[tuple[int, int]],
+    limit: float,
+    min_overlap: int,
+) -> bool:
+    """Packed-int equivalent of ``VideoSignature.matches``.
+
+    Must stay **exactly** equivalent to the reference implementation in media.py;
+    tests/test_performance_paths.py pins the two together. Three things make this
+    the version clustering uses:
+
+    - frames are compared with _packed_distance, ~15x cheaper than
+      MultiHash.__sub__ - the same reason image clustering packs its hashes
+    - an alignment is abandoned the moment its running total exceeds
+      ``limit * overlap``, since the mean can only rise from there
+    - it answers "is there an alignment under the limit", so it returns on the
+      first one and never finishes scoring the rest
+
+    Together these matter most in the case that used to be worst: a shared intro
+    unions many unrelated videos, and every one of those pairs has to be refuted.
+    """
+    if not a or not b:
+        return False
+    need = min(min_overlap, len(a), len(b))
+    for offset in range(-(len(b) - 1), len(a)):
+        start = max(0, offset)
+        stop = min(len(a), offset + len(b))
+        overlap = stop - start
+        if overlap < need:
+            continue
+        budget = limit * overlap
+        total = 0
+        for i in range(start, stop):
+            total += _packed_distance(a[i], b[i - offset])
+            if total > budget:
+                break  # mean is already above the limit and cannot come back down
+        else:
+            return True
+    return False
+
+
+def _identical_sets(file_paths: list[str], cache: "HashCache") -> list[list[str]]:
+    """Partition *file_paths* into sets of byte-identical files, size >= 2.
+
+    Files of different sizes cannot be identical, so sizes bucket the work first
+    and only buckets with a real collision get their contents read. That keeps a
+    scan from hashing every file's bytes while still proving identity before
+    anything is deleted.
+
+    Files that cannot be read are skipped rather than assumed identical.
+    """
+    by_size: dict[int, list[str]] = defaultdict(list)
+    for path in file_paths:
+        by_size[get_file_size(path)].append(path)
+
+    identical: list[list[str]] = []
+    for candidates in by_size.values():
+        if len(candidates) < 2:
+            continue
+        by_digest: dict[str, list[str]] = defaultdict(list)
+        for path in candidates:
+            digest = cache.get_content_hash(path)
+            if digest is not None:
+                by_digest[digest].append(path)
+        identical.extend(members for members in by_digest.values() if len(members) > 1)
+    return identical
+
 
 # Module-level persistent process pool — avoids fork/spawn overhead per scan.
 # Uses 'spawn' context to avoid deadlocks when forking a multi-threaded process
@@ -61,7 +188,7 @@ def _get_process_pool() -> ProcessPoolExecutor:
     return _process_pool
 
 
-def shutdown_process_pool():
+def shutdown_process_pool() -> None:
     """Shut down the shared process pool, killing child processes."""
     global _process_pool
     if _process_pool is not None:
@@ -72,7 +199,7 @@ def shutdown_process_pool():
 class DuplicateFinder:
     _BKTREE_CHUNK_SIZE = 10_000
 
-    def __init__(self, image_extensions, video_extensions):
+    def __init__(self, image_extensions: Iterable[str], video_extensions: Iterable[str]):
         self.image_extensions = image_extensions
         self.video_extensions = video_extensions
 
@@ -234,7 +361,7 @@ class DuplicateFinder:
                     logger.info("Processing videos...")
                     if progress_callback:
                         progress_callback('hashing', len(image_files), len(image_files) + len(video_files), 'Hashing videos...')
-                    video_groups = self._group_files_by_hash_with_cache(video_files, self.video_extensions, cache, progress_callback)
+                    video_groups = self._group_files_by_hash_with_cache(video_files, self.video_extensions, cache, progress_callback, is_video=True)
                 else:
                     video_groups = {}
                 
@@ -253,6 +380,11 @@ class DuplicateFinder:
                 if progress_callback:
                     progress_callback('auto_eliminating', 0, 1, 'Auto-eliminating exact matches...')
 
+                # The pass keeps the group's best twin, so it needs each
+                # group ranked; rank them all on the pool first rather than
+                # one at a time inline
+                self._prime_analyses(list(image_groups.values()) + list(video_groups.values()), cache, progress_callback)
+
                 # Process exact matches for image groups
                 if image_groups:
                     logger.info("Processing exact matches for image groups...")
@@ -263,6 +395,11 @@ class DuplicateFinder:
                     logger.info("Processing exact matches for video groups...")
                     video_groups = self._process_exact_matches_automatically(video_groups, cache, progress_callback)
 
+                # A GIF rendered from a video is never byte-identical to it, so
+                # the pass above can never reclaim one; this does.
+                if video_groups and TOMBSTONE_GIFS:
+                    video_groups = self._tombstone_gifs_automatically(video_groups, cache, progress_callback)
+
                 # Update cache with processed groups
                 cache.set_cached_groups({**image_groups, **video_groups})
                 cache.save()
@@ -271,35 +408,39 @@ class DuplicateFinder:
             # Add progress callback for final processing phase
             if progress_callback:
                 progress_callback('processing', 0, 1, 'Building final duplicate list...')
+
+            # Membership changed for any group the pass above collapsed, and a
+            # cache written before analysis existed has none at all
+            self._prime_analyses(list(image_groups.values()) + list(video_groups.values()), cache, progress_callback)
             
             # Process groups to find best files with resolution caching
-            duplicate_images = []
-            duplicate_videos = []
+            duplicate_images: list[dict[str, Any]] = []
+            duplicate_videos: list[dict[str, Any]] = []
             
             # Cache for resolution calculations to avoid repeated work
-            def get_media_meta(file_path):
+            def get_media_meta(file_path: str) -> tuple[Resolution, float]:
                 """(resolution, duration) via the persistent cache - no re-probing."""
                 return cache.get_media_metadata(file_path, self.image_extensions, self.video_extensions)
 
-            
+            # Byte identity, reported exactly as the auto-elimination pass acts
+            # on it, so the UI cannot label a file an exact match that the
+            # scanner declined to remove
+            is_byte_identical = exact_match_checker(cache)
 
-            
             # Process image groups
             total_image_groups = len([g for g in image_groups.values() if len(g) > 1])
             processed_image_groups = 0
             
             for group in image_groups.values():
                 if len(group) > 1:
-                    # Check if there's a cached best file selection for this group
+                    # Ranked by measured quality, not pixel count - see
+                    # quality_analysis. A best file chosen by hand still wins.
                     group_id = self._get_group_id(group, cache)
-                    cached_best_file = cache.get_best_file(group_id)
-                    
-                    if cached_best_file and cached_best_file in group:
-                        best_file = cached_best_file
-                        logger.debug(f"Using cached best file for group {group_id}: {best_file}")
-                    else:
-                        best_file = max(group, key=lambda x: get_media_meta(x)[0].pixel_count())
-                    
+                    analysis = analyze_group(
+                        group, cache, self.image_extensions, self.video_extensions, group_id
+                    )
+                    best_file = analysis.best_file
+                    logger.debug(f"Best image for group {group_id}: {best_file} ({analysis.best_reason})")
                     # Get metadata for best file using cache
                     best_resolution_obj, _ = get_media_meta(best_file)
                     best_size = get_file_size(best_file)
@@ -311,13 +452,9 @@ class DuplicateFinder:
                             resolution_obj, _ = get_media_meta(f)
                             size = get_file_size(f)
                             
-                            # Check if this is an exact match (same hash, resolution, file size)
-                            is_exact_match = (
-                                resolution_obj.width == best_resolution_obj.width and
-                                resolution_obj.height == best_resolution_obj.height and
-                                size == best_size
-                            )
-                            
+                            # Byte-identical, not merely same-resolution-and-size
+                            is_exact_match = is_byte_identical(f, best_file, size, best_size)
+
                             duplicate_files_with_metadata.append({
                                 'path': cache._get_relative_path(f),
                                 'resolution': {
@@ -327,7 +464,8 @@ class DuplicateFinder:
                                 },
                                 'size': size,
                                 'size_formatted': format_file_size(size),
-                                'is_exact_match': is_exact_match
+                                'is_exact_match': is_exact_match,
+                                **analysis.report_for(f)
                             })
                     
                     # Store group information in cache
@@ -335,6 +473,8 @@ class DuplicateFinder:
                     
                     duplicate_images.append({
                         'group_id': group_id,
+                        'best_reason': analysis.best_reason,
+                        'best_source': analysis.best_source,
                         'best_file': {
                             'path': cache._get_relative_path(best_file),
                             'resolution': {
@@ -343,7 +483,8 @@ class DuplicateFinder:
                                 'label': best_resolution_obj.label()
                             },
                             'size': best_size,
-                            'size_formatted': format_file_size(best_size)
+                            'size_formatted': format_file_size(best_size),
+                            **analysis.report_for(best_file)
                         },
                         'duplicate_files': duplicate_files_with_metadata
                     })
@@ -360,20 +501,12 @@ class DuplicateFinder:
             
             for group in video_groups.values():
                 if len(group) > 1:
-                    # Check if there's a cached best file selection for this group
                     group_id = self._get_group_id(group, cache)
-                    cached_best_file = cache.get_best_file(group_id)
-                    
-                    if cached_best_file and cached_best_file in group:
-                        best_file = cached_best_file
-                        logger.debug(f"Using cached best file for group {group_id}: {best_file}")
-                    else:
-                        # Use enhanced video selection logic
-                        best_file = select_best_video_from_group(
-                            group, tuple(self.video_extensions), metadata_provider=get_media_meta
-                        )
-                        logger.debug(f"Selected best video using enhanced criteria: {best_file}")
-                    
+                    analysis = analyze_group(
+                        group, cache, self.image_extensions, self.video_extensions, group_id
+                    )
+                    best_file = analysis.best_file
+                    logger.debug(f"Best video for group {group_id}: {best_file} ({analysis.best_reason})")
                     # Get metadata for best file using cache
                     best_resolution_obj, best_duration = get_media_meta(best_file)
                     best_size = get_file_size(best_file)
@@ -385,13 +518,9 @@ class DuplicateFinder:
                             resolution_obj, duration = get_media_meta(f)
                             size = get_file_size(f)
                             
-                            # Check if this is an exact match (same hash, resolution, file size)
-                            is_exact_match = (
-                                resolution_obj.width == best_resolution_obj.width and
-                                resolution_obj.height == best_resolution_obj.height and
-                                size == best_size
-                            )
-                            
+                            # Byte-identical, not merely same-resolution-and-size
+                            is_exact_match = is_byte_identical(f, best_file, size, best_size)
+
                             duplicate_files_with_metadata.append({
                                 'path': cache._get_relative_path(f),
                                 'resolution': {
@@ -403,7 +532,8 @@ class DuplicateFinder:
                                 'size_formatted': format_file_size(size),
                                 'duration': duration,
                                 'duration_formatted': f"{duration:.1f}s" if duration > 0 else "Unknown",
-                                'is_exact_match': is_exact_match
+                                'is_exact_match': is_exact_match,
+                                **analysis.report_for(f)
                             })
                     
                     # Store group information in cache
@@ -411,6 +541,8 @@ class DuplicateFinder:
                     
                     duplicate_videos.append({
                         'group_id': group_id,
+                        'best_reason': analysis.best_reason,
+                        'best_source': analysis.best_source,
                         'best_file': {
                             'path': cache._get_relative_path(best_file),
                             'resolution': {
@@ -421,7 +553,8 @@ class DuplicateFinder:
                             'size': best_size,
                             'size_formatted': format_file_size(best_size),
                             'duration': best_duration,
-                            'duration_formatted': f"{best_duration:.1f}s" if best_duration > 0 else "Unknown"
+                            'duration_formatted': f"{best_duration:.1f}s" if best_duration > 0 else "Unknown",
+                            **analysis.report_for(best_file)
                         },
                         'duplicate_files': duplicate_files_with_metadata
                     })
@@ -455,84 +588,50 @@ class DuplicateFinder:
             increment_counter('duplicate_detection_errors')
             return [], []
     
-    def _group_files_by_hash_parallel(self, file_paths, video_extensions, threshold=5):
-        """Group files by perceptual hash using parallel processing.
+    def _group_files_by_hash_with_cache(
+        self,
+        file_paths: list[str],
+        video_extensions: Iterable[str],
+        cache: HashCache,
+        progress_callback: Callable | None = None,
+        threshold: int = 5,
+        is_video: bool = False,
+    ) -> dict[str, list[str]]:
+        """Group files by perceptual hash using cache-aware parallel processing.
 
-        Uses MultiHash comparison: two files match only when both pHash
-        and dHash distances are within *threshold*.
+        *is_video* selects the clustering path: videos carry a multi-frame
+        VideoSignature and are clustered with alignment verification, images a
+        single MultiHash through the BK-tree as before.
         """
         if not file_paths:
             return {}
-
-        pool = _get_process_pool()
-        logger.info("Using persistent process pool for parallel processing")
-
-        hash_func = partial(self._get_file_hash, video_extensions=video_extensions)
-        futures = {pool.submit(hash_func, fp): fp for fp in file_paths}
-        hash_by_path = {}
-        for future in as_completed(futures):
-            fp = futures[future]
-            try:
-                hash_by_path[fp] = future.result()
-            except Exception:
-                hash_by_path[fp] = None
-
-        logger.debug("Grouping similar files (multi-hash)...")
-        groups: dict[str, list[str]] = {}
-        # Store (representative_path, representative_hash) for comparison
-        rep_hashes: list[tuple[str, Any]] = []
-
-        for file_path in file_paths:
-            file_hash = hash_by_path.get(file_path)
-            if file_hash is None:
-                continue
-
-            found_group = None
-            for rep_path, rep_hash in rep_hashes:
-                # MultiHash.__sub__ returns max(pHash_dist, dHash_dist)
-                if (file_hash - rep_hash) < threshold:
-                    found_group = rep_path
-                    break
-
-            if found_group is not None:
-                groups[found_group].append(file_path)
-            else:
-                groups[file_path] = [file_path]
-                rep_hashes.append((file_path, file_hash))
-
-        duplicate_count = len([g for g in groups.values() if len(g) > 1])
-        logger.info(f"Found {duplicate_count} duplicate groups")
-        return groups
-    
-    def _group_files_by_hash_with_cache(self, file_paths, video_extensions, cache, progress_callback=None, threshold=5):
-        """Group files by perceptual hash using cache-aware parallel processing."""
-        if not file_paths:
-            return {}
+        decode = VideoSignature.from_str if is_video else MultiHash.from_str
         
         logger.debug("Calculating hashes (using cache where possible)...")
         
         if progress_callback:
             progress_callback('hashing', 0, len(file_paths), 'Calculating hashes (using cache where possible)...')
         
-        # First, check cache for all files to identify which ones need processing
+        # First, check cache for all files to identify which ones need processing.
+        # One SELECT for the table rather than three queries per file.
         files_to_process = []
         cached_hashes = {}
         cached_files = 0
+        stored = cache.get_file_hash_rows()
         
         for cache_idx, file_path in enumerate(file_paths):
-            relative_path = cache._get_relative_path(file_path)
-            has_cached = cache.has_cached_hash(relative_path) and cache._is_file_unchanged(file_path)
+            row = stored.get(cache._get_relative_path(file_path))
+            if row is not None:
+                cached_hash_str, mtime, size = row
+                if (mtime, size) != cache._get_file_stats(file_path):
+                    row = None
 
-            if has_cached:
-                cached_hash_str = cache.get_cached_hash_str(relative_path)
-                if cached_hash_str:
-                    try:
-                        cached_hashes[file_path] = MultiHash.from_str(cached_hash_str)
-                        cached_files += 1
-                    except Exception as e:
-                        logger.warning(f"Error loading cached hash for {file_path}: {e}")
-                        files_to_process.append(file_path)
-                else:
+            if row is not None and cached_hash_str:
+                try:
+                    cached_hashes[file_path] = decode(cached_hash_str)
+                    cached_files += 1
+                except Exception as e:
+                    logger.warning(f"Error loading cached hash for {file_path}: {e}")
                     files_to_process.append(file_path)
             else:
                 files_to_process.append(file_path)
@@ -615,9 +714,13 @@ class DuplicateFinder:
         
         logger.info(f"Used {cached_files} cached hashes, calculated {len(files_to_process)} new hashes")
         
-        # Group files by similar hashes using BK-tree clustering
-        logger.debug("Grouping similar files with BK-tree...")
-        groups, duplicate_stats = self._cluster_with_bktree(all_hashes, threshold, progress_callback)
+        # Group files by similar hashes
+        if is_video:
+            logger.debug("Grouping videos by frame signature...")
+            groups, duplicate_stats = self._cluster_videos(all_hashes, threshold, progress_callback)
+        else:
+            logger.debug("Grouping similar files with BK-tree...")
+            groups, duplicate_stats = self._cluster_with_bktree(all_hashes, threshold, progress_callback)
         
         exact_duplicate_count = duplicate_stats.get("exact_groups", 0)
         similar_duplicate_groups = duplicate_stats.get("similar_groups", 0)
@@ -631,7 +734,7 @@ class DuplicateFinder:
     
     def _incremental_grouping(self, existing_image_groups: dict, existing_video_groups: dict,
                             image_files: list[str], video_files: list[str], new_files: set[str],
-                            cache, progress_callback: Callable | None = None) -> tuple[dict, dict]:
+                            cache: HashCache, progress_callback: Callable | None = None) -> tuple[dict, dict]:
         """Group newly seen files against the files already known to the cache.
 
         Builds a BK-tree over every known file - not only group representatives -
@@ -653,12 +756,17 @@ class DuplicateFinder:
         new_video_files = [f for f in new_files if any(f.lower().endswith(ext) for ext in self.video_extensions)]
         logger.info(f"New files: {len(new_image_files)} images, {len(new_video_files)} videos")
 
-        # Hash all new files
+        # Hash all new files. Videos are handled separately below: a signature is
+        # a sequence, so it cannot be packed into the single-hash BK-tree that
+        # makes the incremental image path fast.
         new_file_hashes: dict[str, Any] = {}
         for file_path in new_files:
             hash_result = cache.get_hash(file_path, set(self.video_extensions))
-            if hash_result is not None:
-                new_file_hashes[file_path] = _pack_multihash(hash_result)
+            if hash_result is None:
+                continue
+            if isinstance(hash_result, VideoSignature):
+                continue
+            new_file_hashes[file_path] = _pack_multihash(hash_result)
 
         # Create copies of existing groups
         image_groups = {k: list(v) for k, v in existing_image_groups.items()}
@@ -674,11 +782,14 @@ class DuplicateFinder:
                     file_to_group[os.path.normpath(member)] = rep_path
 
         # --- Build BK-trees over every known file, grouped or not ---
+        stored = cache.get_file_hash_rows()
+
         def _build_tree(known_files: list[str]) -> tuple[BKTree, int]:
             tree: BKTree = BKTree(_packed_distance)
             indexed = 0
             for file_path in known_files:
-                hash_str = cache.get_cached_hash_str(cache._get_relative_path(file_path))
+                row = stored.get(cache._get_relative_path(file_path))
+                hash_str = row[0] if row else None
                 if not hash_str:
                     continue
                 try:
@@ -689,19 +800,13 @@ class DuplicateFinder:
             return tree, indexed
 
         known_image_files = [f for f in image_files if os.path.normpath(f) not in new_files]
-        known_video_files = [f for f in video_files if os.path.normpath(f) not in new_files]
         image_tree, indexed_images = _build_tree(known_image_files)
-        video_tree, indexed_videos = _build_tree(known_video_files)
 
-        logger.debug(f"Built BK-trees: {indexed_images} known images, {indexed_videos} known videos")
+        logger.debug(f"Built BK-tree over {indexed_images} known images")
 
-        # --- Search the trees for each new file ---
+        # --- Search the tree for each new image ---
         for inc_idx, (file_path, file_hash) in enumerate(new_file_hashes.items()):
-            is_image = any(file_path.lower().endswith(ext) for ext in self.image_extensions)
-            groups, tree, kind = (
-                (image_groups, image_tree, 'image') if is_image
-                else (video_groups, video_tree, 'video')
-            )
+            groups, tree, kind = image_groups, image_tree, 'image'
 
             normalized = os.path.normpath(file_path)
             matches = tree.search(file_hash, threshold)
@@ -728,6 +833,24 @@ class DuplicateFinder:
             if inc_idx % 50 == 0:
                 time.sleep(0)  # release GIL for HTTP threads
 
+        # --- Videos: re-cluster from cached signatures when any video is new ---
+        # Alignment compares whole sequences, so a new video cannot simply be
+        # dropped next to its nearest neighbour the way an image can. Re-running
+        # the clustering is cheap regardless: only the new files need hashing,
+        # and every other signature is read straight from the cache.
+        if new_video_files:
+            logger.info(f"{len(new_video_files)} new video(s); re-clustering videos from cached signatures")
+            signatures: dict[str, Any] = {}
+            for file_path in video_files:
+                try:
+                    signature = cache.get_hash(file_path, set(self.video_extensions))
+                except Exception as e:
+                    logger.warning(f"Could not load signature for {file_path}: {e}")
+                    continue
+                if isinstance(signature, VideoSignature):
+                    signatures[os.path.normpath(file_path)] = signature
+            video_groups, _ = self._cluster_videos(signatures, threshold, None)
+
         # Update cache with new groups
         all_groups = {**image_groups, **video_groups}
         cache.set_cached_groups(all_groups)
@@ -736,20 +859,138 @@ class DuplicateFinder:
         return image_groups, video_groups
     
     @staticmethod
-    def _has_valid_cached_hash(file_path: str, cache) -> bool:
+    def _has_valid_cached_hash(file_path: str, cache: HashCache) -> bool:
         """Report whether the cache already holds a usable hash for this file."""
         relative_path = cache._get_relative_path(file_path)
-        return cache.has_cached_hash(relative_path) and cache._is_file_unchanged(file_path)
+        return bool(cache.has_cached_hash(relative_path) and cache._is_file_unchanged(file_path))
 
     @staticmethod
     def _get_file_hash(file_path: str, video_extensions: tuple[str, ...]) -> Any | None:
-        """Get hash for a single file - used for multiprocessing."""
+        """Get hash for a single file - used for multiprocessing.
+
+        Videos return a VideoSignature (many frames), images a MultiHash. Both
+        serialize to a single string, so the cache column is unchanged.
+        """
         try:
+            if Path(file_path).suffix.lower() in normalize_extensions(video_extensions):
+                return get_video_signature(file_path)
             return get_image_hash(file_path, video_extensions)
         except Exception as e:
             logger.error(f"Error hashing file {file_path}: {e}")
             return None
-    
+
+    def _cluster_videos(
+        self,
+        signatures: dict[str, Any],
+        threshold: int,
+        progress_callback: Callable | None,
+    ) -> tuple[dict[str, list[str]], dict[str, int]]:
+        """Cluster videos by frame signature, in two stages.
+
+        Stage 1 indexes *every* frame of every video in the BK-tree and unions
+        two videos when any single frame matches. Being over-inclusive here is
+        deliberate: a copy whose start was trimmed shares no frame *position*
+        with its source, so retrieval has to work off any frame, not a chosen one.
+
+        Stage 2 pays for that by re-checking each candidate group with the
+        aligned distance over the whole sequence, and splitting apart members
+        that do not hold up. A shared title card unions two unrelated videos in
+        stage 1 and is rejected here, which one frame alone could never do.
+        """
+        valid = {p: s for p, s in signatures.items() if s is not None and len(s) > 0}
+        empty_stats = {"exact_groups": 0, "similar_groups": 0, "total_groups": 0}
+        if not valid:
+            return {}, empty_stats
+
+        # Pack every frame once. Both stages compare hashes, and doing it here
+        # keeps stage 2 off the numpy path entirely.
+        packed_frames: dict[str, list[tuple[int, int]]] = {
+            path: [_pack_multihash(frame) for frame in signature.frames]
+            for path, signature in valid.items()
+        }
+
+        bk_tree: BKTree[Any, str] = BKTree(_packed_distance)
+        candidates = _UnionFind()
+
+        total = len(valid)
+        logger.debug(f"Clustering {total} videos by frame signature (threshold={threshold})")
+        for idx, path in enumerate(valid):
+            for packed in packed_frames[path]:
+                for match_path, _ in bk_tree.search(packed, threshold):
+                    if match_path != path:
+                        candidates.union(path, match_path)
+                bk_tree.add(packed, path)
+            if idx % 25 == 0:
+                time.sleep(0)  # release GIL for HTTP threads
+                if progress_callback:
+                    progress_callback('grouping', idx, total, f'Matching video frames {idx}/{total}')
+
+        # --- Stage 2: verify each candidate group by full-sequence alignment ---
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for path in valid:
+            grouped[candidates.find(path)].append(path)
+
+        normalized_groups: dict[str, list[str]] = {}
+        exact_groups = 0
+        similar_groups = 0
+        rejected = 0
+
+        for grp_idx, members in enumerate(grouped.values()):
+            if len(members) < 2:
+                continue
+            members.sort()
+            verified = _UnionFind()
+            for i, left in enumerate(members):
+                for right in members[i + 1:]:
+                    # Already proven equivalent through some other member, and
+                    # equivalence is transitive - skip the comparison entirely.
+                    if verified.find(left) == verified.find(right):
+                        continue
+                    if _packed_matches(
+                        packed_frames[left], packed_frames[right],
+                        SIGNATURE_MATCH_DISTANCE, SIGNATURE_MIN_OVERLAP,
+                    ):
+                        verified.union(left, right)
+                if i % 20 == 0:
+                    time.sleep(0)  # release GIL: a large candidate group is O(n^2)
+
+            subgroups: dict[str, list[str]] = defaultdict(list)
+            for member in members:
+                subgroups[verified.find(member)].append(member)
+            if len(subgroups) > 1:
+                rejected += 1
+                logger.debug(
+                    f"Split a {len(members)}-video candidate group into "
+                    f"{len(subgroups)} after alignment: shared footage was not the whole clip"
+                )
+
+            for sub in subgroups.values():
+                if len(sub) < 2:
+                    continue
+                sub.sort()
+                normalized_groups[sub[0]] = sub
+                first = valid[sub[0]]
+                if all(valid[m].frames == first.frames for m in sub[1:]):
+                    exact_groups += 1
+                else:
+                    similar_groups += 1
+
+            if grp_idx % 25 == 0:
+                time.sleep(0)  # release GIL for HTTP threads
+
+        if rejected:
+            logger.info(f"Alignment rejected {rejected} candidate video group(s) as false matches")
+        logger.debug(
+            f"Video clustering: {exact_groups} exact, {similar_groups} similar, "
+            f"{len(normalized_groups)} total groups"
+        )
+        return normalized_groups, {
+            "exact_groups": exact_groups,
+            "similar_groups": similar_groups,
+            "total_groups": len(normalized_groups),
+        }
+
+
     
     def _cluster_with_bktree(self, all_hashes: dict[str, Any], threshold: int, progress_callback: Callable | None) -> tuple[dict[str, list[str]], dict[str, int]]:
         """Cluster files using a BK-tree with chunked construction to limit memory use."""
@@ -865,7 +1106,21 @@ class DuplicateFinder:
         }
     
     
-    def _get_group_id(self, group, cache):
+    def _prime_analyses(self, groups: list[list[str]], cache: HashCache, progress_callback: Callable | None) -> None:
+        """Rank every group lacking a current analysis, fanned out on the pool."""
+        pending = [g for g in groups if len(g) > 1]
+        if not pending:
+            return
+        if progress_callback:
+            progress_callback('processing', 0, len(pending), f'Ranking {len(pending)} groups by quality...')
+        started = time.time()
+        analysed = prime_group_analyses(
+            pending, cache, self.image_extensions, self.video_extensions, executor=_get_process_pool()
+        )
+        if analysed:
+            logger.info(f"Analysed {analysed} group(s) for quality in {time.time() - started:.2f}s")
+
+    def _get_group_id(self, group: list[str], cache: HashCache) -> str:
         """Generate a consistent group ID based on the relative paths of files in the group."""
         # Use a more efficient approach with frozenset for consistent ordering
         # and avoid repeated string operations
@@ -876,7 +1131,76 @@ class DuplicateFinder:
         group_string = "|".join(sorted(relative_files))
         return hashlib.md5(group_string.encode()).hexdigest()[:8]
     
-    def _process_exact_matches_automatically(self, groups: dict[str, list[str]], cache, progress_callback: Callable | None = None) -> dict[str, list[str]]:
+    def _tombstone_gifs_automatically(self, groups: dict[str, list[str]], cache: "HashCache", progress_callback: Callable | None = None) -> dict[str, list[str]]:
+        """Replace GIFs with symlinks to the video they were rendered from.
+
+        Runs only on video groups, which by this point have survived alignment
+        verification over the whole clip - so a shared title card cannot get a
+        GIF tombstoned against footage it does not actually come from. That
+        ordering is the safety property: a single-frame match was never
+        sufficient evidence to delete anything automatically.
+
+        A group holding only GIFs is left alone; there is no better artifact to
+        point at, and choosing between equals is the user's call.
+        """
+        logger.info("Tombstoning GIFs that duplicate a video...")
+
+        def media_meta(path: str) -> tuple[Resolution, float]:
+            return cache.get_media_metadata(path, self.image_extensions, self.video_extensions)
+
+        processed_groups: dict[str, list[str]] = {}
+        tombstoned = 0
+
+        for idx, (group_id, group_files) in enumerate(groups.items(), start=1):
+            time.sleep(0)  # release GIL for HTTP threads between groups
+            gifs = [f for f in group_files if Path(f).suffix.lower() == GIF_SUFFIX]
+            others = [f for f in group_files if Path(f).suffix.lower() != GIF_SUFFIX]
+
+            if not gifs or not others:
+                processed_groups[group_id] = group_files
+                continue
+
+            if progress_callback:
+                progress_callback('auto_eliminating', idx - 1, len(groups),
+                                  f'Tombstoning GIFs in group {idx}/{len(groups)}')
+
+            keeper = select_best_video_from_group(
+                others, self.video_extensions, metadata_provider=media_meta
+            )
+
+            removed: set[str] = set()
+            for gif in gifs:
+                try:
+                    # Worth surfacing: a GIF larger than the video it came from is
+                    # unusual enough that a wrong match would most likely look
+                    # like this, and the log is the only trace afterwards.
+                    if media_meta(gif)[0].pixel_count() > media_meta(keeper)[0].pixel_count():
+                        logger.info(
+                            f"Tombstoning {os.path.basename(gif)} despite it out-resolving "
+                            f"{os.path.basename(keeper)}; the video is still the better copy"
+                        )
+
+                    if create_symlink_and_remove_duplicate(gif, keeper):
+                        removed.add(gif)
+                        tombstoned += 1
+                        cache.update_file_stats(gif)
+                        cache.remove_file_from_groups(gif)
+                        logger.info(f"Tombstoned GIF: {os.path.basename(gif)} -> {os.path.basename(keeper)}")
+                    else:
+                        logger.warning(f"Failed to tombstone GIF: {gif}")
+                except Exception as e:
+                    logger.error(f"Error tombstoning GIF {gif}: {e}")
+
+            remaining = [f for f in group_files if f not in removed]
+            if len(remaining) > 1:
+                processed_groups[group_id] = remaining
+            else:
+                logger.debug(f"Group {group_id} has no duplicates left after tombstoning GIFs")
+
+        logger.info(f"Tombstoned {tombstoned} GIF(s)")
+        return processed_groups
+
+    def _process_exact_matches_automatically(self, groups: dict[str, list[str]], cache: HashCache, progress_callback: Callable | None = None) -> dict[str, list[str]]:
         """
         Automatically process exact matches by creating symlinks and removing them from groups.
         
@@ -893,10 +1217,6 @@ class DuplicateFinder:
         if progress_callback:
             progress_callback('auto_eliminating', 0, len(groups), 'Auto-eliminating exact matches...')
         
-        def get_resolution(file_path):
-            """Resolution via the persistent cache, avoiding repeated probes."""
-            return cache.get_media_metadata(file_path, self.image_extensions, self.video_extensions)[0]
-
         processed_groups = {}
         exact_matches_processed = 0
         total_files_processed = 0
@@ -910,61 +1230,62 @@ class DuplicateFinder:
                 processed_groups[group_id] = group_files
                 continue
             
-            # Find the best file (highest resolution)
-            best_file = max(group_files, key=lambda x: get_resolution(x).pixel_count())
-            best_resolution = get_resolution(best_file)
-            best_size = get_file_size(best_file)
-            
-            # Separate exact matches from similar matches
-            exact_matches = []
-            similar_matches = []
-            
-            for file_path in group_files:
-                if file_path == best_file:
-                    continue
-                    
-                file_resolution = get_resolution(file_path)
-                file_size = get_file_size(file_path)
-                
-                # Check if this is an exact match (same hash, resolution, file size)
-                is_exact_match = (
-                    file_resolution.width == best_resolution.width and
-                    file_resolution.height == best_resolution.height and
-                    file_size == best_size
-                )
-                
-                if is_exact_match:
-                    exact_matches.append(file_path)
-                else:
-                    similar_matches.append(file_path)
-            
-            # Process exact matches automatically
-            if exact_matches:
-                logger.info(f"Found {len(exact_matches)} exact matches for group {group_id}")
-                
-                for duplicate_file in exact_matches:
-                    try:
-                        success = create_symlink_and_remove_duplicate(duplicate_file, best_file)
-                        if success:
-                            exact_matches_processed += 1
-                            total_files_processed += 1
-                            
-                            # Update cache to reflect the file deletion
-                            cache.update_file_stats(duplicate_file)
-                            cache.remove_file_from_groups(duplicate_file)
-                            
-                            logger.debug(f"Processed exact match: {duplicate_file} -> {best_file}")
-                        else:
-                            logger.warning(f"Failed to process exact match: {duplicate_file}")
-                    except Exception as e:
-                        logger.error(f"Error processing exact match {duplicate_file}: {e}")
-            
-            # Update the group - only keep the best file and similar matches
-            remaining_files = [best_file] + similar_matches
+            # Only byte-identical files may be removed automatically, so bucket
+            # the group by actual content rather than by resolution and size -
+            # distinct images do collide on those, and this branch deletes.
+            identical_sets = _identical_sets(group_files, cache)
+            if not identical_sets:
+                # Nothing to remove, and no reason to resolve a best file
+                processed_groups[group_id] = group_files
+                continue
+
+            # The group's best by measured quality (or the user's pick), so the
+            # surviving twin is the file the results will show as best
+            # Keyed by the md5 group id, not by this dict's representative
+            # path, so the verdict primed on the pool is found rather than
+            # recomputed inline
+            best_file = analyze_group(
+                group_files, cache, self.image_extensions, self.video_extensions,
+                self._get_group_id(group_files, cache),
+            ).best_file
+
+            removable: list[tuple[str, str]] = []  # (duplicate, keeper) pairs
+            for identical in identical_sets:
+                # Any member is as good as any other, they are the same bytes.
+                # Prefer the group's best file so the surviving path does not
+                # move between scans, and fall back to a deterministic pick.
+                keeper = best_file if best_file in identical else min(identical)
+                removable.extend((f, keeper) for f in identical if f != keeper)
+
+            logger.info(f"Found {len(removable)} byte-identical duplicates for group {group_id}")
+
+            removed = set()
+            for duplicate_file, keeper in removable:
+                try:
+                    success = create_symlink_and_remove_duplicate(duplicate_file, keeper)
+                    if success:
+                        exact_matches_processed += 1
+                        total_files_processed += 1
+                        removed.add(duplicate_file)
+
+                        # Update cache to reflect the file deletion
+                        cache.update_file_stats(duplicate_file)
+                        cache.remove_file_from_groups(duplicate_file)
+
+                        logger.debug(f"Processed exact match: {duplicate_file} -> {keeper}")
+                    else:
+                        logger.warning(f"Failed to process exact match: {duplicate_file}")
+                except Exception as e:
+                    logger.error(f"Error processing exact match {duplicate_file}: {e}")
+
+            # Keep everything that was not removed, original order preserved.
+            # A file that merely resembles another survives, and so does the one
+            # representative of each identical set.
+            remaining_files = [f for f in group_files if f not in removed]
             if len(remaining_files) > 1:
                 processed_groups[group_id] = remaining_files
             else:
-                # If only the best file remains, this group no longer has duplicates
+                # If only one file remains, this group no longer has duplicates
                 logger.debug(f"Group {group_id} no longer has duplicates after processing exact matches")
         
         logger.info(f"Processed {exact_matches_processed} exact matches, {total_files_processed} total files")

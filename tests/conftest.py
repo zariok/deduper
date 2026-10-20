@@ -25,8 +25,11 @@ from PIL import Image  # noqa: E402
 from deduper.utils import media  # noqa: E402
 from deduper.utils.hash_cache import close_all_caches  # noqa: E402
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp"}
-VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
+# Mirror deduper/config.py: .gif belongs to VIDEO_EXTENSIONS there, because an
+# animated gif is a clip and goes through the ffmpeg path. Classifying it as an
+# image here meant the suite exercised a rule the app does not have.
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".gif"}
 
 
 def _ffmpeg_available() -> bool:
@@ -101,6 +104,65 @@ def sample_media(tmp_path_factory) -> dict[str, str]:
         files["vid_lo"] = str(lo)
 
     return files
+
+
+@pytest.fixture(scope="session")
+def signature_media(tmp_path_factory) -> dict[str, str]:
+    """Clips exercising the multi-frame signature, built once per session.
+
+    ``testsrc`` carries a burned-in timecode, so every second looks different -
+    which is what makes a trim or a shared opening detectable at all.
+    """
+    if not _ffmpeg_available():
+        pytest.skip("ffmpeg is required for video signature fixtures")
+
+    src = tmp_path_factory.mktemp("signature_media")
+
+    def ff(*args: str) -> None:
+        subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args], check=True)
+
+    full = src / "full.mp4"
+    ff("-f", "lavfi", "-i", "testsrc=duration=30:size=640x360:rate=15", "-pix_fmt", "yuv420p", str(full))
+
+    # Same footage as a gif: lower resolution, fewer frames, 256 colours
+    ff("-i", str(full), "-vf",
+       "fps=8,scale=240:-1:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse",
+       str(src / "full.gif"))
+    # Trims: the end trim keeps t=0, the start trim moves every absolute offset
+    ff("-i", str(full), "-t", "20", "-c", "copy", str(src / "trim_end.mp4"))
+    ff("-ss", "10", "-i", str(full), "-c", "copy", str(src / "trim_start.mp4"))
+    # Under a second — unreachable by the old fixed 1s seek
+    ff("-f", "lavfi", "-i", "testsrc=duration=0.6:size=320x180:rate=15", "-pix_fmt", "yuv420p",
+       str(src / "brief.mp4"))
+    ff("-i", str(src / "brief.mp4"), "-vf", "scale=160:-1", str(src / "brief.gif"))
+    # Two clips sharing an opening then diverging: distinct footage that a
+    # single frame at t=1s cannot tell apart
+    intro = src / "intro.mp4"
+    ff("-f", "lavfi", "-i", "color=c=navy:size=640x360:duration=8:rate=15", "-pix_fmt", "yuv420p", str(intro))
+    for tag, pattern in (("share_a", "smptebars"), ("share_b", "rgbtestsrc")):
+        body = src / f"{tag}_body.mp4"
+        ff("-f", "lavfi", "-i", f"{pattern}=duration=22:size=640x360:rate=15", "-pix_fmt", "yuv420p", str(body))
+        listing = src / f"{tag}.txt"
+        listing.write_text(f"file '{intro}'\nfile '{body}'\n")
+        ff("-f", "concat", "-safe", "0", "-i", str(listing), "-c", "copy", str(src / f"{tag}.mp4"))
+
+    # Keyed by full name, not stem: full.mp4 and full.gif share a stem, and the
+    # pair being present together is the whole point of the fixture.
+    return {
+        p.name: str(p)
+        for p in src.iterdir()
+        if p.suffix in {".mp4", ".gif"} and not p.stem.endswith("_body") and p.stem != "intro"
+    }
+
+
+@pytest.fixture
+def signature_dir(tmp_path, signature_media) -> str:
+    """A throwaway copy of the signature clips; scanning mutates them."""
+    folder = tmp_path / "clips"
+    folder.mkdir()
+    for path in signature_media.values():
+        shutil.copy(path, folder / os.path.basename(path))
+    return os.path.realpath(folder)
 
 
 @pytest.fixture

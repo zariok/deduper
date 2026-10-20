@@ -148,6 +148,7 @@
         .media-detail-row {
             display: flex;
             justify-content: space-between;
+            gap: 6px;
             margin-bottom: 4px;
         }
         .media-detail-label {
@@ -155,6 +156,68 @@
         }
         .media-detail-value {
             color: #888;
+        }
+        [data-tip] {
+            cursor: help;
+        }
+        .media-detail-value[data-tip] {
+            border-bottom: 1px dotted #bbb;
+        }
+        /* Flags over the thumbnail: what was detected about this copy. The
+           text appears on hover; the card clips overflow, so it opens upward
+           over the image and stays narrower than the card. */
+        .mod-badges {
+            position: absolute;
+            top: 122px;
+            right: 5px;
+            display: flex;
+            gap: 4px;
+            z-index: 5;
+        }
+        .mod-badge {
+            position: relative;
+            background: rgba(255, 255, 255, 0.92);
+            border: 1px solid #ccc;
+            border-radius: 12px;
+            padding: 1px 6px;
+            font-size: 13px;
+            line-height: 18px;
+            cursor: help;
+        }
+        .mod-badge.penalised {
+            border-color: #dc3545;
+            background: #fff0f1;
+        }
+        /* One tooltip element on <body>, positioned with fixed coordinates:
+           the cards clip their overflow, so anything rendered inside them was
+           cropped at the image edge. */
+        .tip-float {
+            position: fixed;
+            display: none;
+            max-width: 280px;
+            background: #333;
+            color: #fff;
+            font-size: 12px;
+            line-height: 1.4;
+            padding: 8px 10px;
+            border-radius: 4px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            z-index: 1000;
+            pointer-events: none;
+            white-space: normal;
+        }
+        .best-why {
+            font-size: 14px;
+            font-weight: normal;
+            color: #888;
+            cursor: help;
+            margin-left: 4px;
+        }
+        .best-source {
+            font-size: 12px;
+            font-weight: normal;
+            color: #b8860b;
+            margin-left: 6px;
         }
         
         /* Responsive design */
@@ -775,15 +838,19 @@
                     }
                     return folderName + ' - Duplicates: ' + folderInfo.duplicate_count;
                 case 'stale':
-                    // Stale means it was complete but has changed
+                    // Stale means it was complete but the folder has changed since.
+                    // Only trust the count if the server says it was computed after
+                    // that change — e.g. we just recounted it after the user removed
+                    // duplicates. Otherwise the number predates the change and
+                    // showing it is worse than admitting we don't know.
+                    if (!folderInfo.duplicate_count_fresh) {
+                        return folderName + ' - (rescan needed)';
+                    }
                     // Hide if we know there are 0 duplicates
                     if (folderInfo.duplicate_count === 0) {
                         return null;
                     }
-                    if (folderInfo.duplicate_count > 0) {
-                        return folderName + ' - Duplicates: ' + folderInfo.duplicate_count + ' (stale)';
-                    }
-                    return folderName + ' - (rescan needed)';
+                    return folderName + ' - Duplicates: ' + folderInfo.duplicate_count;
                 case 'error':
                     return folderName + ' - (error)';
                 default:
@@ -1183,7 +1250,7 @@
                                         console.log(`Second fallback: Force loading ${stillLoadingImages2.length} remaining images`);
                                         stillLoadingImages2.forEach(img => {
                                             const src = img.getAttribute('data-src');
-                                            if (src && !loadedImages.has(src)) {
+                                            if (src && !img.dataset.queued) {
                                                 console.log(`Force loading image: ${src}`);
                                                 loadingQueue.push({ img, src });
                                             }
@@ -1595,6 +1662,81 @@
             }
         }
 
+        // Shared hover tooltip for every [data-tip] element. Lives on <body>
+        // and is positioned in viewport coordinates, so a card's overflow
+        // clipping cannot crop it; flips below the element near the top edge.
+        const tipFloat = document.createElement('div');
+        tipFloat.className = 'tip-float';
+        document.body.appendChild(tipFloat);
+
+        function showTip(target) {
+            tipFloat.textContent = target.dataset.tip;
+            tipFloat.style.display = 'block';
+            const rect = target.getBoundingClientRect();
+            const tip = tipFloat.getBoundingClientRect();
+            let left = rect.left + rect.width / 2 - tip.width / 2;
+            left = Math.max(8, Math.min(left, window.innerWidth - tip.width - 8));
+            let top = rect.top - tip.height - 8;
+            if (top < 8) top = rect.bottom + 8;
+            tipFloat.style.left = `${left}px`;
+            tipFloat.style.top = `${top}px`;
+        }
+
+        document.addEventListener('mouseover', event => {
+            const target = event.target.closest('[data-tip]');
+            if (target) showTip(target);
+        });
+        document.addEventListener('mouseout', event => {
+            const target = event.target.closest('[data-tip]');
+            if (target && !target.contains(event.relatedTarget)) tipFloat.style.display = 'none';
+        });
+        window.addEventListener('scroll', () => { tipFloat.style.display = 'none'; }, true);
+
+        function escapeAttr(text) {
+            return String(text == null ? '' : text)
+                .replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+                .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        const MODIFICATION_ICONS = { overlay: '🔤', color: '🎨', framing: '✂️' };
+
+        // Badges over the thumbnail: group-relative modifications the scanner
+        // detected (overlay, filter, framing) plus this copy's own weaknesses
+        // (soft/upscaled, heavy compression). Hover for the explanation.
+        function renderBadges(file) {
+            const badges = [];
+            (file.modifications || []).forEach(mod => {
+                const icon = MODIFICATION_ICONS[mod.kind] || '⚠️';
+                const cls = mod.penalised ? 'mod-badge penalised' : 'mod-badge';
+                badges.push(`<span class="${cls}" data-tip="${escapeAttr(mod.label + ': ' + mod.detail)}" aria-label="${escapeAttr(mod.label)}">${icon}</span>`);
+            });
+            const quality = file.quality || {};
+            if (typeof quality.detail === 'number' && quality.detail < 0.6) {
+                badges.push(`<span class="mod-badge penalised" data-tip="${escapeAttr('Low detail: ' + quality.detail_label + '. Only ~' + Math.round(quality.detail * 100) + '% of this resolution carries real picture.')}" aria-label="Low detail">🔍</span>`);
+            }
+            const q = /q≈(\d+)/.exec(quality.codec || '');
+            if (q && Number(q[1]) < 60) {
+                badges.push(`<span class="mod-badge" data-tip="${escapeAttr('Heavily compressed: ' + quality.codec)}" aria-label="Heavily compressed">🗜️</span>`);
+            }
+            return badges.length ? `<div class="mod-badges">${badges.join('')}</div>` : '';
+        }
+
+        function renderQualityRow(file) {
+            const quality = file.quality || {};
+            if (!quality.summary) return '';
+            let value;
+            if (typeof quality.effective_megapixels === 'number') {
+                value = `${quality.effective_megapixels} MP · ${quality.codec}`;
+            } else {
+                value = quality.summary;
+            }
+            return `
+                <div class="media-detail-row">
+                    <span class="media-detail-label">Quality:</span>
+                    <span class="media-detail-value" data-tip="${escapeAttr(quality.summary)}">${escapeAttr(value)}</span>
+                </div>`;
+        }
+
         // Render duplicate groups
         function renderDuplicateGroups(duplicates, type, replace = true) {
             const container = document.getElementById(`${type}-container`);
@@ -1620,13 +1762,20 @@
                 // Best file
                 const bestFile = document.createElement('div');
                 bestFile.className = 'best-file-section';
+                const bestWhy = group.best_reason
+                    ? `<span class="best-why" data-tip="${escapeAttr('Why this one: ' + group.best_reason)}">ⓘ</span>`
+                    : '';
+                const bestSource = group.best_source === 'manual'
+                    ? '<span class="best-source">your pick</span>'
+                    : '';
                 bestFile.innerHTML = `
-                    <h3>Best File:</h3>
+                    <h3>Best File:${bestWhy}${bestSource}</h3>
                     <div class="media-item">
                         <a href="${group.best_file.full}" target="_blank">
                             <div class="image-placeholder">Loading...</div>
                             <img data-src="${group.best_file.thumb}" alt="Best file">
                         </a>
+                        ${renderBadges(group.best_file)}
                         <div class="media-info">
                             <div class="media-filename">${group.best_file.full.split('/').pop()}</div>
                             <div class="media-details">
@@ -1638,6 +1787,7 @@
                                     <span class="media-detail-label">Size:</span>
                                     <span class="media-detail-value">${group.best_file.size_formatted}</span>
                                 </div>
+                                ${renderQualityRow(group.best_file)}
                             </div>
                         </div>
                         <button class="golden-heart-btn" 
@@ -1665,6 +1815,7 @@
                                         <div class="image-placeholder">Loading...</div>
                                         <img data-src="${file.thumb}" alt="Duplicate file">
                                     </a>
+                                    ${renderBadges(file)}
                                 `}
                                 <div class="media-info">
                                     <div class="media-filename">${file.full.split('/').pop()}</div>
@@ -1677,6 +1828,7 @@
                                             <span class="media-detail-label">Size:</span>
                                             <span class="media-detail-value">${file.size_formatted}</span>
                                         </div>
+                                        ${renderQualityRow(file)}
                                     </div>
                                 </div>
                                 <button class="heart-btn" 
@@ -1740,7 +1892,7 @@
                     
                     if (isVisible) {
                         // Load immediately if already visible
-                        if (src && !loadedImages.has(src)) {
+                        if (src && !img.dataset.queued) {
                             console.log(`renderDuplicateGroups: Loading immediately visible new image: ${src}`);
                             loadingQueue.push({ img, src });
                         }
@@ -2145,7 +2297,7 @@
                         
                         console.log(`Image intersecting: ${src}`);
                         
-                        if (src && !loadedImages.has(src)) {
+                        if (src && !img.dataset.queued) {
                             // Add to loading queue instead of loading immediately
                             loadingQueue.push({ img, src });
                             console.log(`Added to loading queue: ${src}`);
@@ -2192,11 +2344,14 @@
                 batch.forEach(({ img, src }, index) => {
                     console.log(`processBatch: Processing image ${index + 1}/${batch.length}: ${src}`);
                     
-                    if (loadedImages.has(src)) {
+                    // Judge the element, not the URL: a re-render creates new <img>
+                    // elements for URLs seen before, and a URL-keyed skip left
+                    // them on "Loading..." for good.
+                    if (!img.hasAttribute('data-src') || img.dataset.queued) {
                         console.log(`processBatch: Skipping already loaded image: ${src}`);
-                        return; // Skip if already loaded
+                        return;
                     }
-                    
+                    img.dataset.queued = '1';
                     loadedImages.add(src);
                     console.log(`processBatch: Loading image: ${src}`);
                     
@@ -2260,7 +2415,7 @@
                 if (isVisible) {
                     // Load immediately if already visible
                     const src = img.getAttribute('data-src');
-                    if (src && !loadedImages.has(src)) {
+                    if (src && !img.dataset.queued) {
                         console.log(`Loading immediately visible image: ${src}`);
                         loadingQueue.push({ img, src });
                     }
@@ -2292,7 +2447,7 @@
                     visibleCount++;
                     const src = img.getAttribute('data-src');
                     console.log(`Checking visible image: ${src}, already loaded: ${loadedImages.has(src)}`);
-                    if (src && !loadedImages.has(src)) {
+                    if (src && !img.dataset.queued) {
                         loadingQueue.push({ img, src });
                         console.log(`Added visible image to loading queue: ${src}`);
                     } else if (src && loadedImages.has(src)) {

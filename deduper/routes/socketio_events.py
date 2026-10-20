@@ -14,13 +14,18 @@ The server pushes:
 - ``folder_refresh``  — notification that a folder was rescanned in the background
 """
 
-from flask_socketio import emit, join_room, leave_room
+from typing import TYPE_CHECKING, Any
+
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from ..utils.logging_config import get_logger
+
+if TYPE_CHECKING:
+    from ..services.background_scanner import FolderState
 
 logger = get_logger(__name__)
 
 
-def _serialize_folder_state(state) -> dict:
+def _serialize_folder_state(state: "FolderState") -> dict[str, Any]:
     """Convert a FolderState to a JSON-serializable dict.
 
     Reusable by both the WebSocket init payload and HTTP status endpoint.
@@ -37,19 +42,26 @@ def _serialize_folder_state(state) -> dict:
         'scan_total': state.scan_total,
         'scan_message': state.scan_message,
         'duplicate_count': state.duplicate_count,
+        # True when the count was computed at or after the newest change we know
+        # about, so a stale folder can still show a number the UI just verified
+        # instead of falling back to "(rescan needed)".
+        'duplicate_count_fresh': (
+            state.duplicate_count >= 0
+            and state.duplicate_count_time >= state.last_modified_time
+        ),
     }
 
 
-def register_socketio_events(socketio):
+def register_socketio_events(socketio: SocketIO) -> None:
     """Register all Socket.IO event handlers on the given *socketio* instance."""
 
     @socketio.on("connect")
-    def handle_connect():
+    def handle_connect() -> None:
         logger.debug("WebSocket client connected")
         emit("connected", {"status": "ok"})
 
     @socketio.on("disconnect")
-    def handle_disconnect():
+    def handle_disconnect() -> None:
         logger.debug("WebSocket client disconnected")
 
     # ------------------------------------------------------------------
@@ -57,7 +69,7 @@ def register_socketio_events(socketio):
     # ------------------------------------------------------------------
 
     @socketio.on("subscribe_progress")
-    def handle_subscribe_progress(data):
+    def handle_subscribe_progress(data: dict[str, Any]) -> None:
         """Client subscribes to progress updates for a scan session.
 
         Expects ``{"session_id": "..."}``
@@ -72,7 +84,7 @@ def register_socketio_events(socketio):
             emit("subscribed", {"room": room})
 
     @socketio.on("unsubscribe_progress")
-    def handle_unsubscribe_progress(data):
+    def handle_unsubscribe_progress(data: dict[str, Any]) -> None:
         session_id = data.get("session_id")
         if session_id:
             room = f"progress:{session_id}"
@@ -84,7 +96,7 @@ def register_socketio_events(socketio):
     # ------------------------------------------------------------------
 
     @socketio.on("subscribe_scanner")
-    def handle_subscribe_scanner():
+    def handle_subscribe_scanner() -> None:
         """Client subscribes to background scanner status broadcasts.
 
         On subscribe, emits a ``scanner_init`` event with the full scanner
@@ -118,7 +130,7 @@ def register_socketio_events(socketio):
             logger.debug(f"Error sending scanner_init: {e}")
 
     @socketio.on("unsubscribe_scanner")
-    def handle_unsubscribe_scanner():
+    def handle_unsubscribe_scanner() -> None:
         leave_room("scanner")
         logger.debug("Client left scanner room")
 
@@ -127,7 +139,7 @@ def register_socketio_events(socketio):
     # ------------------------------------------------------------------
 
     @socketio.on("subscribe_folder")
-    def handle_subscribe_folder(data):
+    def handle_subscribe_folder(data: dict[str, Any]) -> None:
         """Subscribe to status changes for a specific folder."""
         folder = data.get("folder")
         if folder:
@@ -137,7 +149,7 @@ def register_socketio_events(socketio):
             emit("subscribed", {"room": room})
 
     @socketio.on("unsubscribe_folder")
-    def handle_unsubscribe_folder(data):
+    def handle_unsubscribe_folder(data: dict[str, Any]) -> None:
         folder = data.get("folder")
         if folder:
             leave_room(f"folder:{folder}")
@@ -147,7 +159,7 @@ def register_socketio_events(socketio):
     # ------------------------------------------------------------------
 
     @socketio.on("cancel_scan")
-    def handle_cancel_scan(data):
+    def handle_cancel_scan(data: dict[str, Any]) -> None:
         """Request cancellation of a running scan (placeholder for future use)."""
         session_id = data.get("session_id")
         logger.info(f"Scan cancellation requested for {session_id}")
@@ -161,7 +173,7 @@ def register_socketio_events(socketio):
 _socketio_instance = None
 
 
-def init_socketio_ref(socketio):
+def init_socketio_ref(socketio: SocketIO) -> None:
     """Store a module-level reference so helpers can emit without imports."""
     global _socketio_instance
     _socketio_instance = socketio
@@ -213,7 +225,7 @@ def emit_folder_refresh(folder_name: str) -> None:
         logger.debug(f"emit_folder_refresh error: {e}")
 
 
-def emit_folder_update(folder_name: str, state) -> None:
+def emit_folder_update(folder_name: str, state: "FolderState") -> None:
     """Push a single-folder status update to all scanner-room subscribers.
 
     Used for incremental dropdown updates — the client patches just this

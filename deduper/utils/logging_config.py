@@ -9,7 +9,7 @@ import os
 import sys
 from pathlib import Path
 # No typing imports needed - using modern Python 3.10+ syntax
-from flask import request
+from flask import Flask, Response, request
 
 
 class ColoredFormatter(logging.Formatter):
@@ -25,7 +25,7 @@ class ColoredFormatter(logging.Formatter):
         'RESET': '\033[0m'       # Reset
     }
     
-    def format(self, record):
+    def format(self, record: logging.LogRecord) -> str:
         # Add color to the level name
         if hasattr(record, 'levelname'):
             color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
@@ -35,7 +35,7 @@ class ColoredFormatter(logging.Formatter):
 
 
 def setup_logging(
-    log_level: str = None,
+    log_level: str | None = None,
     log_file: str | None = None,
     enable_console: bool = True,
     enable_colors: bool = True
@@ -54,11 +54,11 @@ def setup_logging(
     """
     # Get log level from environment or parameter
     level = log_level or os.environ.get('DEDUPER_LOG_LEVEL', 'INFO').upper()
-    log_level = getattr(logging, level, logging.INFO)
+    numeric_level: int = getattr(logging, level, logging.INFO)
     
     # Create root logger
     logger = logging.getLogger('deduper')
-    logger.setLevel(log_level)
+    logger.setLevel(numeric_level)
     
     # Clear any existing handlers
     logger.handlers.clear()
@@ -77,7 +77,7 @@ def setup_logging(
     # Console handler
     if enable_console:
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(log_level)
+        console_handler.setLevel(numeric_level)
         
         if enable_colors and sys.stdout.isatty():
             console_handler.setFormatter(ColoredFormatter(simple_formatter._fmt, simple_formatter.datefmt))
@@ -98,7 +98,7 @@ def setup_logging(
             maxBytes=10 * 1024 * 1024,  # 10MB
             backupCount=5
         )
-        file_handler.setLevel(log_level)
+        file_handler.setLevel(numeric_level)
         file_handler.setFormatter(detailed_formatter)
         logger.addHandler(file_handler)
     
@@ -121,7 +121,7 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(f'deduper.{name}')
 
 
-def configure_flask_logging(app):
+def configure_flask_logging(app: Flask) -> None:
     """
     Configure Flask application logging.
     
@@ -144,12 +144,12 @@ def configure_flask_logging(app):
     
     # Add request logging
     @app.before_request
-    def log_request_info():
+    def log_request_info() -> None:
         logger = get_logger('flask.requests')
         logger.info(f"Request: {request.method} {request.path} from {request.remote_addr}")
     
     @app.after_request
-    def log_response_info(response):
+    def log_response_info(response: Response) -> Response:
         logger = get_logger('flask.requests')
         logger.info(f"Response: {response.status_code} for {request.method} {request.path}")
         return response

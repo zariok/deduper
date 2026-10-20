@@ -7,9 +7,10 @@ import hashlib
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .logging_config import get_logger
+from .quality import QUALITY_VERSION, ImageQuality, measure_image_quality
 from .media import (
     Resolution,
     get_image_hash,
@@ -48,9 +49,7 @@ def close_hash_cache(directory_path: str) -> None:
             except Exception:
                 pass
             try:
-                if cache._conn:
-                    cache._conn.close()
-                    cache._conn = None
+                cache._close_connection()
             except Exception:
                 pass
 
@@ -64,8 +63,7 @@ def close_all_caches() -> None:
             except Exception:
                 pass
             try:
-                if cache._conn:
-                    cache._conn.close()
+                cache._close_connection()
             except Exception:
                 pass
         _cache_registry.clear()
@@ -75,7 +73,28 @@ CACHE_FILENAME = ".deduper"
 # SQLite database filename
 DB_FILENAME = ".deduper.db"
 
-CACHE_VERSION = "2.2"  # 2.2: Multi-hash (pHash+dHash); old single-hash values invalid
+# 2.3: videos store a multi-frame VideoSignature instead of one thumbnail hash.
+# Images are unaffected in form, but the version gates the whole cache, so a
+# bump re-hashes both. That is the documented cost of changing hash production.
+CACHE_VERSION = "2.3"  # 2.3: Multi-frame video signatures; 2.2 single-frame video hashes invalid
+
+
+def _digest_file(file_path: str, chunk_size: int = 1024 * 1024) -> str | None:
+    """Hash a file's bytes, or return None if it cannot be read.
+
+    blake2b rather than md5: this decides whether a file gets deleted, and it is
+    faster than md5 on 64-bit builds anyway. Read in chunks so a multi-gigabyte
+    video does not land in memory.
+    """
+    h = hashlib.blake2b(digest_size=32)
+    try:
+        with open(file_path, "rb") as fh:
+            while chunk := fh.read(chunk_size):
+                h.update(chunk)
+    except OSError as e:
+        logger.warning(f"Could not read {file_path} for content hashing: {e}")
+        return None
+    return h.hexdigest()
 
 
 def _is_old_cache_format(data: dict[str, Any]) -> bool:
@@ -95,6 +114,7 @@ class HashCache:
 
     def __init__(self, directory_path: str):
         self.directory_path = Path(directory_path).resolve()
+        self._dir_prefix = str(self.directory_path) + os.sep
         self.db_file = self.directory_path / self.DB_FILENAME
         self._conn: sqlite3.Connection | None = None
         self._lock = threading.Lock()
@@ -110,16 +130,32 @@ class HashCache:
                 f"Deleting and recreating."
             )
             try:
-                if self._conn:
-                    self._conn.close()
-                    self._conn = None
+                self._close_connection()
                 if self.db_file.exists():
                     self.db_file.unlink()
             except OSError as remove_err:
                 logger.error(f"Failed to remove corrupt DB {self.db_file}: {remove_err}")
             self._init_db()  # Retry with fresh file
 
-    def __del__(self):
+    @property
+    def _db(self) -> sqlite3.Connection:
+        """The open connection. Every query goes through here.
+
+        ``_conn`` is Optional only because closing sets it to None; a query on
+        a closed cache is a bug, and raising here names it instead of letting
+        an AttributeError on None surface somewhere in sqlite.
+        """
+        if self._conn is None:
+            raise RuntimeError(f"HashCache for {self.directory_path} is closed")
+        return self._conn
+
+    def _close_connection(self) -> None:
+        """Close the connection if open. Safe to call repeatedly."""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def __del__(self) -> None:
         """Close the SQLite connection when this object is garbage-collected.
 
         This is a safety net for HashCache instances evicted from the registry
@@ -127,17 +163,16 @@ class HashCache:
         the GC will reclaim the object and free the file descriptors.
         """
         try:
-            if self._conn:
-                self._conn.close()
+            self._close_connection()
         except Exception:
             pass
 
     def _init_db(self) -> None:
         """Create or open SQLite database and ensure schema."""
         self._conn = sqlite3.connect(str(self.db_file), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.executescript("""
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.executescript("""
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -179,18 +214,54 @@ class HashCache:
                 size INTEGER NOT NULL,
                 updated_at REAL NOT NULL
             );
+            -- Digest of the file's actual bytes. Auto-elimination deletes files,
+            -- so it needs proof of identity: a perceptual hash plus matching
+            -- resolution and size is a proxy that distinct images do collide on.
+            -- Carries its own mtime/size for the same reason media_metadata does.
+            CREATE TABLE IF NOT EXISTS content_hashes (
+                relative_path TEXT PRIMARY KEY,
+                digest TEXT NOT NULL,
+                mtime REAL NOT NULL,
+                size INTEGER NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            -- Per-file quality measurements (see utils/quality.py). Only files
+            -- that land in a duplicate group are ever measured. Rows carry the
+            -- measuring algorithm's version as well as mtime/size, so a change
+            -- to the measurement is recomputed without a CACHE_VERSION bump.
+            CREATE TABLE IF NOT EXISTS quality_metrics (
+                relative_path TEXT PRIMARY KEY,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                bandwidth REAL NOT NULL,
+                codec_quality INTEGER,
+                format TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                mtime REAL NOT NULL,
+                size INTEGER NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            -- Group-relative analysis: the chosen best file and every member's
+            -- detected modifications. Keyed on group_id, valid only while the
+            -- fingerprint (member paths, mtimes and sizes) still matches.
+            CREATE TABLE IF NOT EXISTS group_analysis (
+                group_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            );
         """)
-        self._conn.commit()
+        self._db.commit()
         # Ensure meta exists and check version for auto-invalidation
-        cur = self._conn.execute("SELECT value FROM meta WHERE key='version'")
+        cur = self._db.execute("SELECT value FROM meta WHERE key='version'")
         row = cur.fetchone()
         if row is None:
             now = time.time()
-            self._conn.executemany(
+            self._db.executemany(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
                 [("version", CACHE_VERSION), ("created", str(now)), ("last_updated", str(now))],
             )
-            self._conn.commit()
+            self._db.commit()
         elif row[0] != CACHE_VERSION:
             # Version mismatch — cache was built with different extension mappings
             # or algorithm. Invalidate hashes and grouping but keep schema.
@@ -199,18 +270,34 @@ class HashCache:
                 f"Cache version mismatch ({old_version} -> {CACHE_VERSION}) "
                 f"in {self.directory_path}, invalidating stale data"
             )
-            self._conn.execute("DELETE FROM file_hashes")
-            self._conn.execute("DELETE FROM grouping_results")
-            self._conn.execute("DELETE FROM best_files")
-            self._conn.execute("DELETE FROM groups")
+            # Only hash-derived data is invalid. best_files and groups are keyed
+            # on group_id, which _generate_group_id_from_files builds from sorted
+            # relative PATHS and never from hashes - so a change in how hashes are
+            # produced cannot invalidate a single one of those keys.
+            #
+            # Wiping them destroyed real user decisions on every algorithm bump:
+            # best_files holds the file the user chose to keep, and groups holds
+            # the processed flag marking what they had already worked through.
+            # Rows for groups whose membership genuinely changes get a new
+            # group_id and are simply never looked up again - inert, a few KB,
+            # and far cheaper than discarding the choices that still apply.
+            # invalidate_cache() still clears everything; that one is a user
+            # asking for a clean slate.
+            self._db.execute("DELETE FROM file_hashes")
+            self._db.execute("DELETE FROM grouping_results")
             now = time.time()
-            self._conn.executemany(
+            self._db.executemany(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
                 [("version", CACHE_VERSION), ("last_updated", str(now))],
             )
-            self._conn.commit()
+            self._db.commit()
 
     def _get_relative_path(self, file_path: str) -> str:
+        # Fast path: nearly every path handed in is a clean absolute path under
+        # the cache directory, and os.path.relpath (two abspath calls plus a
+        # common-prefix walk) was 40% of a warm rescan.
+        if file_path.startswith(self._dir_prefix) and os.path.normpath(file_path) == file_path:
+            return file_path[len(self._dir_prefix):]
         try:
             return os.path.relpath(file_path, self.directory_path)
         except ValueError:
@@ -229,24 +316,37 @@ class HashCache:
     def _is_file_unchanged(self, file_path: str) -> bool:
         mtime, size = self._get_file_stats(file_path)
         rel = self._get_relative_path(file_path)
-        row = self._conn.execute(
+        row = self._db.execute(
             "SELECT mtime, size FROM file_hashes WHERE relative_path = ?", (rel,)
         ).fetchone()
         if not row:
             return False
-        return row[0] == mtime and row[1] == size
+        return bool(row[0] == mtime and row[1] == size)
 
     def has_cached_hash(self, relative_path: str) -> bool:
-        row = self._conn.execute(
+        row = self._db.execute(
             "SELECT 1 FROM file_hashes WHERE relative_path = ? LIMIT 1", (relative_path,)
         ).fetchone()
         return row is not None
 
     def get_cached_hash_str(self, relative_path: str) -> str | None:
-        row = self._conn.execute(
+        row = self._db.execute(
             "SELECT hash_value FROM file_hashes WHERE relative_path = ?", (relative_path,)
         ).fetchone()
         return row[0] if row else None
+
+    def get_file_hash_rows(self) -> dict[str, tuple[str, float, int]]:
+        """Every stored hash as {relative_path: (hash_value, mtime, size)}.
+
+        One SELECT for the whole table. The hashing phase used to ask three
+        questions per file - is it cached, is it unchanged, what is the hash -
+        which at library scale is tens of thousands of round trips per rescan.
+        """
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT relative_path, hash_value, mtime, size FROM file_hashes"
+            ).fetchall()
+        return {rel: (hash_value, mtime, size) for rel, hash_value, mtime, size in rows}
 
     # Maximum rows to write per lock acquisition.  Keeps the lock held for
     # only a few milliseconds so web-request threads can interleave.
@@ -271,52 +371,62 @@ class HashCache:
         for i in range(0, len(rows), self._BATCH_CHUNK_SIZE):
             chunk = rows[i : i + self._BATCH_CHUNK_SIZE]
             with self._lock:
-                self._conn.executemany(
+                self._db.executemany(
                     """INSERT OR REPLACE INTO file_hashes
                        (relative_path, hash_value, mtime, size, updated_at) VALUES (?,?,?,?,?)""",
                     chunk,
                 )
-                self._conn.commit()
+                self._db.commit()
 
         # Final metadata update
         with self._lock:
-            self._conn.execute("UPDATE meta SET value=? WHERE key='last_updated'", (str(now),))
-            self._conn.commit()
+            self._db.execute("UPDATE meta SET value=? WHERE key='last_updated'", (str(now),))
+            self._db.commit()
 
     def get_hash(self, file_path: str, video_extensions: set) -> Any | None:
-        from .media import MultiHash
+        """Return the cached perceptual hash, computing and storing it if absent.
+
+        Videos yield a multi-frame VideoSignature, images a MultiHash; both
+        serialize to one string, so the column is shared.
+        """
+        from .media import MultiHash, VideoSignature, get_video_signature
         if not os.path.exists(file_path):
             return None
+        is_video = Path(file_path).suffix.lower() in normalize_extensions(video_extensions)
+        decode = VideoSignature.from_str if is_video else MultiHash.from_str
         rel = self._get_relative_path(file_path)
-        row = self._conn.execute(
+        row = self._db.execute(
             "SELECT hash_value, mtime, size FROM file_hashes WHERE relative_path = ?", (rel,)
         ).fetchone()
         if row:
             mtime, size = self._get_file_stats(file_path)
             if row[1] == mtime and row[2] == size:
                 try:
-                    return MultiHash.from_str(row[0])
+                    return decode(row[0])
                 except Exception as e:
                     logger.warning(f"Error converting cached hash for {file_path}: {e}")
                     return None
-        h = get_image_hash(file_path, tuple(video_extensions))
+        h = (
+            get_video_signature(file_path) if is_video
+            else get_image_hash(file_path, tuple(video_extensions))
+        )
         if h is not None:
             mtime, size = self._get_file_stats(file_path)
             with self._lock:
-                self._conn.execute(
+                self._db.execute(
                     """INSERT OR REPLACE INTO file_hashes
                        (relative_path, hash_value, mtime, size, updated_at) VALUES (?,?,?,?,?)""",
                     (rel, str(h), mtime, size, time.time()),
                 )
-                self._conn.execute("UPDATE meta SET value=? WHERE key='last_updated'", (str(time.time()),))
-                self._conn.commit()
+                self._db.execute("UPDATE meta SET value=? WHERE key='last_updated'", (str(time.time()),))
+                self._db.commit()
         return h
 
     def get_media_metadata(
         self,
         file_path: str,
-        image_extensions,
-        video_extensions,
+        image_extensions: Iterable[str],
+        video_extensions: Iterable[str],
     ) -> tuple[Resolution, float]:
         """
         Return (resolution, duration) for a media file.
@@ -337,7 +447,7 @@ class HashCache:
             if pending is not None and pending[3] == mtime and pending[4] == size:
                 return Resolution(pending[0], pending[1]), pending[2]
 
-            row = self._conn.execute(
+            row = self._db.execute(
                 "SELECT width, height, duration, mtime, size FROM media_metadata WHERE relative_path=?",
                 (rel,),
             ).fetchone()
@@ -390,61 +500,184 @@ class HashCache:
         for i in range(0, len(rows), self._BATCH_CHUNK_SIZE):
             chunk = rows[i : i + self._BATCH_CHUNK_SIZE]
             with self._lock:
-                self._conn.executemany(
+                self._db.executemany(
                     "INSERT OR REPLACE INTO media_metadata "
                     "(relative_path, width, height, duration, mtime, size, updated_at) "
                     "VALUES (?,?,?,?,?,?,?)",
                     chunk,
                 )
-                self._conn.commit()
+                self._db.commit()
+
+    def get_content_hash(self, file_path: str) -> str | None:
+        """
+        Return a digest of the file's bytes, or None if it cannot be read.
+
+        Persisted and reused while mtime and size are unchanged, so confirming a
+        duplicate costs one indexed SELECT on a warm rescan rather than a re-read.
+        Only ever called for files that already share a size with another member
+        of their group, so whole-folder scans do not read every file's contents.
+        """
+        rel = self._get_relative_path(file_path)
+        mtime, size = self._get_file_stats(file_path)
+
+        with self._lock:
+            row = self._db.execute(
+                "SELECT digest, mtime, size FROM content_hashes WHERE relative_path=?",
+                (rel,),
+            ).fetchone()
+
+        if row is not None and row[1] == mtime and row[2] == size:
+            return str(row[0])
+
+        # Read outside the lock: this walks the whole file, and every status
+        # endpoint contends on it.
+        digest = _digest_file(file_path)
+        if digest is None:
+            return None
+
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO content_hashes "
+                "(relative_path, digest, mtime, size, updated_at) VALUES (?,?,?,?,?)",
+                (rel, digest, mtime, size, time.time()),
+            )
+            self._db.commit()
+        return digest
+
+    def get_cached_image_quality(self, file_path: str) -> ImageQuality | None:
+        """Stored measurements for an unchanged file, or None. Never measures."""
+        rel = self._get_relative_path(file_path)
+        mtime, size = self._get_file_stats(file_path)
+        with self._lock:
+            row = self._db.execute(
+                "SELECT width, height, bandwidth, codec_quality, format, version, mtime, size "
+                "FROM quality_metrics WHERE relative_path=?",
+                (rel,),
+            ).fetchone()
+        if row is not None and row[5] == QUALITY_VERSION and row[6] == mtime and row[7] == size:
+            return ImageQuality(row[0], row[1], row[2], row[3], row[4], row[5])
+        return None
+
+    def set_image_quality(self, file_path: str, quality: ImageQuality) -> None:
+        rel = self._get_relative_path(file_path)
+        mtime, size = self._get_file_stats(file_path)
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO quality_metrics "
+                "(relative_path, width, height, bandwidth, codec_quality, format, version, "
+                "mtime, size, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    rel, quality.width, quality.height, quality.bandwidth,
+                    quality.codec_quality, quality.format, quality.version,
+                    mtime, size, time.time(),
+                ),
+            )
+            self._db.commit()
+
+    def get_image_quality(self, file_path: str) -> ImageQuality:
+        """
+        Return the quality measurements for an image, measuring it if needed.
+
+        Persisted and reused while mtime, size and the measuring algorithm's
+        version are unchanged. Measurement decodes the whole image, so it runs
+        outside the lock like every other probe here.
+        """
+        cached = self.get_cached_image_quality(file_path)
+        if cached is not None:
+            return cached
+        quality = measure_image_quality(file_path)
+        self.set_image_quality(file_path, quality)
+        return quality
+
+    def group_fingerprint(self, file_paths: list) -> str:
+        """Digest of the members' relative paths, mtimes and sizes.
+
+        Any edit, replacement or membership change gives a new fingerprint, so
+        a stored analysis can never describe files other than the ones present.
+        """
+        parts = []
+        for path in file_paths:
+            rel = self._get_relative_path(path)
+            mtime, size = self._get_file_stats(path)
+            parts.append(f"{rel}:{mtime}:{size}")
+        return hashlib.md5("|".join(sorted(parts)).encode()).hexdigest()
+
+    def get_group_analysis(self, group_id: str, fingerprint: str) -> dict | None:
+        """Stored analysis for a group, or None if absent or for different files."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT fingerprint, payload FROM group_analysis WHERE group_id=?",
+                (group_id,),
+            ).fetchone()
+        if row is None or row[0] != fingerprint:
+            return None
+        try:
+            payload = json.loads(row[1])
+        except (TypeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def set_group_analysis(self, group_id: str, fingerprint: str, payload: dict) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO group_analysis "
+                "(group_id, fingerprint, payload, updated_at) VALUES (?,?,?,?)",
+                (group_id, fingerprint, json.dumps(payload), time.time()),
+            )
+            self._db.commit()
 
     def update_file_stats(self, file_path: str) -> None:
         rel = self._get_relative_path(file_path)
         if os.path.exists(file_path):
             mtime, size = self._get_file_stats(file_path)
             with self._lock:
-                self._conn.execute(
+                self._db.execute(
                     "UPDATE file_hashes SET mtime=?, size=?, updated_at=? WHERE relative_path=?",
                     (mtime, size, time.time(), rel),
                 )
-                self._conn.commit()
+                self._db.commit()
         else:
             with self._lock:
-                self._conn.execute("DELETE FROM file_hashes WHERE relative_path=?", (rel,))
-                self._conn.execute("DELETE FROM media_metadata WHERE relative_path=?", (rel,))
-                self._conn.commit()
+                self._db.execute("DELETE FROM file_hashes WHERE relative_path=?", (rel,))
+                self._db.execute("DELETE FROM media_metadata WHERE relative_path=?", (rel,))
+                self._db.execute("DELETE FROM content_hashes WHERE relative_path=?", (rel,))
+                self._db.execute("DELETE FROM quality_metrics WHERE relative_path=?", (rel,))
+                self._db.commit()
                 self._pending_media_meta.pop(rel, None)
 
     def cleanup_deleted_files(self, existing_files: set) -> None:
         # Flush first, so buffered rows for now-deleted files are not resurrected
         self.flush_media_metadata()
         existing_rel = {self._get_relative_path(p) for p in existing_files}
-        cur = self._conn.execute("SELECT relative_path FROM file_hashes")
+        cur = self._db.execute("SELECT relative_path FROM file_hashes")
         to_del = [r[0] for r in cur.fetchall() if r[0] not in existing_rel]
         for rel in to_del:
             abs_path = self.directory_path / rel
             if abs_path.exists():
                 continue
-            thumb = abs_path.with_name(f"thumb-deduper.{abs_path.stem}.jpg")
-            if thumb.exists():
-                try:
-                    thumb.unlink()
-                except OSError as e:
-                    logger.warning(f"Failed to remove thumbnail {thumb}: {e}")
+            from .media import legacy_thumbnail_path_for, thumbnail_path_for
+
+            for thumb in (thumbnail_path_for(abs_path), legacy_thumbnail_path_for(abs_path)):
+                if thumb.exists():
+                    try:
+                        thumb.unlink()
+                    except OSError as e:
+                        logger.warning(f"Failed to remove thumbnail {thumb}: {e}")
         if to_del:
             del_rows = [(r,) for r in to_del]
             for i in range(0, len(del_rows), self._BATCH_CHUNK_SIZE):
                 chunk = del_rows[i : i + self._BATCH_CHUNK_SIZE]
                 with self._lock:
-                    self._conn.executemany("DELETE FROM file_hashes WHERE relative_path=?", chunk)
-                    self._conn.executemany("DELETE FROM media_metadata WHERE relative_path=?", chunk)
-                    self._conn.commit()
+                    self._db.executemany("DELETE FROM file_hashes WHERE relative_path=?", chunk)
+                    self._db.executemany("DELETE FROM media_metadata WHERE relative_path=?", chunk)
+                    self._db.executemany("DELETE FROM content_hashes WHERE relative_path=?", chunk)
+                    self._db.commit()
             logger.info(f"Cleaned up {len(to_del)} deleted files from cache")
 
     def get_cache_stats(self) -> dict[str, Any]:
         total = 0
         try:
-            total = self._conn.execute("SELECT COUNT(*) FROM file_hashes").fetchone()[0]
+            total = self._db.execute("SELECT COUNT(*) FROM file_hashes").fetchone()[0]
         except Exception:
             pass
         size_mb = 0.0
@@ -452,7 +685,7 @@ class HashCache:
             size_mb = self.db_file.stat().st_size / (1024 * 1024)
         created = 0.0
         last = 0.0
-        for row in self._conn.execute("SELECT key, value FROM meta WHERE key IN ('created','last_updated')"):
+        for row in self._db.execute("SELECT key, value FROM meta WHERE key IN ('created','last_updated')"):
             if row[0] == "created":
                 created = float(row[1])
             else:
@@ -461,7 +694,7 @@ class HashCache:
         duplicate_groups = 0
         processed_groups = 0
         remaining = 0
-        for row in self._conn.execute("SELECT rep_path, files FROM grouping_results"):
+        for row in self._db.execute("SELECT rep_path, files FROM grouping_results"):
             total_groups += 1
             try:
                 files = json.loads(row[1])
@@ -473,7 +706,7 @@ class HashCache:
                 p = self._get_absolute_path(r)
                 if os.path.exists(p) and not os.path.islink(p):
                     remaining += 1
-        for _ in self._conn.execute("SELECT 1 FROM groups WHERE processed=1"):
+        for _ in self._db.execute("SELECT 1 FROM groups WHERE processed=1"):
             processed_groups += 1
         return {
             "total_cached_files": total,
@@ -489,31 +722,29 @@ class HashCache:
     def save(self) -> None:
         self.flush_media_metadata()
         with self._lock:
-            self._conn.execute("UPDATE meta SET value=? WHERE key='last_updated'", (str(time.time()),))
-            self._conn.commit()
+            self._db.execute("UPDATE meta SET value=? WHERE key='last_updated'", (str(time.time()),))
+            self._db.commit()
 
     def force_save(self) -> None:
         self.save()
 
     def invalidate_cache(self) -> None:
         with self._lock:
-            self._conn.execute("DELETE FROM file_hashes")
-            self._conn.execute("DELETE FROM grouping_results")
-            self._conn.execute("DELETE FROM best_files")
-            self._conn.execute("DELETE FROM groups")
+            self._db.execute("DELETE FROM file_hashes")
+            self._db.execute("DELETE FROM grouping_results")
+            self._db.execute("DELETE FROM best_files")
+            self._db.execute("DELETE FROM groups")
             now = time.time()
-            self._conn.executemany(
+            self._db.executemany(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
                 [("version", CACHE_VERSION), ("created", str(now)), ("last_updated", str(now))],
             )
-            self._conn.commit()
+            self._db.commit()
         logger.info("Cache invalidated")
 
     def clear_corrupted_cache(self) -> None:
         try:
-            if self._conn:
-                self._conn.close()
-                self._conn = None
+            self._close_connection()
             if self.db_file.exists():
                 self.db_file.unlink()
         except OSError as e:
@@ -524,15 +755,15 @@ class HashCache:
     def set_best_file(self, group_id: str, best_file_path: str) -> None:
         rel = self._get_relative_path(best_file_path)
         with self._lock:
-            self._conn.execute(
+            self._db.execute(
                 "INSERT OR REPLACE INTO best_files (group_id, best_file, updated_at) VALUES (?,?,?)",
                 (group_id, rel, time.time()),
             )
-            self._conn.commit()
+            self._db.commit()
         logger.debug(f"Set best file for group {group_id}: {rel}")
 
     def get_best_file(self, group_id: str) -> str | None:
-        row = self._conn.execute(
+        row = self._db.execute(
             "SELECT best_file FROM best_files WHERE group_id=?", (group_id,)
         ).fetchone()
         if row:
@@ -540,14 +771,14 @@ class HashCache:
         return None
 
     def get_group_files(self, group_id: str) -> list:
-        row = self._conn.execute("SELECT files FROM groups WHERE group_id=?", (group_id,)).fetchone()
+        row = self._db.execute("SELECT files FROM groups WHERE group_id=?", (group_id,)).fetchone()
         if row:
             try:
                 return [self._get_absolute_path(r) for r in json.loads(row[0])]
             except Exception:
                 pass
         # Fallback: search grouping_results by building group_id from each group
-        for r in self._conn.execute("SELECT rep_path, files FROM grouping_results"):
+        for r in self._db.execute("SELECT rep_path, files FROM grouping_results"):
             try:
                 files = json.loads(r[1])
             except Exception:
@@ -563,27 +794,27 @@ class HashCache:
     def set_group_files(self, group_id: str, file_paths: list) -> None:
         rels = [self._get_relative_path(p) for p in file_paths]
         with self._lock:
-            self._conn.execute(
+            self._db.execute(
                 "INSERT OR REPLACE INTO groups (group_id, files, processed, updated_at) VALUES (?,?,0,?)",
                 (group_id, json.dumps(rels), time.time()),
             )
-            self._conn.commit()
+            self._db.commit()
 
     def mark_group_processed(self, group_id: str) -> None:
         with self._lock:
-            self._conn.execute(
+            self._db.execute(
                 "UPDATE groups SET processed=1, updated_at=? WHERE group_id=?",
                 (time.time(), group_id),
             )
-            self._conn.commit()
+            self._db.commit()
         logger.debug(f"Marked group {group_id} as processed")
 
     def get_group_ids(self) -> list[str]:
-        return [r[0] for r in self._conn.execute("SELECT group_id FROM groups").fetchall()]
+        return [r[0] for r in self._db.execute("SELECT group_id FROM groups").fetchall()]
 
     def get_cached_groups(self) -> dict:
         out = {}
-        for row in self._conn.execute("SELECT rep_path, files FROM grouping_results"):
+        for row in self._db.execute("SELECT rep_path, files FROM grouping_results"):
             try:
                 files = json.loads(row[1])
             except Exception:
@@ -603,36 +834,46 @@ class HashCache:
                 out[abs_rep] = abs_files
         return out
 
+    def count_duplicate_groups(self) -> int:
+        """Number of groups that still hold more than one real file.
+
+        Counted through get_cached_groups so symlinks and deleted paths drop out
+        exactly as they do when the folder view is rendered - the dropdown label
+        and the page the user is looking at must not disagree. read_metadata
+        counts the raw JSON instead, which is why it can report a higher number.
+        """
+        return sum(1 for files in self.get_cached_groups().values() if len(files) > 1)
+
     def set_cached_groups(self, groups: dict) -> None:
         now = time.time()
         with self._lock:
-            self._conn.execute("DELETE FROM grouping_results")
+            self._db.execute("DELETE FROM grouping_results")
             for rep, paths in groups.items():
                 rel_rep = self._get_relative_path(rep)
                 rels = [self._get_relative_path(p) for p in paths]
-                self._conn.execute(
+                self._db.execute(
                     "INSERT INTO grouping_results (rep_path, files, updated_at) VALUES (?,?,?)",
                     (rel_rep, json.dumps(rels), now),
                 )
-            self._conn.execute("UPDATE meta SET value=? WHERE key='last_updated'", (str(now),))
-            self._conn.commit()
+            self._db.execute("UPDATE meta SET value=? WHERE key='last_updated'", (str(now),))
+            self._db.commit()
         logger.debug(f"Cached {len(groups)} groups")
 
     def get_grouping_timestamp(self) -> float:
-        row = self._conn.execute("SELECT value FROM meta WHERE key='grouping_timestamp'").fetchone()
+        row = self._db.execute("SELECT value FROM meta WHERE key='grouping_timestamp'").fetchone()
         return float(row[0]) if row else 0.0
 
     def set_grouping_timestamp(self, timestamp: float) -> None:
         with self._lock:
-            self._conn.execute(
+            self._db.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('grouping_timestamp', ?)",
                 (str(timestamp),),
             )
-            self._conn.commit()
+            self._db.commit()
 
     def is_grouping_stale(self, file_paths: set) -> bool:
         cached = set()
-        for row in self._conn.execute("SELECT files FROM grouping_results"):
+        for row in self._db.execute("SELECT files FROM grouping_results"):
             try:
                 for r in json.loads(row[0]):
                     p = self._get_absolute_path(r)
@@ -644,29 +885,29 @@ class HashCache:
 
     def invalidate_grouping_cache(self) -> None:
         with self._lock:
-            self._conn.execute("DELETE FROM grouping_results")
-            self._conn.execute("DELETE FROM meta WHERE key='grouping_timestamp'")
-            self._conn.commit()
+            self._db.execute("DELETE FROM grouping_results")
+            self._db.execute("DELETE FROM meta WHERE key='grouping_timestamp'")
+            self._db.commit()
         logger.debug("Invalidated grouping cache")
 
     def remove_file_from_groups(self, file_path: str) -> None:
         rel = self._get_relative_path(file_path)
         with self._lock:
             updated = {}
-            for row in self._conn.execute("SELECT rep_path, files FROM grouping_results"):
+            for row in self._db.execute("SELECT rep_path, files FROM grouping_results"):
                 try:
                     files = [f for f in json.loads(row[1]) if f != rel]
                 except Exception:
                     continue
                 if files:
                     updated[row[0]] = files
-            self._conn.execute("DELETE FROM grouping_results")
+            self._db.execute("DELETE FROM grouping_results")
             for rep, files in updated.items():
-                self._conn.execute(
+                self._db.execute(
                     "INSERT INTO grouping_results (rep_path, files, updated_at) VALUES (?,?,?)",
                     (rep, json.dumps(files), time.time()),
                 )
-            self._conn.commit()
+            self._db.commit()
         logger.debug(f"Removed {rel} from cached groups")
 
     def _generate_group_id_from_files(self, file_paths: list) -> str:

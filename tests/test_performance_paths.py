@@ -16,10 +16,22 @@ from deduper.services.duplicate_finder import (
     DuplicateFinder,
     _pack_multihash,
     _packed_distance,
+    _packed_matches,
 )
-from deduper.utils.media import MultiHash, get_image_hash
+from deduper.utils.media import (
+    SIGNATURE_MATCH_DISTANCE,
+    SIGNATURE_MIN_OVERLAP,
+    MultiHash,
+    VideoSignature,
+    get_image_hash,
+    get_video_signature,
+)
 
-from .conftest import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, gradient_image
+from .conftest import (
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    gradient_image,
+)
 
 
 def _random_multihash(rng):
@@ -28,6 +40,75 @@ def _random_multihash(rng):
         phash=imagehash.hex_to_hash(hex_of()),
         dhash=imagehash.hex_to_hash(hex_of()),
     )
+
+
+def _random_signature(rng, length, step=5.0, shared_prefix=None):
+    """A signature of *length* frames, optionally opening with shared frames."""
+    frames = list(shared_prefix or [])
+    frames += [_random_multihash(rng) for _ in range(length - len(frames))]
+    return VideoSignature(frames=tuple(frames), step=step)
+
+
+class TestPackedSignatureMatching:
+    """_packed_matches decides which videos get grouped - and, via the GIF
+    tombstone, which files get deleted. It must agree with the reference
+    implementation on media.VideoSignature exactly, never merely usually.
+    """
+
+    def _agree(self, a, b):
+        packed_a = [_pack_multihash(f) for f in a.frames]
+        packed_b = [_pack_multihash(f) for f in b.frames]
+        fast = _packed_matches(
+            packed_a, packed_b, SIGNATURE_MATCH_DISTANCE, SIGNATURE_MIN_OVERLAP
+        )
+        return fast, a.matches(b)
+
+    def test_agrees_on_unrelated_signatures(self):
+        rng = random.Random(3)
+        for _ in range(60):
+            a = _random_signature(rng, 13)
+            b = _random_signature(rng, 13)
+            fast, reference = self._agree(a, b)
+            assert fast == reference
+
+    def test_agrees_when_one_is_a_trimmed_copy(self):
+        rng = random.Random(7)
+        for cut in (0, 1, 3, 5):
+            full = _random_signature(rng, 14)
+            trimmed = VideoSignature(frames=full.frames[cut:], step=full.step)
+            fast, reference = self._agree(full, trimmed)
+            assert fast == reference, f"disagreed on a {cut}-frame trim"
+
+    def test_agrees_when_only_an_opening_is_shared(self):
+        """The case the early-abandon prune is built for: a long shared prefix
+        followed by entirely different frames."""
+        rng = random.Random(13)
+        for prefix_len in (1, 3, 6, 9):
+            shared = [_random_multihash(rng) for _ in range(prefix_len)]
+            a = _random_signature(rng, 13, shared_prefix=shared)
+            b = _random_signature(rng, 13, shared_prefix=shared)
+            fast, reference = self._agree(a, b)
+            assert fast == reference, f"disagreed on a {prefix_len}-frame shared opening"
+
+    def test_agrees_on_identical_and_on_length_mismatch(self):
+        rng = random.Random(21)
+        a = _random_signature(rng, 12)
+        assert self._agree(a, a) == (True, True)
+
+        short = VideoSignature(frames=a.frames[:2], step=a.step)
+        fast, reference = self._agree(a, short)
+        assert fast == reference
+
+    def test_agrees_on_real_video_signatures(self, signature_dir):
+        sigs = [
+            get_video_signature(os.path.join(signature_dir, n))
+            for n in ("full.mp4", "full.gif", "trim_start.mp4", "share_a.mp4", "share_b.mp4")
+        ]
+        sigs = [s for s in sigs if s]
+        for i in range(len(sigs)):
+            for j in range(i + 1, len(sigs)):
+                fast, reference = self._agree(sigs[i], sigs[j])
+                assert fast == reference
 
 
 class TestPackedDistance:

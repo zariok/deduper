@@ -1,5 +1,6 @@
 import os
 import signal
+from types import FrameType
 import sys
 import atexit
 from flask import Flask
@@ -17,7 +18,7 @@ logger = setup_logging()
 socketio = SocketIO()
 
 
-def create_app(config_name='default'):
+def create_app(config_name: str = 'default') -> Flask:
     """Create and configure the Flask application."""
     logger.info(f"Creating Flask application with config: {config_name}")
 
@@ -65,7 +66,7 @@ def create_app(config_name='default'):
 _cleanup_done = False
 
 
-def _cleanup():
+def _cleanup() -> None:
     """Shut down background scanner, process pool, and SQLite caches."""
     global _cleanup_done
     if _cleanup_done:
@@ -90,7 +91,7 @@ def _cleanup():
     logger.info("Cleanup complete")
 
 
-def _start_background_scanner(app: Flask):
+def _start_background_scanner(app: Flask) -> None:
     """Start the background scanner service."""
     # When Flask runs with debug=True and use_reloader=True (the default),
     # it spawns two processes: a parent reloader process and a child worker.
@@ -116,7 +117,7 @@ def _start_background_scanner(app: Flask):
         atexit.register(_cleanup)
 
         # Handle SIGINT/SIGTERM so child processes are cleaned up on Ctrl+C
-        def _signal_handler(signum, frame):
+        def _signal_handler(signum: int, frame: FrameType | None) -> None:
             logger.info(f"Received signal {signum}, shutting down...")
             _cleanup()
             sys.exit(0)
