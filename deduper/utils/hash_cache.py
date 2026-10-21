@@ -258,6 +258,23 @@ class HashCache:
                 payload TEXT NOT NULL,
                 updated_at REAL NOT NULL
             );
+            -- Audit trail of what the scanner did, or would do, on its own.
+            -- applied=1 rows are files it replaced with a symlink (written
+            -- before the symlink, so a crash leaves a record); applied=0 rows
+            -- are the 'ledger' policy's dry run, rebuilt on every scan. Never
+            -- wiped by a version bump or invalidate_cache: it is history.
+            CREATE TABLE IF NOT EXISTS auto_actions (
+                id INTEGER PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                tier TEXT NOT NULL,
+                duplicate TEXT NOT NULL,
+                keeper TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                applied INTEGER NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_auto_actions_applied
+                ON auto_actions(applied, tier);
         """)
         self._db.commit()
         # Ensure meta exists and check version for auto-invalidation
@@ -982,6 +999,181 @@ class HashCache:
             self._db.commit()
         logger.debug(f"Removed {rel} from cached groups")
 
+    # --- Auto-resolve ledger (auto_actions) ---
+
+    def record_auto_action(
+        self,
+        group_id: str,
+        tier: str,
+        duplicate_abs: str,
+        keeper_abs: str,
+        evidence: dict[str, Any],
+        applied: bool,
+    ) -> int:
+        """Append one ledger row and return its id.
+
+        Callers that are about to delete write this first with applied=True
+        and downgrade it with mark_auto_action if the symlink fails.
+        """
+        with self._lock:
+            cur = self._db.execute(
+                "INSERT INTO auto_actions "
+                "(group_id, tier, duplicate, keeper, evidence, applied, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    group_id, tier,
+                    self._get_relative_path(duplicate_abs),
+                    self._get_relative_path(keeper_abs),
+                    json.dumps(evidence), int(applied), time.time(),
+                ),
+            )
+            self._db.commit()
+            row_id = cur.lastrowid
+        assert row_id is not None
+        return row_id
+
+    def mark_auto_action(
+        self, row_id: int, applied: bool, evidence_update: dict[str, Any] | None = None
+    ) -> None:
+        """Set a row's applied flag, merging *evidence_update* into its evidence."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT evidence FROM auto_actions WHERE id=?", (row_id,)
+            ).fetchone()
+            if row is None:
+                return
+            evidence = self._decode_evidence(row[0])
+            if evidence_update:
+                evidence.update(evidence_update)
+            self._db.execute(
+                "UPDATE auto_actions SET applied=?, evidence=? WHERE id=?",
+                (int(applied), json.dumps(evidence), row_id),
+            )
+            self._db.commit()
+
+    def delete_auto_action(self, row_id: int, pending_only: bool = True) -> bool:
+        """Delete one ledger row; return whether a row was removed.
+
+        By default only a pending (applied=0) row can go: dismissing a proposal
+        from the review page must never erase the history of a real deletion.
+        ``pending_only=False`` is for withdrawing a row recorded ahead of an
+        action that then did not happen.
+        """
+        query = "DELETE FROM auto_actions WHERE id=?"
+        if pending_only:
+            query += " AND applied=0"
+        with self._lock:
+            cur = self._db.execute(query, (row_id,))
+            self._db.commit()
+            return cur.rowcount > 0
+
+    def replace_pending_auto_actions(
+        self, tier: str, rows: list[tuple[str, str, str, dict[str, Any]]]
+    ) -> None:
+        """Swap every pending (applied=0) row of *tier* for *rows*, atomically.
+
+        *rows* are ``(group_id, duplicate_abs, keeper_abs, evidence)``. Ledger
+        mode calls this once per scan, so the pending rows describe what the
+        scanner would do now rather than accumulating across scans.
+        """
+        now = time.time()
+        params = [
+            (
+                group_id, tier,
+                self._get_relative_path(duplicate),
+                self._get_relative_path(keeper),
+                json.dumps(evidence), 0, now,
+            )
+            for group_id, duplicate, keeper, evidence in rows
+        ]
+        with self._lock:
+            try:
+                self._db.execute(
+                    "DELETE FROM auto_actions WHERE applied=0 AND tier=?", (tier,)
+                )
+                self._db.executemany(
+                    "INSERT INTO auto_actions "
+                    "(group_id, tier, duplicate, keeper, evidence, applied, created_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    params,
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+
+    @staticmethod
+    def _decode_evidence(raw: str) -> dict[str, Any]:
+        try:
+            evidence = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return evidence if isinstance(evidence, dict) else {}
+
+    @staticmethod
+    def _auto_action_filter(
+        applied: bool | None, tier: str | None
+    ) -> tuple[str, list[Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if applied is not None:
+            clauses.append("applied=?")
+            params.append(int(applied))
+        if tier is not None:
+            clauses.append("tier=?")
+            params.append(tier)
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    def get_auto_actions(
+        self,
+        applied: bool | None = None,
+        tier: str | None = None,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Ledger rows, newest first, with absolute paths and decoded evidence.
+
+        Each dict: id, group_id, tier, duplicate, keeper, evidence, applied
+        (bool), created_at.
+        """
+        where, params = self._auto_action_filter(applied, tier)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, group_id, tier, duplicate, keeper, evidence, applied, created_at "
+                f"FROM auto_actions{where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+        return [
+            {
+                "id": row_id,
+                "group_id": group_id,
+                "tier": row_tier,
+                "duplicate": self._get_absolute_path(duplicate),
+                "keeper": self._get_absolute_path(keeper),
+                "evidence": self._decode_evidence(evidence),
+                "applied": bool(row_applied),
+                "created_at": created_at,
+            }
+            for row_id, group_id, row_tier, duplicate, keeper, evidence, row_applied, created_at
+            in rows
+        ]
+
+    def count_auto_actions(self, applied: bool | None = None, tier: str | None = None) -> int:
+        where, params = self._auto_action_filter(applied, tier)
+        with self._lock:
+            row = self._db.execute(
+                f"SELECT COUNT(*) FROM auto_actions{where}", params
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def count_auto_actions_by_tier(self, applied: bool | None = None) -> dict[str, int]:
+        where, params = self._auto_action_filter(applied, None)
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT tier, COUNT(*) FROM auto_actions{where} GROUP BY tier", params
+            ).fetchall()
+        return {tier: int(count) for tier, count in rows}
+
     def _generate_group_id_from_files(self, file_paths: list) -> str:
         rels = sorted({self._get_relative_path(p) for p in file_paths})
         return hashlib.md5("|".join(rels).encode()).hexdigest()[:8]
@@ -990,13 +1182,15 @@ class HashCache:
     def read_metadata(folder_path: str, folder_mtime: float | None = None) -> dict[str, Any]:
         """
         Read lightweight metadata from .deduper.db without a full HashCache.
-        Returns: status ('pending'|'complete'|'stale'), last_scan_time, duplicate_count, file_count.
+        Returns: status ('pending'|'complete'|'stale'), last_scan_time, duplicate_count,
+        file_count, pending_auto_count (auto_actions rows not yet applied).
         """
         default: dict[str, Any] = {
             "status": "pending",
             "last_scan_time": 0.0,
             "duplicate_count": -1,
             "file_count": 0,
+            "pending_auto_count": 0,
         }
         db = Path(folder_path) / DB_FILENAME
         if not db.exists():
@@ -1031,11 +1225,19 @@ class HashCache:
                 except OSError:
                     folder_mtime = 0
             status = "stale" if folder_mtime > last_scan_time else "complete"
+            try:
+                pending_row = conn.execute(
+                    "SELECT COUNT(*) FROM auto_actions WHERE applied=0"
+                ).fetchone()
+                pending_auto_count = int(pending_row[0]) if pending_row else 0
+            except sqlite3.Error:
+                pending_auto_count = 0  # a database from before the ledger existed
             return {
                 "status": status,
                 "last_scan_time": last_scan_time,
                 "duplicate_count": duplicate_count,
                 "file_count": file_count,
+                "pending_auto_count": pending_auto_count,
             }
         except Exception as e:
             logger.debug(f"Could not read cache metadata for {folder_path}: {e}")

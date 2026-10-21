@@ -62,6 +62,16 @@ def _release_cache(folder_path: str) -> None:
         pass
 
 
+def _resolved_parent(path: str) -> str:
+    """*path* with its directory resolved but its last component untouched.
+
+    HashCache resolves its own directory, so a path under an unresolved
+    DATA_DIR (``/var`` vs ``/private/var``) would be stored as ``../..``.
+    Resolving the leaf too would follow a symlink to its target.
+    """
+    return os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+
+
 def _refresh_folder_duplicate_count(folder: str, cache: HashCache) -> None:
     """Push the post-edit duplicate count to the background scanner.
 
@@ -78,7 +88,11 @@ def _refresh_folder_duplicate_count(folder: str, cache: HashCache) -> None:
         scanner = get_background_scanner()
         if scanner is None:
             return
-        scanner.update_folder_duplicate_count(folder, cache.count_duplicate_groups())
+        scanner.update_folder_duplicate_count(
+            folder,
+            cache.count_duplicate_groups(),
+            cache.count_auto_actions(applied=False),
+        )
     except Exception as e:
         logger.warning(f"Failed to refresh duplicate count for {folder}: {e}")
 
@@ -320,8 +334,38 @@ def manage_duplicate() -> ResponseReturnValue:
             # Use shared helper for symlink creation (single source of truth)
             logger.debug(f"Attempting to replace duplicate: {full_file_path} -> {full_best_file_path}")
 
+            # A manual replacement deletes a file just as the auto tiers do, so
+            # it goes in the same ledger, recorded before the symlink so a crash
+            # leaves a record. Only a real file is recorded: re-pointing an
+            # existing symlink destroys nothing.
+            ledger_row: int | None = None
+            if os.path.isfile(full_file_path) and not os.path.islink(full_file_path):
+                try:
+                    ledger_cache = get_hash_cache(folder_path)
+                    ledger_row = ledger_cache.record_auto_action(
+                        str(data.get('group_id') or ''), 'manual',
+                        _resolved_parent(full_file_path),
+                        _resolved_parent(full_best_file_path),
+                        {
+                            'source': 'manage-duplicate',
+                            'duplicate_size': get_file_size(full_file_path),
+                            'keeper_size': get_file_size(full_best_file_path),
+                        },
+                        applied=True,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to record manual ledger row: {e}")
+
             success = create_symlink_and_remove_duplicate(full_file_path, full_best_file_path)
             if not success:
+                if ledger_row is not None:
+                    # Nothing was deleted; a row would claim otherwise
+                    try:
+                        get_hash_cache(folder_path).delete_auto_action(
+                            ledger_row, pending_only=False
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to withdraw manual ledger row: {e}")
                 if not os.path.exists(full_file_path):
                     return jsonify({'error': f'File not found: {file_path}'}), 404
                 return jsonify({'error': 'Failed to create symlink'}), 500
@@ -753,7 +797,8 @@ def folder_scan_status(user_folder: str) -> ResponseReturnValue:
             'error_message': state.error_message,
             'scan_progress': state.scan_progress,
             'scan_total': state.scan_total,
-            'scan_message': state.scan_message
+            'scan_message': state.scan_message,
+            'pending_auto_count': state.pending_auto_count,
         })
     except Exception as e:
         logger.error(f"Error getting folder scan status: {e}", exc_info=True)
@@ -1030,6 +1075,208 @@ def get_cached_results(user_folder: str) -> ResponseReturnValue:
     finally:
         if folder_path:
             _release_cache(folder_path)
+
+
+AUTO_RESOLVE_PAGE_SIZE = 100
+
+
+def _ledger_folder(user_folder: str) -> tuple[str, str]:
+    """Decode and validate a folder name for the auto-resolve routes.
+
+    Returns ``(decoded_name, folder_path)``; aborts 400 on anything that could
+    reach outside DATA_DIR (the same test /scan applies) and 404 when the
+    folder does not exist.
+    """
+    decoded = urllib.parse.unquote(user_folder)
+    if not decoded or '..' in decoded or '/' in decoded or '\\' in decoded:
+        logger.warning(f"Invalid folder name detected: {decoded}")
+        abort(400, description='Invalid folder name')
+    folder_path = os.path.join(Config.DATA_DIR, decoded)
+    if not os.path.isdir(folder_path):
+        abort(404, description=f'Folder not found: {decoded}')
+    return decoded, folder_path
+
+
+def _ledger_cache(folder_path: str) -> HashCache | None:
+    """The folder's cache, or None when it has never been scanned.
+
+    Viewing the ledger must not create a database in an unscanned folder.
+    """
+    if not os.path.exists(os.path.join(folder_path, HashCache.DB_FILENAME)):
+        return None
+    return get_hash_cache(folder_path)
+
+
+def _format_evidence(tier: str, evidence: dict[str, Any]) -> str:
+    """One readable line from a ledger row's evidence dict."""
+    parts: list[str] = []
+    if tier == 'gif':
+        if evidence.get('gif_width') and evidence.get('gif_height'):
+            parts.append(
+                f"GIF {evidence['gif_width']}×{evidence['gif_height']}"
+                f" {float(evidence.get('gif_duration') or 0):.1f}s"
+            )
+        if evidence.get('keeper_width') and evidence.get('keeper_height'):
+            parts.append(
+                f"video {evidence['keeper_width']}×{evidence['keeper_height']}"
+                f" {float(evidence.get('keeper_duration') or 0):.1f}s"
+            )
+        if evidence.get('verified'):
+            parts.append(f"verified by {evidence['verified']}")
+    elif evidence.get('width') and evidence.get('height'):
+        parts.append(f"{evidence['width']}×{evidence['height']}")
+    if 'phash_max' in evidence:
+        parts.append(f"pHash ≤{evidence['phash_max']}")
+    if 'dhash_max' in evidence:
+        parts.append(f"dHash ≤{evidence['dhash_max']}")
+    if tier == 'identical':
+        parts.append('byte-identical')
+    if 'keeper_size' in evidence and 'duplicate_size' in evidence:
+        parts.append(
+            f"keeper {format_file_size(int(evidence['keeper_size'] or 0))}"
+            f" vs {format_file_size(int(evidence['duplicate_size'] or 0))}"
+        )
+    elif 'size' in evidence:
+        parts.append(f"{format_file_size(int(evidence['size'] or 0))} each")
+    if 'keeper_score' in evidence and 'duplicate_score' in evidence:
+        try:
+            parts.append(
+                f"score {float(evidence['keeper_score']):.3g}"
+                f" vs {float(evidence['duplicate_score']):.3g}"
+            )
+        except (TypeError, ValueError):
+            pass
+    if evidence.get('members'):
+        parts.append(f"{evidence['members']} in group")
+    if evidence.get('source'):
+        parts.append(str(evidence['source']))
+    if evidence.get('keeper_reason'):
+        parts.append(f"\"{evidence['keeper_reason']}\"")
+    if evidence.get('error'):
+        parts.append(f"error: {evidence['error']}")
+    return ' · '.join(parts)
+
+
+def _ledger_row_view(
+    row: dict[str, Any], decoded: str, folder_real: str
+) -> dict[str, Any]:
+    """A ledger row with folder-relative paths, URLs and on-disk state."""
+    view: dict[str, Any] = {
+        'id': row['id'],
+        'group_id': row['group_id'],
+        'tier': row['tier'],
+        'applied': row['applied'],
+        'created_at': row['created_at'],
+        'evidence': row['evidence'],
+        'evidence_text': _format_evidence(row['tier'], row['evidence']),
+    }
+    for role in ('duplicate', 'keeper'):
+        abs_path: str = row[role]
+        rel = os.path.relpath(abs_path, folder_real)
+        served = f"{decoded}/{rel}"
+        if os.path.islink(abs_path):
+            state = 'symlink'
+        elif os.path.isfile(abs_path):
+            state = 'present'
+        else:
+            state = 'missing'
+        view[role] = {
+            'path': rel,
+            'name': os.path.basename(rel),
+            'state': state,
+            'is_video': any(
+                rel.lower().endswith(ext) for ext in Config.VIDEO_EXTENSIONS
+            ),
+            'full': url_for('main.serve_file', filename=served),
+            'thumb': url_for('main.serve_thumbnail', filename=served),
+        }
+    # Pending rows go stale between scans: the user may have handled the file
+    view['resolved'] = view['duplicate']['state'] != 'present'
+    view['actionable'] = (
+        not row['applied'] and not view['resolved']
+        and view['keeper']['state'] == 'present'
+    )
+    return view
+
+
+def _ledger_listing(folder_path: str, decoded: str) -> dict[str, Any]:
+    """Rows and counts for one page of the review page / its JSON twin."""
+    applied = request.args.get('applied', '0') == '1'
+    try:
+        page = max(1, int(request.args.get('page', '1')))
+    except ValueError:
+        page = 1
+    listing: dict[str, Any] = {
+        'folder': decoded,
+        'policy': Config.AUTO_RESOLVE_POLICY,
+        'applied': applied,
+        'page': page,
+        'per_page': AUTO_RESOLVE_PAGE_SIZE,
+        'total': 0,
+        'pages': 1,
+        'pending_by_tier': {},
+        'applied_by_tier': {},
+        'rows': [],
+    }
+    cache = _ledger_cache(folder_path)
+    if cache is None:
+        return listing
+    total = cache.count_auto_actions(applied=applied)
+    rows = cache.get_auto_actions(
+        applied=applied,
+        limit=AUTO_RESOLVE_PAGE_SIZE,
+        offset=(page - 1) * AUTO_RESOLVE_PAGE_SIZE,
+    )
+    folder_real = os.path.realpath(folder_path)
+    listing.update(
+        total=total,
+        pages=max(1, -(-total // AUTO_RESOLVE_PAGE_SIZE)),
+        pending_by_tier=cache.count_auto_actions_by_tier(False),
+        applied_by_tier=cache.count_auto_actions_by_tier(True),
+        rows=[_ledger_row_view(row, decoded, folder_real) for row in rows],
+    )
+    return listing
+
+
+@bp.route('/auto-resolve/<path:user_folder>.json')
+def auto_resolve_json(user_folder: str) -> ResponseReturnValue:
+    """The review page's rows as JSON: ``?applied=0|1&page=N``, 100 per page."""
+    decoded, folder_path = _ledger_folder(user_folder)
+    try:
+        return jsonify(_ledger_listing(folder_path, decoded))
+    finally:
+        _release_cache(folder_path)
+
+
+@bp.route('/auto-resolve/<path:user_folder>')
+def auto_resolve_review(user_folder: str) -> ResponseReturnValue:
+    """Review what the automatic tiers did (applied) or would do (pending)."""
+    decoded, folder_path = _ledger_folder(user_folder)
+    try:
+        listing = _ledger_listing(folder_path, decoded)
+        return render_template('auto_resolve.html', **listing)
+    finally:
+        _release_cache(folder_path)
+
+
+@bp.route('/auto-resolve/<path:user_folder>/dismiss', methods=['POST'])
+def auto_resolve_dismiss(user_folder: str) -> ResponseReturnValue:
+    """Delete one pending ledger row. Applied rows are history and stay."""
+    decoded, folder_path = _ledger_folder(user_folder)
+    try:
+        data = request.get_json(silent=True) or {}
+        raw_id: Any = data.get('id') if isinstance(data, dict) else None
+        try:
+            row_id = int(raw_id)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'A numeric row id is required'}), 400
+        cache = _ledger_cache(folder_path)
+        if cache is None or not cache.delete_auto_action(row_id):
+            return jsonify({'error': f'No pending row {row_id}'}), 404
+        _refresh_folder_duplicate_count(decoded, cache)
+        return jsonify({'dismissed': row_id})
+    finally:
+        _release_cache(folder_path)
 
 
 @bp.errorhandler(Exception)

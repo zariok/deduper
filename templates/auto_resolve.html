@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Auto-resolve: {{ folder }}</title>
+    <style>
+        /* Subset of index.html's look, copied rather than shared */
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        a { color: #007bff; }
+        .header-card, .ledger-row {
+            background-color: white;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .header-card h1 { margin: 0 0 8px 0; font-size: 24px; color: #333; }
+        .meta { font-size: 13px; color: #666; line-height: 1.6; }
+        .tabs { display: flex; gap: 8px; margin-bottom: 20px; }
+        .tab {
+            padding: 8px 16px;
+            border-radius: 5px;
+            border: 2px solid #ddd;
+            background: white;
+            color: #333;
+            text-decoration: none;
+        }
+        .tab.active { border-color: #007bff; color: #007bff; font-weight: bold; }
+        .ledger-row { display: flex; gap: 20px; align-items: flex-start; }
+        .side { flex: 0 0 260px; }
+        .side img {
+            max-width: 100%;
+            max-height: 220px;
+            border-radius: 4px;
+            display: block;
+            background: #f0f0f0;
+        }
+        .side .placeholder {
+            height: 150px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #f0f0f0;
+            color: #999;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .side-label { font-size: 12px; color: #666; margin-bottom: 4px; text-transform: uppercase; }
+        .media-filename { font-weight: bold; font-size: 14px; margin-top: 8px; color: #333; word-break: break-all; }
+        .details { flex: 1; min-width: 0; }
+        .evidence { font-size: 14px; color: #333; margin: 8px 0; line-height: 1.5; }
+        .tier {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 12px;
+            font-weight: bold;
+            background: #e9ecef;
+            color: #333;
+        }
+        .tier-identical { background: #d4edda; color: #155724; }
+        .tier-gif { background: #d1ecf1; color: #0c5460; }
+        .tier-reencode { background: #fff3cd; color: #856404; }
+        .tier-manual { background: #e2e3e5; color: #383d41; }
+        .resolved-label { color: #721c24; font-size: 13px; font-weight: bold; margin-left: 8px; }
+        .when { font-size: 12px; color: #888; }
+        .btn {
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-right: 8px;
+        }
+        .btn:disabled { opacity: 0.5; cursor: default; }
+        .btn-apply { background: #dc3545; color: white; }
+        .btn-dismiss { background: #6c757d; color: white; }
+        .row-error { color: #721c24; font-size: 13px; margin-top: 6px; }
+        .empty {
+            background-color: #fff3cd;
+            color: #856404;
+            padding: 15px;
+            border-radius: 5px;
+            border: 1px solid #ffeeba;
+        }
+        .pager { display: flex; gap: 12px; align-items: center; margin: 20px 0; }
+        @media (max-width: 700px) {
+            .ledger-row { flex-direction: column; }
+            .side { flex: none; width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    {% macro tier_counts(counts) -%}
+        {%- if counts -%}
+            {%- for tier, n in counts|dictsort %}{{ tier }} {{ n }}{% if not loop.last %}, {% endif %}{% endfor -%}
+        {%- else -%}none{%- endif -%}
+    {%- endmacro %}
+    {% set tab_query = 'applied=1' if applied else 'applied=0' %}
+
+    <div class="header-card">
+        <h1>Auto-resolve: {{ folder }}</h1>
+        <div class="meta">
+            Policy: <strong>{{ policy }}</strong><br>
+            Pending (would do): {{ tier_counts(pending_by_tier) }}<br>
+            Applied (did): {{ tier_counts(applied_by_tier) }}<br>
+            <a href="/">&larr; Back to folders</a>
+        </div>
+    </div>
+
+    <div class="tabs">
+        <a class="tab{% if not applied %} active{% endif %}" href="?applied=0">Pending</a>
+        <a class="tab{% if applied %} active{% endif %}" href="?applied=1">Applied</a>
+    </div>
+
+    <p class="meta"><span id="rowTotal">{{ total }}</span> {{ 'applied' if applied else 'pending' }} row(s){% if pages > 1 %}, page {{ page }} of {{ pages }}{% endif %}</p>
+
+    {% if not rows %}
+    <div class="empty">
+        {% if applied %}Nothing has been auto-resolved in this folder yet.{% else %}Nothing is pending: the scanner would not auto-resolve anything here.{% endif %}
+    </div>
+    {% endif %}
+
+    {% for row in rows %}
+    <div class="ledger-row" data-id="{{ row.id }}" data-duplicate="{{ row.duplicate.path }}"
+         data-keeper="{{ row.keeper.path }}" data-group="{{ row.group_id }}"
+         data-actionable="{{ '1' if row.actionable else '0' }}">
+        {% for role, label in [('duplicate', 'Duplicate'), ('keeper', 'Keeper')] %}
+        {% set f = row[role] %}
+        <div class="side">
+            <div class="side-label">{{ label }}</div>
+            {% if f.state == 'missing' %}
+            <div class="placeholder">missing</div>
+            {% elif f.is_video %}
+            <a href="{{ f.full }}" target="_blank"><img src="{{ f.thumb }}" alt="{{ f.name }}" loading="lazy"></a>
+            {% else %}
+            <a href="{{ f.full }}" target="_blank"><img src="{{ f.full }}" alt="{{ f.name }}" loading="lazy"></a>
+            {% endif %}
+            <div class="media-filename">{{ f.name }}</div>
+        </div>
+        {% endfor %}
+        <div class="details">
+            <span class="tier tier-{{ row.tier }}">{{ row.tier }}</span>
+            {% if row.resolved and not row.applied %}<span class="resolved-label">already resolved</span>{% endif %}
+            {% if row.applied and row.duplicate.state == 'missing' %}<span class="resolved-label">duplicate missing</span>{% endif %}
+            <div class="evidence">{{ row.evidence_text or 'no evidence recorded' }}</div>
+            <div class="when" data-ts="{{ row.created_at }}"></div>
+            {% if not row.applied %}
+            <div style="margin-top: 10px;">
+                <button class="btn btn-apply" {% if not row.actionable %}disabled{% endif %}>Apply</button>
+                <button class="btn btn-dismiss">Dismiss</button>
+            </div>
+            <div class="row-error"></div>
+            {% endif %}
+        </div>
+    </div>
+    {% endfor %}
+
+    {% if pages > 1 %}
+    <div class="pager">
+        {% if page > 1 %}<a href="?{{ tab_query }}&page={{ page - 1 }}">&larr; Previous</a>{% endif %}
+        <span class="meta">Page {{ page }} of {{ pages }}</span>
+        {% if page < pages %}<a href="?{{ tab_query }}&page={{ page + 1 }}">Next &rarr;</a>{% endif %}
+    </div>
+    {% endif %}
+
+    <script>
+        const FOLDER = {{ folder|tojson }};
+        const DISMISS_URL = '/auto-resolve/' + encodeURIComponent(FOLDER) + '/dismiss';
+
+        document.querySelectorAll('.when[data-ts]').forEach((el) => {
+            const ts = parseFloat(el.dataset.ts);
+            if (ts > 0) el.textContent = new Date(ts * 1000).toLocaleString();
+        });
+
+        function removeRow(row) {
+            row.remove();
+            const total = document.getElementById('rowTotal');
+            total.textContent = Math.max(0, parseInt(total.textContent, 10) - 1);
+        }
+
+        async function postJson(url, body) {
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            let data = {};
+            try { data = await response.json(); } catch (e) { /* empty body */ }
+            return { ok: response.ok, status: response.status, data };
+        }
+
+        async function dismiss(row) {
+            // 404 means the row is already gone (dismissed elsewhere or rebuilt
+            // by a scan); either way it should leave the page
+            const result = await postJson(DISMISS_URL, { id: parseInt(row.dataset.id, 10) });
+            return result.ok || result.status === 404;
+        }
+
+        document.querySelectorAll('.ledger-row').forEach((row) => {
+            const errorEl = row.querySelector('.row-error');
+            const applyBtn = row.querySelector('.btn-apply');
+            const dismissBtn = row.querySelector('.btn-dismiss');
+
+            if (applyBtn) applyBtn.addEventListener('click', async () => {
+                if (!confirm('Replace ' + row.dataset.duplicate + ' with a symlink to ' + row.dataset.keeper + '?')) return;
+                applyBtn.disabled = dismissBtn.disabled = true;
+                try {
+                    // The same request the main page's delete button sends, so
+                    // the symlink and its ledger record come from one place
+                    const result = await postJson('/manage-duplicate', {
+                        action: 'delete',
+                        file_path: row.dataset.duplicate,
+                        best_file_path: row.dataset.keeper,
+                        folder: FOLDER,
+                        group_id: row.dataset.group
+                    });
+                    if (!result.ok) throw new Error(result.data.error || ('HTTP ' + result.status));
+                    // The pending proposal is now done; drop it so it does not
+                    // linger until the next scan rebuilds the ledger
+                    await dismiss(row);
+                    removeRow(row);
+                } catch (err) {
+                    errorEl.textContent = 'Apply failed: ' + err.message;
+                    applyBtn.disabled = dismissBtn.disabled = false;
+                }
+            });
+
+            if (dismissBtn) dismissBtn.addEventListener('click', async () => {
+                dismissBtn.disabled = true;
+                if (applyBtn) applyBtn.disabled = true;
+                try {
+                    if (!(await dismiss(row))) throw new Error('server refused');
+                    removeRow(row);
+                } catch (err) {
+                    errorEl.textContent = 'Dismiss failed: ' + err.message;
+                    dismissBtn.disabled = false;
+                    if (applyBtn) applyBtn.disabled = row.dataset.actionable !== '1';
+                }
+            });
+        });
+    </script>
+</body>
+</html>

@@ -25,7 +25,12 @@ from ..utils.media import (
 from ..utils.hash_cache import HashCache, get_hash_cache
 from ..utils.logging_config import get_logger
 from ..utils.metrics import metrics, timer, increment_counter, set_gauge
-from .quality_analysis import analyze_group, exact_match_checker, prime_group_analyses
+from .quality_analysis import (
+    ANALYSIS_VERSION,
+    analyze_group,
+    exact_match_checker,
+    prime_group_analyses,
+)
 
 logger = get_logger(__name__)
 
@@ -57,6 +62,11 @@ def _packed_distance(a: tuple[int, int], b: tuple[int, int]) -> int:
 # re-download it. Set False to leave GIFs for manual review instead.
 TOMBSTONE_GIFS = True
 GIF_SUFFIX = ".gif"
+
+# The re-encode tier's bound on *each* of pHash and dHash, between every pair of
+# a group. Grouping allows 5; a re-encode of one picture lands at 0-1, while a
+# different frame of the same shoot lands at 3-5.
+REENCODE_MAX_DISTANCE = 2
 
 
 class _UnionFind:
@@ -136,6 +146,11 @@ def _packed_matches(
         else:
             return True
     return False
+
+
+def _is_real_file(path: str) -> bool:
+    """A regular file that is present and not a symlink (isfile follows links)."""
+    return os.path.isfile(path) and not os.path.islink(path)
 
 
 def _identical_sets(file_paths: list[str], cache: "HashCache") -> list[list[str]]:
@@ -315,6 +330,10 @@ class DuplicateFinder:
             # file and skipped symlinks, so filter members against it instead of
             # asking the filesystem twice per member.
             cached_groups = cache.get_cached_groups(existing=all_files)
+            # The file_hashes table as read once by the warm path, handed on to
+            # the re-encode tier so it does not read it again; None when hashes
+            # may have been written since and the tier must read it itself
+            hash_rows: dict[str, tuple[str, float, int]] | None = None
             
             if cached_groups:
                 logger.info("Found cached groups, performing incremental grouping...")
@@ -352,6 +371,8 @@ class DuplicateFinder:
                 logger.info(f"Found {len(new_files)} new or changed files since the cached scan")
                 if new_files:
                     logger.debug(f"First few new files: {list(new_files)[:3]}")
+                else:
+                    hash_rows = stored
 
                 # Perform incremental grouping
                 image_groups, video_groups = self._incremental_grouping(
@@ -441,6 +462,21 @@ class DuplicateFinder:
             # Membership changed for any group the pass above collapsed, and a
             # cache written before analysis existed has none at all
             self._prime_analyses(list(image_groups.values()) + list(video_groups.values()), cache, progress_callback)
+
+            # Re-encode tier. Runs on every scan, not only when files arrived:
+            # in ledger mode the pending rows must describe the folder as it
+            # is now, and with analyses primed above it costs dict lookups.
+            resolved = self._auto_resolve_reencodes(
+                image_groups, cache, progress_callback,
+                hash_rows=hash_rows, existing=all_files,
+            )
+            if resolved is not image_groups:
+                # Apply mode replaced files: persist the trimmed membership and
+                # rank the shrunken groups, as after the exact-match pass
+                image_groups = resolved
+                cache.set_cached_groups({**image_groups, **video_groups})
+                cache.save()
+                self._prime_analyses(list(image_groups.values()), cache, progress_callback)
             
             # Process groups to find best files with resolution caching
             duplicate_images: list[dict[str, Any]] = []
@@ -1210,19 +1246,42 @@ class DuplicateFinder:
             keeper = select_best_video_from_group(
                 others, self.video_extensions, metadata_provider=media_meta
             )
+            ledger_group_id = self._get_group_id(group_files, cache)
 
             removed: set[str] = set()
             for gif in gifs:
                 try:
+                    gif_res, gif_duration = media_meta(gif)
+                    keeper_res, keeper_duration = media_meta(keeper)
                     # Worth surfacing: a GIF larger than the video it came from is
                     # unusual enough that a wrong match would most likely look
                     # like this, and the log is the only trace afterwards.
-                    if media_meta(gif)[0].pixel_count() > media_meta(keeper)[0].pixel_count():
+                    if gif_res.pixel_count() > keeper_res.pixel_count():
                         logger.info(
                             f"Tombstoning {os.path.basename(gif)} despite it out-resolving "
                             f"{os.path.basename(keeper)}; the video is still the better copy"
                         )
 
+                    # Recorded before the symlink so a crash leaves a record.
+                    # Group membership here already survived whole-clip
+                    # alignment in _cluster_videos; that is the evidence.
+                    row_id = cache.record_auto_action(
+                        ledger_group_id, "gif", gif, keeper,
+                        {
+                            "verified": "aligned_distance",
+                            "match_distance": SIGNATURE_MATCH_DISTANCE,
+                            "members": len(group_files),
+                            "gif_width": gif_res.width,
+                            "gif_height": gif_res.height,
+                            "gif_duration": gif_duration,
+                            "keeper_width": keeper_res.width,
+                            "keeper_height": keeper_res.height,
+                            "keeper_duration": keeper_duration,
+                            "duplicate_size": cache.get_file_size(gif),
+                            "keeper_size": cache.get_file_size(keeper),
+                        },
+                        applied=True,
+                    )
                     if create_symlink_and_remove_duplicate(gif, keeper):
                         removed.add(gif)
                         tombstoned += 1
@@ -1231,6 +1290,7 @@ class DuplicateFinder:
                         cache.update_file_stats(gif)
                         logger.info(f"Tombstoned GIF: {os.path.basename(gif)} -> {os.path.basename(keeper)}")
                     else:
+                        cache.mark_auto_action(row_id, False, {"error": "symlink failed"})
                         logger.warning(f"Failed to tombstone GIF: {gif}")
                 except Exception as e:
                     logger.error(f"Error tombstoning GIF {gif}: {e}")
@@ -1243,6 +1303,226 @@ class DuplicateFinder:
 
         logger.info(f"Tombstoned {tombstoned} GIF(s)")
         return processed_groups
+
+    def _reencode_candidate(
+        self,
+        group: list[str],
+        cache: HashCache,
+        stored: dict[str, tuple[str, float, int]],
+        existing: set[str] | None = None,
+    ) -> tuple[str, str, dict[str, Any], dict[str, Any]] | None:
+        """Check one image group against the re-encode tier's guards.
+
+        Returns ``(group_id, keeper, base_evidence, payload)`` when every guard
+        holds, else None. The guards (plan 1.2 and 1.5) are deliberately far
+        stricter than the grouping threshold that put the files together:
+
+        - identical, non-zero width x height for every member, so no crop and
+          no downscale
+        - pHash <= 2 *and* dHash <= 2 between every pair (grouping allows 5),
+          from current hashes only
+        - a current group_analysis that flags no modification on any member
+        - a manual best-file pick, if any, is still a member and is the keeper
+        - every member is still a real file, not a symlink: a member of
+          *existing* (the scan's walk, which skips symlinks) when given, else
+          asked of the filesystem
+
+        Nothing here decodes an image: dimensions, hashes and the analysis all
+        come from the cache.
+        """
+        if len(group) < 2:
+            return None
+
+        dims: tuple[int, int] | None = None
+        for path in group:
+            resolution, _ = cache.get_media_metadata(
+                path, self.image_extensions, self.video_extensions
+            )
+            if resolution.width <= 0 or resolution.height <= 0:
+                return None
+            if dims is None:
+                dims = (resolution.width, resolution.height)
+            elif dims != (resolution.width, resolution.height):
+                return None
+        assert dims is not None
+
+        packed: list[tuple[int, int]] = []
+        for path in group:
+            row = stored.get(cache._get_relative_path(path))
+            if row is None or not row[0] or "|" not in row[0]:
+                # Missing, or a legacy pHash-only string: dHash was never measured
+                return None
+            if (row[1], row[2]) != cache._get_file_stats(path):
+                return None  # the hash describes an older version of the file
+            try:
+                hash_obj = MultiHash.from_str(row[0])
+            except Exception:
+                return None
+            packed.append(_pack_multihash(hash_obj))
+
+        # Separate maxima: a pair must agree on both hashes on its own terms
+        phash_max = 0
+        dhash_max = 0
+        for i, left in enumerate(packed):
+            for right in packed[i + 1:]:
+                phash_max = max(phash_max, (left[0] ^ right[0]).bit_count())
+                dhash_max = max(dhash_max, (left[1] ^ right[1]).bit_count())
+                if phash_max > REENCODE_MAX_DISTANCE or dhash_max > REENCODE_MAX_DISTANCE:
+                    return None
+
+        group_id = self._get_group_id(group, cache)
+        payload = cache.get_group_analysis(group_id, cache.group_fingerprint(group))
+        if payload is None or payload.get("version") != ANALYSIS_VERSION:
+            return None
+        members = payload.get("members")
+        if not isinstance(members, dict):
+            return None
+        for path in group:
+            report = members.get(path)
+            if not isinstance(report, dict) or report.get("modifications"):
+                return None
+
+        chosen = cache.get_best_file(group_id)
+        if chosen is not None:
+            if chosen not in group:
+                return None  # the user's pick is gone; leave the group to them
+            keeper, keeper_reason = chosen, "Chosen manually"
+        else:
+            keeper = str(payload.get("best_file", ""))
+            keeper_reason = str(payload.get("best_reason", ""))
+        if keeper not in group:
+            return None
+
+        if existing is not None:
+            if not all(path in existing for path in group):
+                return None
+        elif not all(_is_real_file(path) for path in group):
+            return None
+
+        evidence: dict[str, Any] = {
+            "phash_max": phash_max,
+            "dhash_max": dhash_max,
+            "width": dims[0],
+            "height": dims[1],
+            "keeper_reason": keeper_reason,
+            "members": len(group),
+        }
+        return group_id, keeper, evidence, members
+
+    def _auto_resolve_reencodes(
+        self,
+        groups: dict[str, list[str]],
+        cache: HashCache,
+        progress_callback: Callable | None = None,
+        hash_rows: dict[str, tuple[str, float, int]] | None = None,
+        existing: set[str] | None = None,
+    ) -> dict[str, list[str]]:
+        """The 're-encode' tier: same picture, same size, different container.
+
+        Targets the .jpg/.jpeg mixes and their kin; see _reencode_candidate for
+        the guards. What happens to a qualifying group depends on
+        Config.AUTO_RESOLVE_POLICY, read at call time:
+
+        - ``off``: nothing, not even the ledger
+        - ``ledger``: the pending 'reencode' rows are replaced with what this
+          tier would do now; no file is touched and *groups* comes back as is
+        - ``apply``: each non-keeper member is recorded, then replaced with a
+          symlink to the keeper, and dropped from its group exactly as the
+          exact-match pass does
+
+        *hash_rows* is a get_file_hash_rows() result the caller already holds
+        and knows to be current; otherwise the table is read once here.
+        *existing* is the scan's walk; see _reencode_candidate.
+
+        Returns *groups* itself when nothing was replaced, so the caller can
+        tell with an identity test whether membership changed.
+        """
+        from ..config import Config  # call-time: tests patch it, workers skip it
+
+        policy = Config.AUTO_RESOLVE_POLICY
+        if policy not in ("ledger", "apply"):
+            return groups
+
+        image_exts = normalize_extensions(self.image_extensions)
+        video_exts = normalize_extensions(self.video_extensions)
+
+        def is_image(path: str) -> bool:
+            suffix = Path(path).suffix.lower()
+            return suffix in image_exts and suffix not in video_exts
+
+        candidates = [
+            (key, members) for key, members in groups.items()
+            if len(members) > 1 and all(is_image(p) for p in members)
+        ]
+
+        rows: list[tuple[str, str, str, dict[str, Any]]] = []
+        if candidates:
+            if progress_callback:
+                progress_callback('auto_eliminating', 0, len(candidates),
+                                  'Checking groups for re-encoded copies...')
+            # Once per scan, not per group
+            stored = hash_rows if hash_rows is not None else cache.get_file_hash_rows()
+            for idx, (_, members) in enumerate(candidates):
+                if idx % 50 == 0:
+                    time.sleep(0)  # release GIL for HTTP threads
+                found = self._reencode_candidate(members, cache, stored, existing)
+                if found is None:
+                    continue
+                group_id, keeper, base, reports = found
+
+                def score(path: str) -> float:
+                    quality = reports.get(path, {}).get("quality", {})
+                    return float(quality.get("score", 0.0)) if isinstance(quality, dict) else 0.0
+
+                for duplicate in members:
+                    if duplicate == keeper:
+                        continue
+                    rows.append((group_id, duplicate, keeper, {
+                        **base,
+                        "keeper_score": score(keeper),
+                        "duplicate_score": score(duplicate),
+                        "duplicate_size": cache.get_file_size(duplicate),
+                        "keeper_size": cache.get_file_size(keeper),
+                    }))
+
+        if policy == "ledger":
+            cache.replace_pending_auto_actions("reencode", rows)
+            logger.info(f"Re-encode tier (ledger): {len(rows)} file(s) would be auto-resolved")
+            return groups
+
+        # apply: no pending rows may linger from an earlier ledger-mode scan
+        cache.replace_pending_auto_actions("reencode", [])
+        removed: set[str] = set()
+        for group_id, duplicate, keeper, evidence in rows:
+            # The walk is a snapshot; this is about to delete, so ask again
+            if not (_is_real_file(duplicate) and _is_real_file(keeper)):
+                logger.warning(f"Skipping re-encode {duplicate}: it or its keeper changed")
+                continue
+            try:
+                row_id = cache.record_auto_action(
+                    group_id, "reencode", duplicate, keeper, evidence, applied=True
+                )
+                if create_symlink_and_remove_duplicate(duplicate, keeper):
+                    removed.add(duplicate)
+                    cache.update_file_stats(duplicate)
+                    logger.debug(f"Auto-resolved re-encode: {duplicate} -> {keeper}")
+                else:
+                    cache.mark_auto_action(row_id, False, {"error": "symlink failed"})
+                    logger.warning(f"Failed to auto-resolve re-encode: {duplicate}")
+            except Exception as e:
+                logger.error(f"Error auto-resolving re-encode {duplicate}: {e}")
+        logger.info(f"Re-encode tier (apply): replaced {len(removed)} of {len(rows)} file(s)")
+        if not removed:
+            return groups
+
+        processed: dict[str, list[str]] = {}
+        for key, members in groups.items():
+            remaining = [f for f in members if f not in removed]
+            if len(remaining) > 1:
+                processed[key] = remaining
+            else:
+                logger.debug(f"Group {key} no longer has duplicates after re-encode tier")
+        return processed
 
     def _process_exact_matches_automatically(self, groups: dict[str, list[str]], cache: HashCache, progress_callback: Callable | None = None) -> dict[str, list[str]]:
         """
@@ -1288,9 +1568,10 @@ class DuplicateFinder:
             # Keyed by the md5 group id, not by this dict's representative
             # path, so the verdict primed on the pool is found rather than
             # recomputed inline
+            ledger_group_id = self._get_group_id(group_files, cache)
             best_file = analyze_group(
                 group_files, cache, self.image_extensions, self.video_extensions,
-                self._get_group_id(group_files, cache),
+                ledger_group_id,
             ).best_file
 
             removable: list[tuple[str, str]] = []  # (duplicate, keeper) pairs
@@ -1306,6 +1587,17 @@ class DuplicateFinder:
             removed = set()
             for duplicate_file, keeper in removable:
                 try:
+                    # Recorded before the symlink so a crash leaves a record.
+                    # The digest was read (and cached) by _identical_sets; it
+                    # is fetched before update_file_stats drops the dup's row.
+                    evidence: dict[str, Any] = {"size": cache.get_file_size(keeper)}
+                    digest = cache.get_content_hash(keeper)
+                    if digest is not None:
+                        evidence["digest"] = digest
+                    row_id = cache.record_auto_action(
+                        ledger_group_id, "identical", duplicate_file, keeper,
+                        evidence, applied=True,
+                    )
                     success = create_symlink_and_remove_duplicate(duplicate_file, keeper)
                     if success:
                         exact_matches_processed += 1
@@ -1320,6 +1612,7 @@ class DuplicateFinder:
 
                         logger.debug(f"Processed exact match: {duplicate_file} -> {keeper}")
                     else:
+                        cache.mark_auto_action(row_id, False, {"error": "symlink failed"})
                         logger.warning(f"Failed to process exact match: {duplicate_file}")
                 except Exception as e:
                     logger.error(f"Error processing exact match {duplicate_file}: {e}")

@@ -42,6 +42,8 @@ def _serialize_folder_state(state: "FolderState") -> dict[str, Any]:
         'scan_total': state.scan_total,
         'scan_message': state.scan_message,
         'duplicate_count': state.duplicate_count,
+        # Files the auto-resolve tiers would replace (ledger rows not applied)
+        'pending_auto_count': state.pending_auto_count,
         # True when the count was computed at or after the newest change we know
         # about, so a stale folder can still show a number the UI just verified
         # instead of falling back to "(rescan needed)".

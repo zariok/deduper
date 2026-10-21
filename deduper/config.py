@@ -2,7 +2,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 if TYPE_CHECKING:
     from flask import Flask
@@ -29,6 +29,35 @@ def env_positive_int(name: str, default: int) -> int:
         _logger.warning("Ignoring %s=%r: must be positive; using %d", name, raw, default)
         return default
     return value
+
+
+def env_choice(name: str, choices: Iterable[str], default: str) -> str:
+    """Read one of *choices* from environment variable *name*, case-insensitively.
+
+    Unset or blank yields *default*. Anything else not in *choices* also yields
+    *default*, with a warning - the same contract as env_positive_int, so a typo
+    degrades to the stock behaviour rather than stopping the app.
+    """
+    allowed = {c.lower() for c in choices}
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value not in allowed:
+        _logger.warning(
+            "Ignoring %s=%r: expected one of %s; using %r",
+            name, raw, "|".join(sorted(allowed)), default,
+        )
+        return default
+    return value
+
+
+# What the automatic tiers beyond byte identity may do (see
+# docs/OPTIMIZATION_AND_NATIVE_CORE_PLAN.md 1.1). 'off' skips them, 'ledger'
+# records what they would do in the auto_actions table without touching a file,
+# 'apply' replaces the duplicates with symlinks. The byte-identical and GIF
+# passes are proven and are not governed by this; they only log to the ledger.
+AUTO_RESOLVE_POLICIES = ("off", "ledger", "apply")
 
 
 def default_hash_workers() -> int:
@@ -69,6 +98,10 @@ class Config:
     HASH_WORKERS = env_positive_int('DEDUPER_HASH_WORKERS', default_hash_workers())
     FFMPEG_WORKERS = env_positive_int('DEDUPER_FFMPEG_WORKERS', 8)
     SCAN_WORKERS = env_positive_int('DEDUPER_SCAN_WORKERS', 4)
+
+    # off | ledger | apply - see AUTO_RESOLVE_POLICIES. Defaults to ledger so
+    # precision can be measured on the real corpus before anything is deleted.
+    AUTO_RESOLVE_POLICY = env_choice('DEDUPER_AUTO_RESOLVE', AUTO_RESOLVE_POLICIES, 'ledger')
 
     # Supported file extensions
     # NOTE: .gif is classified as video because animated GIFs are temporal media.

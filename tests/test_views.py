@@ -110,6 +110,57 @@ def idle_scanner(monkeypatch):
     return _install
 
 
+class TestPendingAutoCount:
+    """The ledger's pending count rides along with duplicate_count, so the UI
+    can show "would auto-resolve: N" per folder from the status endpoints."""
+
+    def _scanned(self, client, reencode_dir, idle_scanner, monkeypatch):
+        monkeypatch.setattr(Config, "AUTO_RESOLVE_POLICY", "ledger")
+        http, data_dir = client
+        folder = populate(data_dir, reencode_dir)
+        DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS).find_duplicates(folder)
+        return http, folder, idle_scanner(data_dir)
+
+    def test_discovery_seeds_it_from_the_cache(self, client, reencode_dir, idle_scanner, monkeypatch):
+        _, _, scanner = self._scanned(client, reencode_dir, idle_scanner, monkeypatch)
+        assert scanner.get_folder_status("photos").pending_auto_count == 1
+
+    def test_status_endpoints_report_it(self, client, reencode_dir, idle_scanner, monkeypatch):
+        http, _, _ = self._scanned(client, reencode_dir, idle_scanner, monkeypatch)
+        folders = http.get("/scanner/status").get_json()["folders"]
+        assert folders["photos"]["pending_auto_count"] == 1
+        status = http.get("/scanner/folder/photos/status").get_json()
+        assert status["pending_auto_count"] == 1
+
+    def test_refresh_after_management_recounts_it(self, client, reencode_dir, idle_scanner, monkeypatch):
+        http, folder, scanner = self._scanned(client, reencode_dir, idle_scanner, monkeypatch)
+        state = scanner.get_folder_status("photos")
+        state.pending_auto_count = 99
+
+        from deduper.routes.views import _refresh_folder_duplicate_count
+        from deduper.utils.hash_cache import get_hash_cache
+
+        _refresh_folder_duplicate_count("photos", get_hash_cache(folder))
+        assert state.pending_auto_count == 1
+
+    def test_a_folder_scanned_before_the_ledger_reads_zero(self, client, images_only_dir, idle_scanner):
+        """A database without the auto_actions table must not break discovery."""
+        import sqlite3
+
+        http, data_dir = client
+        folder = populate(data_dir, images_only_dir)
+        DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS).find_duplicates(folder)
+        from deduper.utils.hash_cache import close_all_caches
+
+        close_all_caches()
+        with sqlite3.connect(os.path.join(folder, ".deduper.db")) as conn:
+            conn.execute("DROP TABLE auto_actions")
+        scanner = idle_scanner(data_dir)
+        state = scanner.get_folder_status("photos")
+        assert state.pending_auto_count == 0
+        assert state.duplicate_count >= 1
+
+
 class TestDuplicateCountAfterManagement:
     """Removing duplicates has to move the dropdown count immediately.
 
@@ -418,3 +469,153 @@ class TestImageThumbnails:
         with open(os.path.join(folder, "thumb.big.jpg"), "rb") as handle:
             assert response.data == handle.read()
         assert not os.path.exists(os.path.join(folder, "thumb-deduper.big.jpg.jpg"))
+
+
+class TestAutoResolveReview:
+    """The review page for the auto-resolve ledger and its JSON twin."""
+
+    def _ledger(self, data_dir, tmp_path, rows=1, tier="reencode"):
+        """A folder with two real images and *rows* pending ledger rows."""
+        from deduper.utils.hash_cache import get_hash_cache
+
+        from .test_quality import textured_image
+
+        source = tmp_path / "src"
+        source.mkdir()
+        textured_image(320, 240).save(source / "keep.png")
+        textured_image(320, 240).save(source / "dup.jpg", quality=95)
+        folder = populate(data_dir, str(source))
+        cache = get_hash_cache(folder)
+        evidence = {
+            "phash_max": 1, "dhash_max": 0, "width": 64, "height": 48,
+            "keeper_score": 2.0, "duplicate_score": 1.5,
+            "keeper_reason": "Highest measured quality", "members": 2,
+            "duplicate_size": 1500, "keeper_size": 2_200_000,
+        }
+        ids = [
+            cache.record_auto_action(
+                "g1", tier,
+                os.path.join(folder, "dup.jpg"), os.path.join(folder, "keep.png"),
+                evidence, applied=False,
+            )
+            for _ in range(rows)
+        ]
+        return folder, cache, ids
+
+    def test_renders_with_no_rows(self, client, tmp_path):
+        http, data_dir = client
+        os.mkdir(os.path.join(data_dir, "photos"))
+        response = http.get("/auto-resolve/photos")
+        assert response.status_code == 200
+        assert b"Auto-resolve: photos" in response.data
+        assert b"Nothing is pending" in response.data
+        # An unscanned folder must not get a database just for being viewed
+        assert not os.path.exists(os.path.join(data_dir, "photos", ".deduper.db"))
+
+    def test_renders_a_pending_reencode_row(self, client, tmp_path):
+        http, data_dir = client
+        self._ledger(data_dir, tmp_path)
+        response = http.get("/auto-resolve/photos")
+        assert response.status_code == 200
+        page = response.get_data(as_text=True)
+        assert "dup.jpg" in page and "keep.png" in page
+        assert "tier-reencode" in page
+        assert "64×48 · pHash ≤1 · dHash ≤0" in page
+        assert "/data/photos/dup.jpg" in page
+        assert "Highest measured quality" in page
+        assert "Apply</button>" in page and "Dismiss</button>" in page
+        assert "already resolved" not in page
+
+    def test_a_row_whose_duplicate_is_gone_still_renders(self, client, tmp_path):
+        http, data_dir = client
+        folder, _, _ = self._ledger(data_dir, tmp_path)
+        os.remove(os.path.join(folder, "dup.jpg"))
+        response = http.get("/auto-resolve/photos")
+        assert response.status_code == 200
+        assert "already resolved" in response.get_data(as_text=True)
+
+    def test_dismiss_removes_the_row_once(self, client, tmp_path):
+        http, data_dir = client
+        _, cache, (row_id,) = self._ledger(data_dir, tmp_path)
+        url = "/auto-resolve/photos/dismiss"
+        assert http.post(url, json={"id": row_id}).status_code == 200
+        assert cache.count_auto_actions(applied=False) == 0
+        assert http.post(url, json={"id": row_id}).status_code == 404
+        assert http.post(url, json={"id": "nope"}).status_code == 400
+
+    def test_dismiss_never_deletes_an_applied_row(self, client, tmp_path):
+        http, data_dir = client
+        folder, cache, _ = self._ledger(data_dir, tmp_path)
+        applied_id = cache.record_auto_action(
+            "g1", "identical", os.path.join(folder, "dup.jpg"),
+            os.path.join(folder, "keep.png"), {}, applied=True,
+        )
+        response = http.post("/auto-resolve/photos/dismiss", json={"id": applied_id})
+        assert response.status_code == 404
+        assert cache.count_auto_actions(applied=True) == 1
+
+    def test_json_paginates(self, client, tmp_path):
+        http, data_dir = client
+        self._ledger(data_dir, tmp_path, rows=150)
+        first = http.get("/auto-resolve/photos.json").get_json()
+        assert first["total"] == 150 and first["pages"] == 2
+        assert len(first["rows"]) == 100
+        second = http.get("/auto-resolve/photos.json?page=2").get_json()
+        assert len(second["rows"]) == 50
+        assert not {r["id"] for r in first["rows"]} & {r["id"] for r in second["rows"]}
+        row = second["rows"][0]
+        assert row["duplicate"]["path"] == "dup.jpg"
+        assert row["keeper"]["path"] == "keep.png"
+        assert first["pending_by_tier"] == {"reencode": 150}
+        applied = http.get("/auto-resolve/photos.json?applied=1").get_json()
+        assert applied["total"] == 0 and applied["rows"] == []
+
+    def test_apply_records_a_manual_row(self, client, tmp_path):
+        """The page's Apply button is a plain /manage-duplicate delete; that
+        endpoint has to write the ledger itself."""
+        http, data_dir = client
+        folder, cache, _ = self._ledger(data_dir, tmp_path)
+        response = http.post(
+            "/manage-duplicate",
+            json={
+                "action": "delete", "folder": "photos", "group_id": "g1",
+                "file_path": "dup.jpg", "best_file_path": "keep.png",
+            },
+        )
+        assert response.status_code == 200
+        assert os.path.islink(os.path.join(folder, "dup.jpg"))
+        (row,) = cache.get_auto_actions(applied=True)
+        assert row["tier"] == "manual" and row["group_id"] == "g1"
+        assert os.path.basename(row["duplicate"]) == "dup.jpg"
+        assert os.path.basename(row["keeper"]) == "keep.png"
+
+    def test_a_failed_manual_replacement_leaves_no_row(self, client, tmp_path):
+        http, data_dir = client
+        _, cache, _ = self._ledger(data_dir, tmp_path)
+        response = http.post(
+            "/manage-duplicate",
+            json={
+                "action": "delete", "folder": "photos",
+                "file_path": "dup.jpg", "best_file_path": "no-such-keeper.png",
+            },
+        )
+        assert response.status_code == 500
+        assert cache.count_auto_actions(applied=True) == 0
+
+    @pytest.mark.parametrize("name", ["..", "..%2F..", "a..b", "%2E%2E"])
+    def test_path_traversal_is_rejected(self, client, name):
+        http, _ = client
+        assert http.get(f"/auto-resolve/{name}").status_code == 400
+        assert http.get(f"/auto-resolve/{name}.json").status_code == 400
+        assert http.post(f"/auto-resolve/{name}/dismiss", json={"id": 1}).status_code == 400
+
+    def test_missing_folder_is_404(self, client):
+        http, _ = client
+        assert http.get("/auto-resolve/nope").status_code == 404
+
+    def test_index_labels_use_the_pending_count(self, client):
+        http, _ = client
+        page = http.get("/").get_data(as_text=True)
+        assert "pending_auto_count" in page
+        assert "Would auto-resolve: " in page
+        assert 'id="autoResolveLink"' in page

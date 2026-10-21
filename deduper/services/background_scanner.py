@@ -29,7 +29,7 @@ from enum import Enum, IntEnum
 from pathlib import Path
 from ..config import Config
 from ..utils.logging_config import get_logger
-from ..utils.hash_cache import HashCache
+from ..utils.hash_cache import HashCache, get_hash_cache
 from .duplicate_finder import DuplicateFinder
 
 # Get the standard logger
@@ -164,6 +164,9 @@ class FolderState:
     # When duplicate_count was computed.  Compared against last_modified_time to
     # tell a count that still matches the folder from one the folder has outrun.
     duplicate_count_time: float = 0
+    # Ledger rows the auto-resolve tiers would apply (auto_actions, applied=0),
+    # refreshed alongside duplicate_count. 0 until the folder has been scanned.
+    pending_auto_count: int = 0
 
 
 class BackgroundScanner:
@@ -452,7 +455,9 @@ class BackgroundScanner:
         with self._lock:
             self._ui_activity_time = time.time()
 
-    def update_folder_duplicate_count(self, folder_name: str, duplicate_count: int) -> None:
+    def update_folder_duplicate_count(
+        self, folder_name: str, duplicate_count: int, pending_auto_count: int | None = None
+    ) -> None:
         """Record a duplicate count that was produced outside a background scan.
 
         The UI removes duplicates through /manage-duplicate, which edits the
@@ -461,6 +466,9 @@ class BackgroundScanner:
         this the dropdown keeps showing the count from the last full scan - and a
         rescan is at least STABILITY_WAIT_SECONDS + MIN_RESCAN_INTERVAL_SECONDS
         away, longer while the user is still working in the folder.
+
+        *pending_auto_count*, when given, replaces the folder's count of
+        pending auto-resolve ledger rows.
         """
         with self._lock:
             state = self._folder_states.get(folder_name)
@@ -471,6 +479,8 @@ class BackgroundScanner:
             # despite the count having just been verified.
             state.duplicate_count = duplicate_count
             state.duplicate_count_time = time.time()
+            if pending_auto_count is not None:
+                state.pending_auto_count = pending_auto_count
 
         # Emit outside the lock - every status endpoint contends on it.
         self._emit_folder_update(folder_name, state)
@@ -770,6 +780,7 @@ class BackgroundScanner:
             'status': ScanStatus.PENDING,
             'last_scan_time': 0.0,
             'duplicate_count': -1,
+            'pending_auto_count': 0,
             'file_count': 0,
             'folder_mtime': 0.0
         }
@@ -780,6 +791,7 @@ class BackgroundScanner:
             'status': status_map.get(meta['status'], ScanStatus.PENDING),
             'last_scan_time': meta['last_scan_time'],
             'duplicate_count': meta['duplicate_count'],
+            'pending_auto_count': meta.get('pending_auto_count', 0),
             'file_count': meta['file_count'],
             'folder_mtime': folder_mtime
         }
@@ -809,6 +821,7 @@ class BackgroundScanner:
                                 # that produced it; seeding both stamps lets the
                                 # freshness test work before the first mtime check.
                                 duplicate_count_time=cache_meta['last_scan_time'],
+                                pending_auto_count=cache_meta['pending_auto_count'],
                                 last_modified_time=cache_meta['folder_mtime'],
                                 file_count=cache_meta['file_count']
                             )
@@ -949,7 +962,7 @@ class BackgroundScanner:
         # Use a container to store results from the scan sub-thread
         scan_result: dict[str, Any] = {
             'success': False, 'images': None, 'videos': None,
-            'error': None, 'traceback': None,
+            'error': None, 'traceback': None, 'pending_auto': None,
         }
         scan_complete = threading.Event()
 
@@ -1002,6 +1015,13 @@ class BackgroundScanner:
                 scan_result['success'] = True
                 scan_result['images'] = duplicate_images
                 scan_result['videos'] = duplicate_videos
+                # Read here, on the scan thread, before the cache is closed
+                try:
+                    scan_result['pending_auto'] = get_hash_cache(folder_path).count_auto_actions(
+                        applied=False
+                    )
+                except Exception as e:
+                    scanner_log('warning', f"[{folder_name}] Could not count pending auto actions: {e}")
                 scanner_log('info', f"[{folder_name}] Scan sub-thread COMPLETED successfully")
 
             except Exception as e:
@@ -1043,6 +1063,7 @@ class BackgroundScanner:
         if scan_result['success']:
             dup_images = scan_result['images']
             dup_videos = scan_result['videos']
+            pending_auto_count = scan_result['pending_auto'] or 0
             with self._lock:
                 st = self._folder_states.get(folder_name)
                 if st:
@@ -1056,6 +1077,9 @@ class BackgroundScanner:
                     st.file_count = image_count + video_count
                     st.duplicate_count = len(dup_images or []) + len(dup_videos or [])
                     st.duplicate_count_time = st.last_scan_time
+                    if scan_result['pending_auto'] is not None:
+                        st.pending_auto_count = scan_result['pending_auto']
+                    pending_auto_count = st.pending_auto_count
 
             with self._lock:
                 if folder_name == self._ui_active_folder:
@@ -1076,6 +1100,7 @@ class BackgroundScanner:
                     'status': 'complete',
                     'ready': True,
                     'duplicate_count': len(dup_images or []) + len(dup_videos or []),
+                    'pending_auto_count': pending_auto_count,
                 })
                 emit_folder_refresh(folder_name)
             except Exception:
