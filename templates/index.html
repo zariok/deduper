@@ -476,6 +476,7 @@
         <select class="folder-select" id="folderSelect">
             <option value="">Select a folder...</option>
         </select>
+        <a id="autoResolveLink" href="#" style="display: none; margin-top: 8px; font-size: 14px; color: #007bff;">Review what would auto-resolve</a>
         <div class="cache-controls" id="cacheControls" style="display: none; margin-top: 10px;">
             <div class="cache-info" id="cacheInfo" style="background: #e9ecef; padding: 10px; border-radius: 5px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;">
                 <div>
@@ -820,6 +821,28 @@
             fetch('/scanner/ui-activity', { method: 'POST' }).catch(() => {});
         }
 
+        // " · Would auto-resolve: M" when the ledger has pending rows
+        function autoResolveSuffix(folderInfo) {
+            const pending = folderInfo.pending_auto_count || 0;
+            return pending > 0 ? ' \u00b7 Would auto-resolve: ' + pending : '';
+        }
+
+        // Show the review-page link when the selected folder has pending rows
+        function updateAutoResolveLink() {
+            const select = document.getElementById('folderSelect');
+            const link = document.getElementById('autoResolveLink');
+            if (!select || !link) return;
+            const option = select.options[select.selectedIndex];
+            const pending = option ? parseInt(option.dataset.pendingAuto || '0', 10) : 0;
+            if (select.value && pending > 0) {
+                link.href = '/auto-resolve/' + encodeURIComponent(select.value);
+                link.textContent = 'Review what would auto-resolve (' + pending + ')';
+                link.style.display = 'inline-block';
+            } else {
+                link.style.display = 'none';
+            }
+        }
+
         // Build the display label for a folder based on its status
         function buildFolderLabel(folderName, folderInfo) {
             if (!folderInfo) {
@@ -836,7 +859,7 @@
                         // Return null to indicate this folder should be hidden
                         return null;
                     }
-                    return folderName + ' - Duplicates: ' + folderInfo.duplicate_count;
+                    return folderName + ' - Duplicates: ' + folderInfo.duplicate_count + autoResolveSuffix(folderInfo);
                 case 'stale':
                     // Stale means it was complete but the folder has changed since.
                     // Only trust the count if the server says it was computed after
@@ -850,7 +873,7 @@
                     if (folderInfo.duplicate_count === 0) {
                         return null;
                     }
-                    return folderName + ' - Duplicates: ' + folderInfo.duplicate_count;
+                    return folderName + ' - Duplicates: ' + folderInfo.duplicate_count + autoResolveSuffix(folderInfo);
                 case 'error':
                     return folderName + ' - (error)';
                 default:
@@ -890,6 +913,7 @@
                 option.value = folderName;
                 option.textContent = label;
                 option.className = 'status-' + (folderInfo ? folderInfo.status : 'pending');
+                option.dataset.pendingAuto = (folderInfo && folderInfo.pending_auto_count) || 0;
                 select.appendChild(option);
             }
 
@@ -902,6 +926,7 @@
 
             // After first update, try to load saved folder selection
             loadSavedFolderSelection();
+            updateAutoResolveLink();
         }
 
         // Incrementally update a single folder in the dropdown.
@@ -918,6 +943,7 @@
             if (label === null) {
                 // Folder should be hidden (0 duplicates) — remove if present
                 if (existing) existing.remove();
+                updateAutoResolveLink();
                 return;
             }
 
@@ -925,12 +951,14 @@
                 // Update existing option in-place
                 existing.textContent = label;
                 existing.className = 'status-' + (folderInfo.status || 'pending');
+                existing.dataset.pendingAuto = folderInfo.pending_auto_count || 0;
             } else {
                 // New folder — insert in sorted position
                 const option = document.createElement('option');
                 option.value = folderName;
                 option.textContent = label;
                 option.className = 'status-' + (folderInfo.status || 'pending');
+                option.dataset.pendingAuto = folderInfo.pending_auto_count || 0;
 
                 // Find sorted insertion point (skip placeholder at index 0)
                 let inserted = false;
@@ -943,6 +971,7 @@
                 }
                 if (!inserted) select.appendChild(option);
             }
+            updateAutoResolveLink();
         }
 
         // Show loading state in the content sections
@@ -1275,6 +1304,7 @@
             }
         }
 
+        document.getElementById('folderSelect').addEventListener('change', updateAutoResolveLink);
         document.getElementById('folderSelect').addEventListener('change', async (e) => {
             const folder = e.target.value;
             if (!folder) {

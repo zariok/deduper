@@ -1051,6 +1051,22 @@ class HashCache:
             )
             self._db.commit()
 
+    def delete_auto_action(self, row_id: int, pending_only: bool = True) -> bool:
+        """Delete one ledger row; return whether a row was removed.
+
+        By default only a pending (applied=0) row can go: dismissing a proposal
+        from the review page must never erase the history of a real deletion.
+        ``pending_only=False`` is for withdrawing a row recorded ahead of an
+        action that then did not happen.
+        """
+        query = "DELETE FROM auto_actions WHERE id=?"
+        if pending_only:
+            query += " AND applied=0"
+        with self._lock:
+            cur = self._db.execute(query, (row_id,))
+            self._db.commit()
+            return cur.rowcount > 0
+
     def replace_pending_auto_actions(
         self, tier: str, rows: list[tuple[str, str, str, dict[str, Any]]]
     ) -> None:
