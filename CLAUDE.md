@@ -61,6 +61,9 @@ Environment variables (see README.md for the full list):
 - `DEDUPER_FFMPEG_WORKERS` (default 8): ffmpeg thumbnail thread pool
 - `DEDUPER_SCAN_WORKERS` (default 4): background scanner worker threads
 - Pool sizes that are not positive integers fall back to the default with a warning
+- `DEDUPER_AUTO_RESOLVE` (`off | ledger | apply`, default `ledger`; anything else
+  falls back to `ledger` with a warning): what the automatic tiers beyond byte
+  identity may do. `ledger` only records what they would do
 
 ## Architecture
 
@@ -96,6 +99,11 @@ Environment variables (see README.md for the full list):
      the path exists and will re-download if it does not. Disable with
      `TOMBSTONE_GIFS = False`. This runs only after alignment verification, so a
      shared intro cannot tombstone a GIF against the wrong video
+   - **Re-encode tier** (`_auto_resolve_reencodes`): an all-image group with
+     identical dimensions, pHash *and* dHash each <= 2 between every pair, a
+     current analysis with no modification flags, and any manual best pick still
+     a member. Governed by `DEDUPER_AUTO_RESOLVE` (read at call time); runs on
+     every scan from cached data only, so the ledger stays current
    - Hashing runs on a module-level `ProcessPoolExecutor` using the **spawn**
      context - forking a process whose threads hold locks deadlocks the children.
      `shutdown_process_pool()` is registered for exit
@@ -148,7 +156,13 @@ Environment variables (see README.md for the full list):
    - `.deduper.db` per scanned directory. `.deduper` is the *legacy JSON* name,
      kept only so `scripts/migrate_deduper_to_sqlite.py` can find files to convert
    - Tables: `meta`, `file_hashes`, `grouping_results`, `best_files`, `groups`,
-     `media_metadata`, `content_hashes`, `quality_metrics`, `group_analysis`
+     `media_metadata`, `content_hashes`, `quality_metrics`, `group_analysis`,
+     `auto_actions`
+   - `auto_actions` is the audit trail of automatic replacements, one row per
+     file, tier `identical | gif | reencode` (more planned). `applied=1` rows are
+     written *before* the symlink and downgraded if it fails; `applied=0` rows are
+     the ledger-mode dry run, which `replace_pending_auto_actions` rebuilds per
+     tier on every scan. Never wiped by a version bump: it is history
    - `content_hashes` holds a blake2b digest of the file's bytes, written only
      for files that already share a size with another member of their group -
      a scan never reads every file's contents
