@@ -190,6 +190,21 @@ def images_only_dir(tmp_path, sample_media) -> str:
     return os.path.realpath(folder)
 
 
+@pytest.fixture
+def reencode_dir(tmp_path) -> str:
+    """One picture saved twice at the same size - PNG and a high-quality JPEG -
+    plus an unrelated image. The JPEG is 4:4:4: Pillow's default 4:2:0 shifts
+    the colour of this saturated synthetic gradient enough for the analysis to
+    flag a colour difference, which (correctly) disqualifies the group."""
+    folder = tmp_path / "reencode"
+    folder.mkdir()
+    picture = gradient_image(240, 240, 11)
+    picture.save(folder / "pic.png")
+    picture.save(folder / "pic.jpg", quality=95, subsampling=0)
+    gradient_image(200, 200, 200).save(folder / "other.png")
+    return os.path.realpath(folder)
+
+
 @pytest.fixture(autouse=True)
 def clear_media_caches():
     """Drop the module-level lru_caches around every test.

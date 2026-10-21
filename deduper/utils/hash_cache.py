@@ -1166,13 +1166,15 @@ class HashCache:
     def read_metadata(folder_path: str, folder_mtime: float | None = None) -> dict[str, Any]:
         """
         Read lightweight metadata from .deduper.db without a full HashCache.
-        Returns: status ('pending'|'complete'|'stale'), last_scan_time, duplicate_count, file_count.
+        Returns: status ('pending'|'complete'|'stale'), last_scan_time, duplicate_count,
+        file_count, pending_auto_count (auto_actions rows not yet applied).
         """
         default: dict[str, Any] = {
             "status": "pending",
             "last_scan_time": 0.0,
             "duplicate_count": -1,
             "file_count": 0,
+            "pending_auto_count": 0,
         }
         db = Path(folder_path) / DB_FILENAME
         if not db.exists():
@@ -1207,11 +1209,19 @@ class HashCache:
                 except OSError:
                     folder_mtime = 0
             status = "stale" if folder_mtime > last_scan_time else "complete"
+            try:
+                pending_row = conn.execute(
+                    "SELECT COUNT(*) FROM auto_actions WHERE applied=0"
+                ).fetchone()
+                pending_auto_count = int(pending_row[0]) if pending_row else 0
+            except sqlite3.Error:
+                pending_auto_count = 0  # a database from before the ledger existed
             return {
                 "status": status,
                 "last_scan_time": last_scan_time,
                 "duplicate_count": duplicate_count,
                 "file_count": file_count,
+                "pending_auto_count": pending_auto_count,
             }
         except Exception as e:
             logger.debug(f"Could not read cache metadata for {folder_path}: {e}")

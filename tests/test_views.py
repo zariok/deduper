@@ -110,6 +110,57 @@ def idle_scanner(monkeypatch):
     return _install
 
 
+class TestPendingAutoCount:
+    """The ledger's pending count rides along with duplicate_count, so the UI
+    can show "would auto-resolve: N" per folder from the status endpoints."""
+
+    def _scanned(self, client, reencode_dir, idle_scanner, monkeypatch):
+        monkeypatch.setattr(Config, "AUTO_RESOLVE_POLICY", "ledger")
+        http, data_dir = client
+        folder = populate(data_dir, reencode_dir)
+        DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS).find_duplicates(folder)
+        return http, folder, idle_scanner(data_dir)
+
+    def test_discovery_seeds_it_from_the_cache(self, client, reencode_dir, idle_scanner, monkeypatch):
+        _, _, scanner = self._scanned(client, reencode_dir, idle_scanner, monkeypatch)
+        assert scanner.get_folder_status("photos").pending_auto_count == 1
+
+    def test_status_endpoints_report_it(self, client, reencode_dir, idle_scanner, monkeypatch):
+        http, _, _ = self._scanned(client, reencode_dir, idle_scanner, monkeypatch)
+        folders = http.get("/scanner/status").get_json()["folders"]
+        assert folders["photos"]["pending_auto_count"] == 1
+        status = http.get("/scanner/folder/photos/status").get_json()
+        assert status["pending_auto_count"] == 1
+
+    def test_refresh_after_management_recounts_it(self, client, reencode_dir, idle_scanner, monkeypatch):
+        http, folder, scanner = self._scanned(client, reencode_dir, idle_scanner, monkeypatch)
+        state = scanner.get_folder_status("photos")
+        state.pending_auto_count = 99
+
+        from deduper.routes.views import _refresh_folder_duplicate_count
+        from deduper.utils.hash_cache import get_hash_cache
+
+        _refresh_folder_duplicate_count("photos", get_hash_cache(folder))
+        assert state.pending_auto_count == 1
+
+    def test_a_folder_scanned_before_the_ledger_reads_zero(self, client, images_only_dir, idle_scanner):
+        """A database without the auto_actions table must not break discovery."""
+        import sqlite3
+
+        http, data_dir = client
+        folder = populate(data_dir, images_only_dir)
+        DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS).find_duplicates(folder)
+        from deduper.utils.hash_cache import close_all_caches
+
+        close_all_caches()
+        with sqlite3.connect(os.path.join(folder, ".deduper.db")) as conn:
+            conn.execute("DROP TABLE auto_actions")
+        scanner = idle_scanner(data_dir)
+        state = scanner.get_folder_status("photos")
+        assert state.pending_auto_count == 0
+        assert state.duplicate_count >= 1
+
+
 class TestDuplicateCountAfterManagement:
     """Removing duplicates has to move the dropdown count immediately.
 

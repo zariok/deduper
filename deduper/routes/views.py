@@ -78,7 +78,11 @@ def _refresh_folder_duplicate_count(folder: str, cache: HashCache) -> None:
         scanner = get_background_scanner()
         if scanner is None:
             return
-        scanner.update_folder_duplicate_count(folder, cache.count_duplicate_groups())
+        scanner.update_folder_duplicate_count(
+            folder,
+            cache.count_duplicate_groups(),
+            cache.count_auto_actions(applied=False),
+        )
     except Exception as e:
         logger.warning(f"Failed to refresh duplicate count for {folder}: {e}")
 
@@ -753,7 +757,8 @@ def folder_scan_status(user_folder: str) -> ResponseReturnValue:
             'error_message': state.error_message,
             'scan_progress': state.scan_progress,
             'scan_total': state.scan_total,
-            'scan_message': state.scan_message
+            'scan_message': state.scan_message,
+            'pending_auto_count': state.pending_auto_count,
         })
     except Exception as e:
         logger.error(f"Error getting folder scan status: {e}", exc_info=True)
