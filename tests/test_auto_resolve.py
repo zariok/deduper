@@ -14,6 +14,8 @@ from deduper import config as config_module
 from deduper.config import AUTO_RESOLVE_POLICIES, env_choice
 from deduper.utils.hash_cache import HashCache
 
+from .conftest import requires_ffmpeg
+
 VAR = "DEDUPER_TEST_AUTO_RESOLVE"
 
 
@@ -147,3 +149,50 @@ class TestLedgerApi:
         directory = str(cache.directory_path)
         cache._close_connection()
         assert HashCache(directory).count_auto_actions(applied=True) == 1
+
+
+def _scan(folder: str):
+    from deduper.services.duplicate_finder import DuplicateFinder
+
+    from .conftest import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+
+    return DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS).find_duplicates(folder)
+
+
+class TestProvenPassesWriteLedger:
+    def test_identical_pass_records_an_applied_row(self, images_only_dir):
+        _scan(images_only_dir)
+        cache = HashCache(images_only_dir)
+        rows = cache.get_auto_actions(tier="identical")
+        assert len(rows) == 1
+        (row,) = rows
+        assert row["applied"] is True
+        assert row["duplicate"] == os.path.join(images_only_dir, "img_a_copy.png")
+        assert row["keeper"] == os.path.join(images_only_dir, "img_a.png")
+        assert row["evidence"]["size"] == os.path.getsize(row["keeper"])
+        assert len(row["evidence"]["digest"]) == 64
+        assert len(row["group_id"]) == 8
+        assert os.path.islink(row["duplicate"])
+
+    def test_failed_symlink_is_marked_not_applied(self, images_only_dir, monkeypatch):
+        from deduper.services import duplicate_finder
+
+        monkeypatch.setattr(
+            duplicate_finder, "create_symlink_and_remove_duplicate", lambda d, k: False
+        )
+        _scan(images_only_dir)
+        (row,) = HashCache(images_only_dir).get_auto_actions(tier="identical")
+        assert row["applied"] is False
+        assert row["evidence"]["error"] == "symlink failed"
+        assert not os.path.islink(row["duplicate"])
+
+    @requires_ffmpeg
+    def test_gif_pass_records_an_applied_row(self, signature_dir):
+        _scan(signature_dir)
+        rows = HashCache(signature_dir).get_auto_actions(tier="gif", applied=True)
+        by_dup = {os.path.basename(r["duplicate"]): r for r in rows}
+        assert "full.gif" in by_dup
+        row = by_dup["full.gif"]
+        assert os.path.basename(row["keeper"]) == "full.mp4"
+        assert row["evidence"]["keeper_width"] == 640
+        assert os.path.islink(row["duplicate"])

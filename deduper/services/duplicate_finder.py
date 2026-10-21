@@ -1210,19 +1210,42 @@ class DuplicateFinder:
             keeper = select_best_video_from_group(
                 others, self.video_extensions, metadata_provider=media_meta
             )
+            ledger_group_id = self._get_group_id(group_files, cache)
 
             removed: set[str] = set()
             for gif in gifs:
                 try:
+                    gif_res, gif_duration = media_meta(gif)
+                    keeper_res, keeper_duration = media_meta(keeper)
                     # Worth surfacing: a GIF larger than the video it came from is
                     # unusual enough that a wrong match would most likely look
                     # like this, and the log is the only trace afterwards.
-                    if media_meta(gif)[0].pixel_count() > media_meta(keeper)[0].pixel_count():
+                    if gif_res.pixel_count() > keeper_res.pixel_count():
                         logger.info(
                             f"Tombstoning {os.path.basename(gif)} despite it out-resolving "
                             f"{os.path.basename(keeper)}; the video is still the better copy"
                         )
 
+                    # Recorded before the symlink so a crash leaves a record.
+                    # Group membership here already survived whole-clip
+                    # alignment in _cluster_videos; that is the evidence.
+                    row_id = cache.record_auto_action(
+                        ledger_group_id, "gif", gif, keeper,
+                        {
+                            "verified": "aligned_distance",
+                            "match_distance": SIGNATURE_MATCH_DISTANCE,
+                            "members": len(group_files),
+                            "gif_width": gif_res.width,
+                            "gif_height": gif_res.height,
+                            "gif_duration": gif_duration,
+                            "keeper_width": keeper_res.width,
+                            "keeper_height": keeper_res.height,
+                            "keeper_duration": keeper_duration,
+                            "duplicate_size": cache.get_file_size(gif),
+                            "keeper_size": cache.get_file_size(keeper),
+                        },
+                        applied=True,
+                    )
                     if create_symlink_and_remove_duplicate(gif, keeper):
                         removed.add(gif)
                         tombstoned += 1
@@ -1231,6 +1254,7 @@ class DuplicateFinder:
                         cache.update_file_stats(gif)
                         logger.info(f"Tombstoned GIF: {os.path.basename(gif)} -> {os.path.basename(keeper)}")
                     else:
+                        cache.mark_auto_action(row_id, False, {"error": "symlink failed"})
                         logger.warning(f"Failed to tombstone GIF: {gif}")
                 except Exception as e:
                     logger.error(f"Error tombstoning GIF {gif}: {e}")
@@ -1288,9 +1312,10 @@ class DuplicateFinder:
             # Keyed by the md5 group id, not by this dict's representative
             # path, so the verdict primed on the pool is found rather than
             # recomputed inline
+            ledger_group_id = self._get_group_id(group_files, cache)
             best_file = analyze_group(
                 group_files, cache, self.image_extensions, self.video_extensions,
-                self._get_group_id(group_files, cache),
+                ledger_group_id,
             ).best_file
 
             removable: list[tuple[str, str]] = []  # (duplicate, keeper) pairs
@@ -1306,6 +1331,17 @@ class DuplicateFinder:
             removed = set()
             for duplicate_file, keeper in removable:
                 try:
+                    # Recorded before the symlink so a crash leaves a record.
+                    # The digest was read (and cached) by _identical_sets; it
+                    # is fetched before update_file_stats drops the dup's row.
+                    evidence: dict[str, Any] = {"size": cache.get_file_size(keeper)}
+                    digest = cache.get_content_hash(keeper)
+                    if digest is not None:
+                        evidence["digest"] = digest
+                    row_id = cache.record_auto_action(
+                        ledger_group_id, "identical", duplicate_file, keeper,
+                        evidence, applied=True,
+                    )
                     success = create_symlink_and_remove_duplicate(duplicate_file, keeper)
                     if success:
                         exact_matches_processed += 1
@@ -1320,6 +1356,7 @@ class DuplicateFinder:
 
                         logger.debug(f"Processed exact match: {duplicate_file} -> {keeper}")
                     else:
+                        cache.mark_auto_action(row_id, False, {"error": "symlink failed"})
                         logger.warning(f"Failed to process exact match: {duplicate_file}")
                 except Exception as e:
                     logger.error(f"Error processing exact match {duplicate_file}: {e}")
