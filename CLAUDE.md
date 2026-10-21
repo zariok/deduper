@@ -159,10 +159,12 @@ Environment variables (see README.md for the full list):
      `media_metadata`, `content_hashes`, `quality_metrics`, `group_analysis`,
      `auto_actions`
    - `auto_actions` is the audit trail of automatic replacements, one row per
-     file, tier `identical | gif | reencode` (more planned). `applied=1` rows are
-     written *before* the symlink and downgraded if it fails; `applied=0` rows are
-     the ledger-mode dry run, which `replace_pending_auto_actions` rebuilds per
-     tier on every scan. Never wiped by a version bump: it is history
+     file, tier `identical | gif | reencode | manual` (more planned; `manual` is
+     the UI's delete action). `applied=1` rows are written *before* the symlink
+     and downgraded if it fails; `applied=0` rows are the ledger-mode dry run,
+     which `replace_pending_auto_actions` rebuilds per tier on every scan, and
+     which `/auto-resolve/<folder>` shows for review (Apply / Dismiss). Never
+     wiped by a version bump: it is history
    - `content_hashes` holds a blake2b digest of the file's bytes, written only
      for files that already share a size with another member of their group -
      a scan never reads every file's contents
@@ -183,7 +185,8 @@ Environment variables (see README.md for the full list):
    - `socketio` is initialised in `app.py` with `async_mode="threading"`
    - Key routes: `/`, `/scan/<folder>`, `/cached-results/<folder>`,
      `/manage-duplicate`, `/data/<filename>`, `/thumb/<filename>`,
-     `/scanner/status`, `/scanner/folder/<folder>/status`
+     `/scanner/status`, `/scanner/folder/<folder>/status`,
+     `/auto-resolve/<folder>` (+ `.json`, `/dismiss`)
 
 6. **Background Scanner** (`deduper/services/background_scanner.py`)
    - Class: `BackgroundScanner`, daemon thread started at app startup
