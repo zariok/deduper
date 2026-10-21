@@ -212,3 +212,48 @@ class TestVideoProbing:
         lo = get_image_hash(os.path.join(media_dir, "vid_lo.mp4"), VIDEO_EXTENSIONS)
         assert hi is not None and lo is not None
         assert int(hi - lo) < 5
+
+
+class TestThumbnailHeaderCheck:
+    def test_valid_jpeg_passes(self, tmp_path):
+        from deduper.utils.media import _thumbnail_header_ok
+
+        path = tmp_path / "thumb.jpg"
+        Image.new("RGB", (16, 16), (200, 10, 10)).save(path, "JPEG")
+        assert _thumbnail_header_ok(path)
+
+    def test_zero_byte_file_fails(self, tmp_path):
+        from deduper.utils.media import _thumbnail_header_ok
+
+        path = tmp_path / "thumb.jpg"
+        path.write_bytes(b"")
+        assert not _thumbnail_header_ok(path)
+
+    def test_garbage_bytes_fail(self, tmp_path):
+        from deduper.utils.media import _thumbnail_header_ok
+
+        path = tmp_path / "thumb.jpg"
+        path.write_bytes(b"this is not an image at all" * 10)
+        assert not _thumbnail_header_ok(path)
+
+    def test_missing_file_fails(self, tmp_path):
+        from deduper.utils.media import _thumbnail_header_ok
+
+        assert not _thumbnail_header_ok(tmp_path / "absent.jpg")
+
+    def test_batch_does_not_decode_cached_thumbnails(self, tmp_path, monkeypatch):
+        """An existing thumbnail is accepted on its header, not a full decode."""
+        from deduper.utils import media
+
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"not really a video")
+        target = media.thumbnail_path_for(video)
+        Image.new("RGB", (16, 16)).save(target, "JPEG")
+
+        def _no_decode(path):
+            raise AssertionError(f"full decode of cached thumbnail {path}")
+
+        monkeypatch.setattr(media, "_is_valid_image", _no_decode)
+        assert media.batch_extract_video_thumbnails([str(video)]) == {
+            str(video): str(target)
+        }

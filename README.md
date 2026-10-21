@@ -124,6 +124,12 @@ The application can be configured using environment variables:
 | `DEDUPER_LOG_LEVEL` | Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL) | INFO |
 | `SECRET_KEY` | Flask secret key. **Required** - the app exits if it is unset and `DEDUPER_DEV`/`FLASK_ENV` are not set | _(none)_ |
 | `DEDUPER_DEV` | Set to `true` to allow an insecure `'dev'` secret key for local use | unset |
+| `DEDUPER_HASH_WORKERS` | Processes in the hashing/quality-analysis pool | half the CPU cores, at least 4 |
+| `DEDUPER_FFMPEG_WORKERS` | Threads running ffmpeg for batch video thumbnails | 8 |
+| `DEDUPER_SCAN_WORKERS` | Background-scanner threads; each scans a different folder (each has its own database) | 4 |
+
+The three pool sizes accept positive integers; anything else falls back to the
+default with a logged warning.
 
 ### FFmpeg Installation
 

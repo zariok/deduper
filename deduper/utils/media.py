@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import lru_cache
@@ -19,7 +20,24 @@ logger = get_logger(__name__)
 
 # Shared thread pool for concurrent FFmpeg subprocess execution.
 # Threads are ideal here because each thread just waits on a subprocess.
-_ffmpeg_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ffmpeg")
+# Created on first use and sized by DEDUPER_FFMPEG_WORKERS (default 8). Lazy so
+# that importing this module - which every spawned hashing worker does - neither
+# starts threads nor imports deduper.config and its SECRET_KEY check.
+_ffmpeg_pool: ThreadPoolExecutor | None = None
+_ffmpeg_pool_lock = threading.Lock()
+
+
+def _get_ffmpeg_pool() -> ThreadPoolExecutor:
+    global _ffmpeg_pool
+    if _ffmpeg_pool is None:
+        with _ffmpeg_pool_lock:
+            if _ffmpeg_pool is None:
+                from ..config import Config
+
+                _ffmpeg_pool = ThreadPoolExecutor(
+                    max_workers=Config.FFMPEG_WORKERS, thread_name_prefix="ffmpeg"
+                )
+    return _ffmpeg_pool
 
 
 # --- Video signature sampling -------------------------------------------------
@@ -689,7 +707,10 @@ def batch_extract_video_thumbnails(
     for vp in video_paths:
         source = Path(vp)
         target = thumbnail_path_for(source)
-        if target.exists() and target.stat().st_size > 0 and _is_valid_image(target):
+        # Header-only check: a full decode of every cached thumbnail made this
+        # loop cost as much as building them. Freshly written thumbnails are
+        # still fully validated in extract_video_thumbnail.
+        if _thumbnail_header_ok(target):
             results[vp] = str(target)  # already cached on disk
         else:
             to_extract.append(vp)
@@ -700,7 +721,7 @@ def batch_extract_video_thumbnails(
     logger.info(f"Batch extracting {len(to_extract)} video thumbnails ({len(results)} already cached)")
 
     futures = {
-        _ffmpeg_pool.submit(
+        _get_ffmpeg_pool().submit(
             extract_video_thumbnail,
             vp,
             timestamp_seconds=timestamp_seconds,
@@ -1207,6 +1228,22 @@ def _is_valid_image(image_path: Path) -> bool:
             return img.width > 0 and img.height > 0
     except (UnidentifiedImageError, OSError, Exception) as exc:
         logger.debug("Invalid image file %s: %s", image_path, exc)
+        return False
+
+
+def _thumbnail_header_ok(image_path: Path) -> bool:
+    """Cheap check that an existing thumbnail is non-empty and has an image header.
+
+    Image.open only parses the header; nothing is decoded. Use _is_valid_image
+    for a file ffmpeg has just written, where truncation is the real risk.
+    """
+    try:
+        if image_path.stat().st_size <= 0:
+            return False
+        with Image.open(image_path):
+            return True
+    except Exception as exc:
+        logger.debug("Thumbnail header check failed for %s: %s", image_path, exc)
         return False
 
 

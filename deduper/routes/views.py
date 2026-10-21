@@ -667,7 +667,7 @@ def live_cache_stats(user_folder: str) -> ResponseReturnValue:
         if os.path.exists(db_file):
             try:
                 cache = get_hash_cache(folder_path)
-                s = cache.get_cache_stats()
+                s = cache.get_cache_stats(include_groups=True)
                 stats.update(s)
                 stats['timestamp'] = time.time()
             except (OSError, Exception) as e:

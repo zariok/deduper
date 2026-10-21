@@ -57,6 +57,10 @@ Environment variables (see README.md for the full list):
 - `DEDUPER_PORT` (default 5000), `DEDUPER_HOST` (default 127.0.0.1)
 - `DEDUPER_DATA_DIR` (default ./data)
 - `DEDUPER_LOG_LEVEL` (default INFO)
+- `DEDUPER_HASH_WORKERS` (default `max(4, cpu_count // 2)`): hashing process pool
+- `DEDUPER_FFMPEG_WORKERS` (default 8): ffmpeg thumbnail thread pool
+- `DEDUPER_SCAN_WORKERS` (default 4): background scanner worker threads
+- Pool sizes that are not positive integers fall back to the default with a warning
 
 ## Architecture
 

@@ -6,8 +6,9 @@ import time
 import hashlib
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from .logging_config import get_logger
 from .quality import QUALITY_VERSION, ImageQuality, measure_image_quality
@@ -120,6 +121,10 @@ class HashCache:
         self._lock = threading.Lock()
         # Buffered media_metadata rows; see get_media_metadata / flush_media_metadata
         self._pending_media_meta: dict[str, tuple] = {}
+        # Per-thread stat snapshot for the scan running on that thread; see
+        # scan_stats. Thread-local so a request thread sharing this pooled cache
+        # never reads a scan's snapshot.
+        self._scan_local = threading.local()
         try:
             self._init_db()
 
@@ -172,6 +177,9 @@ class HashCache:
         self._conn = sqlite3.connect(str(self.db_file), check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
+        # mmap is advisory: SQLite falls back to read() where it is unsupported
+        self._db.execute("PRAGMA mmap_size=268435456")
+        self._db.execute("PRAGMA temp_store=MEMORY")
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -306,12 +314,49 @@ class HashCache:
     def _get_absolute_path(self, relative_path: str) -> str:
         return os.path.join(self.directory_path, relative_path)
 
+    @contextmanager
+    def scan_stats(self, stats: dict[str, tuple[float, int]]) -> Iterator[None]:
+        """Serve ``_get_file_stats`` from a scan's walk for the duration of a block.
+
+        *stats* maps absolute path -> ``(st_mtime, st_size)``, taken from
+        ``os.DirEntry.stat()`` while the scan walked the folder - the same values
+        ``os.stat`` gives for a regular file, so cache validation compares equal.
+        It saves the several stats per file a scan otherwise repeats: hash
+        validity, group fingerprints, metadata and content-hash lookups, sizes.
+
+        The snapshot is only as fresh as the walk that built it, so it must be
+        built by, and used within, a single scan. Never keep it on the cache
+        across scans: a stale (mtime, size) would make a changed file's cached
+        hash look valid. It is thread-local, so only the scanning thread sees it,
+        and paths it does not hold fall through to a real stat.
+        """
+        previous = getattr(self._scan_local, "stats", None)
+        self._scan_local.stats = stats
+        try:
+            yield
+        finally:
+            self._scan_local.stats = previous
+
     def _get_file_stats(self, file_path: str) -> tuple[float, int]:
+        scan_stats: dict[str, tuple[float, int]] | None = getattr(
+            self._scan_local, "stats", None
+        )
+        if scan_stats is not None:
+            cached = scan_stats.get(file_path)
+            if cached is not None:
+                return cached
         try:
             st = os.stat(file_path)
             return st.st_mtime, st.st_size
         except OSError:
             return 0.0, 0
+
+    def get_file_size(self, file_path: str) -> int:
+        """Size in bytes, or 0 if unreadable - as ``helpers.get_file_size``.
+
+        Answered from the scan's stat snapshot when one is active.
+        """
+        return self._get_file_stats(file_path)[1]
 
     def _is_file_unchanged(self, file_path: str) -> bool:
         mtime, size = self._get_file_stats(file_path)
@@ -627,6 +672,11 @@ class HashCache:
             self._db.commit()
 
     def update_file_stats(self, file_path: str) -> None:
+        # The caller has just changed this file (typically replaced it with a
+        # symlink), so whatever the scan's walk recorded for it is now stale
+        scan_stats = getattr(self._scan_local, "stats", None)
+        if scan_stats is not None:
+            scan_stats.pop(file_path, None)
         rel = self._get_relative_path(file_path)
         if os.path.exists(file_path):
             mtime, size = self._get_file_stats(file_path)
@@ -674,7 +724,13 @@ class HashCache:
                     self._db.commit()
             logger.info(f"Cleaned up {len(to_del)} deleted files from cache")
 
-    def get_cache_stats(self) -> dict[str, Any]:
+    def get_cache_stats(self, include_groups: bool = False) -> dict[str, Any]:
+        """File count, database size and timestamps.
+
+        With *include_groups*, also the group counts the cache panel displays.
+        Those decode every grouping row and stat every member, so the scan-start
+        log line and callers that only want a timestamp leave them out.
+        """
         total = 0
         try:
             total = self._db.execute("SELECT COUNT(*) FROM file_hashes").fetchone()[0]
@@ -690,6 +746,14 @@ class HashCache:
                 created = float(row[1])
             else:
                 last = float(row[1])
+        stats: dict[str, Any] = {
+            "total_cached_files": total,
+            "cache_size_mb": size_mb,
+            "created": created,
+            "last_updated": last,
+        }
+        if not include_groups:
+            return stats
         total_groups = 0
         duplicate_groups = 0
         processed_groups = 0
@@ -708,16 +772,13 @@ class HashCache:
                     remaining += 1
         for _ in self._db.execute("SELECT 1 FROM groups WHERE processed=1"):
             processed_groups += 1
-        return {
-            "total_cached_files": total,
-            "cache_size_mb": size_mb,
-            "created": created,
-            "last_updated": last,
-            "total_groups": total_groups,
-            "duplicate_groups": duplicate_groups,
-            "processed_groups": processed_groups,
-            "remaining_duplicates": remaining,
-        }
+        stats.update(
+            total_groups=total_groups,
+            duplicate_groups=duplicate_groups,
+            processed_groups=processed_groups,
+            remaining_duplicates=remaining,
+        )
+        return stats
 
     def save(self) -> None:
         self.flush_media_metadata()
@@ -812,7 +873,15 @@ class HashCache:
     def get_group_ids(self) -> list[str]:
         return [r[0] for r in self._db.execute("SELECT group_id FROM groups").fetchall()]
 
-    def get_cached_groups(self) -> dict:
+    def get_cached_groups(self, existing: set[str] | None = None) -> dict:
+        """Cached groups as {abs_rep: [abs_member, ...]}, minus symlinks and gone files.
+
+        *existing*, when given, is the set of real files a scan has just walked:
+        absolute paths under this cache's resolved directory, symlinks already
+        excluded. Membership in it replaces an ``islink`` and an ``exists`` call
+        per member. Without it the filesystem is asked, which is what callers
+        outside a scan want.
+        """
         out = {}
         for row in self._db.execute("SELECT rep_path, files FROM grouping_results"):
             try:
@@ -827,7 +896,10 @@ class HashCache:
                 # that no longer exist. Testing islink alone is not enough: it is
                 # False for a missing path, so a deleted file stayed in its group on
                 # every later scan and was reported with zeroed resolution and size.
-                if os.path.islink(p) or not os.path.exists(p):
+                if existing is not None:
+                    if p not in existing:
+                        continue
+                elif os.path.islink(p) or not os.path.exists(p):
                     continue
                 abs_files.append(p)
             if abs_files:
@@ -1007,6 +1079,8 @@ class HashCache:
         try:
             conn = sqlite3.connect(str(db_path))
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA mmap_size=268435456")
+            conn.execute("PRAGMA temp_store=MEMORY")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS file_hashes (

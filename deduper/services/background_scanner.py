@@ -27,6 +27,7 @@ from typing import Callable, Any
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from pathlib import Path
+from ..config import Config
 from ..utils.logging_config import get_logger
 from ..utils.hash_cache import HashCache
 from .duplicate_finder import DuplicateFinder
@@ -198,8 +199,10 @@ class BackgroundScanner:
     # Base retry delay after failure (doubles each failure: 5min, 10min, 20min)
     BASE_RETRY_DELAY_SECONDS = 300
 
-    # Number of concurrent scan worker threads (Phase 3.1)
-    NUM_SCAN_WORKERS = 2
+    # Number of concurrent scan worker threads (Phase 3.1). DEDUPER_SCAN_WORKERS,
+    # default 4: each folder has its own SQLite database, so workers scanning
+    # different folders do not contend on a cache.
+    NUM_SCAN_WORKERS = Config.SCAN_WORKERS
 
     def __init__(
         self,
