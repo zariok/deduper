@@ -167,7 +167,8 @@ def prime_group_analyses(
     they need the cache's ffprobe metadata and cost nothing to rank.
 
     Returns the number of groups analysed. A group whose analysis is current
-    costs one stat per member and one SELECT.
+    costs one SELECT, plus one stat per member outside a scan (inside one the
+    fingerprint reads the walk's snapshot; see HashCache.scan_stats).
     """
     futures: dict[Future[tuple[dict[str, Any], dict[str, ImageQuality]]], tuple[str, str]] = {}
     analysed = 0
@@ -212,7 +213,7 @@ def _analyze_videos(group: list[str], cache: HashCache, image_extensions: Iterab
     summaries = {}
     for path in group:
         resolution, duration = media_meta(path)
-        size = get_file_size(path)
+        size = cache.get_file_size(path)
         bitrate = (size * 8 / duration / 1e6) if duration > 0 else 0.0
         parts = [resolution.label()]
         if duration > 0:
@@ -293,6 +294,8 @@ def exact_match_checker(cache: HashCache) -> Callable[[str, str, int, int], bool
 
     Guarded on size so a plain near-duplicate never has its contents read, and
     memoised per keeper so a group of N reads the keeper's digest once.
+    The stat each digest lookup validates against comes from the scan's
+    snapshot when one is active (HashCache.scan_stats).
     """
     digests: dict[str, str | None] = {}
 

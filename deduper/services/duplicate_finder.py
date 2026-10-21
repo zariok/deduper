@@ -3,12 +3,13 @@ import time
 import multiprocessing as mp
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterable
 import imagehash
 from ..utils.bktree import BKTree
-from ..utils.helpers import get_file_size, format_file_size, create_symlink_and_remove_duplicate
+from ..utils.helpers import format_file_size, create_symlink_and_remove_duplicate
 from ..utils.media import (
     SIGNATURE_MATCH_DISTANCE,
     SIGNATURE_MIN_OVERLAP,
@@ -149,7 +150,7 @@ def _identical_sets(file_paths: list[str], cache: "HashCache") -> list[list[str]
     """
     by_size: dict[int, list[str]] = defaultdict(list)
     for path in file_paths:
-        by_size[get_file_size(path)].append(path)
+        by_size[cache.get_file_size(path)].append(path)
 
     identical: list[list[str]] = []
     for candidates in by_size.values():
@@ -206,6 +207,9 @@ class DuplicateFinder:
     @timer('duplicate_detection_total')
     def find_duplicates(self, folder_path: str, progress_callback: Callable | None = None) -> tuple[list[dict], list[dict]]:
         """Find duplicate images and videos in the given folder."""
+        # Holds the walk's stat snapshot (HashCache.scan_stats) open for exactly
+        # this scan, and closes it however the scan ends
+        scan_scope = ExitStack()
         try:
             # HashCache resolves its own directory, so walk the resolved path too.
             # Otherwise a symlinked parent (/var -> /private/var) makes every relative
@@ -233,12 +237,25 @@ class DuplicateFinder:
             image_files = []
             video_files = []
             all_files = set()
+            # path -> (mtime, size) for every media file, from the walk's own
+            # DirEntry.stat(); see HashCache.scan_stats. Built for and used by
+            # this scan only.
+            stat_cache: dict[str, tuple[float, int]] = {}
             
             if progress_callback:
                 progress_callback('scanning', 0, 0, 'Scanning directory structure...')
 
             logger.debug("Scanning directory structure (os.scandir)...")
             file_count = 0
+
+            def _remember_stat(entry: os.DirEntry[str]) -> None:
+                # One syscall, cached on the entry. On failure the path is simply
+                # absent, and _get_file_stats falls back to a real stat.
+                try:
+                    st = entry.stat()
+                except OSError:
+                    return
+                stat_cache[entry.path] = (st.st_mtime, st.st_size)
 
             def _scan_recursive(path: str) -> None:
                 nonlocal file_count
@@ -255,8 +272,10 @@ class DuplicateFinder:
                                 file_count += 1
                                 if any(file_path.lower().endswith(ext) for ext in self.image_extensions):
                                     image_files.append(file_path)
+                                    _remember_stat(entry)
                                 elif any(file_path.lower().endswith(ext) for ext in self.video_extensions):
                                     video_files.append(file_path)
+                                    _remember_stat(entry)
                                 if file_count % 100 == 0 and progress_callback:
                                     progress_callback('scanning', file_count, 0, f'Found {file_count} files...')
                             elif entry.is_dir():
@@ -267,6 +286,7 @@ class DuplicateFinder:
                     logger.warning(f"Error scanning {path}: {e}")
 
             _scan_recursive(folder_path)
+            scan_scope.enter_context(cache.scan_stats(stat_cache))
             
             # Clean up deleted files from cache
             cache.cleanup_deleted_files(all_files)
@@ -286,8 +306,10 @@ class DuplicateFinder:
             all_media_files = set(image_files + video_files)
             logger.debug(f"Checking for cached groups for {len(all_media_files)} files")
             
-            # Load any existing cached groups
-            cached_groups = cache.get_cached_groups()
+            # Load any existing cached groups. The walk has just listed every real
+            # file and skipped symlinks, so filter members against it instead of
+            # asking the filesystem twice per member.
+            cached_groups = cache.get_cached_groups(existing=all_files)
             
             if cached_groups:
                 logger.info("Found cached groups, performing incremental grouping...")
@@ -315,10 +337,12 @@ class DuplicateFinder:
                 # membership is not a usable test: a file that hashed to a group of one
                 # is absent from grouping_results, so every unique file would look new
                 # on every scan and the work below could never be skipped.
+                # One SELECT for the table, checked against the walk's stats.
+                stored = cache.get_file_hash_rows()
                 new_files = {
                     os.path.normpath(f)
                     for f in image_files + video_files
-                    if not self._has_valid_cached_hash(f, cache)
+                    if not self._cached_hash_is_current(f, cache, stored)
                 }
                 logger.info(f"Found {len(new_files)} new or changed files since the cached scan")
                 if new_files:
@@ -443,14 +467,14 @@ class DuplicateFinder:
                     logger.debug(f"Best image for group {group_id}: {best_file} ({analysis.best_reason})")
                     # Get metadata for best file using cache
                     best_resolution_obj, _ = get_media_meta(best_file)
-                    best_size = get_file_size(best_file)
+                    best_size = cache.get_file_size(best_file)
                     
                     # Get metadata for duplicate files using cache
                     duplicate_files_with_metadata = []
                     for f in group:
                         if f != best_file:
                             resolution_obj, _ = get_media_meta(f)
-                            size = get_file_size(f)
+                            size = cache.get_file_size(f)
                             
                             # Byte-identical, not merely same-resolution-and-size
                             is_exact_match = is_byte_identical(f, best_file, size, best_size)
@@ -509,14 +533,14 @@ class DuplicateFinder:
                     logger.debug(f"Best video for group {group_id}: {best_file} ({analysis.best_reason})")
                     # Get metadata for best file using cache
                     best_resolution_obj, best_duration = get_media_meta(best_file)
-                    best_size = get_file_size(best_file)
+                    best_size = cache.get_file_size(best_file)
                     
                     # Get metadata for duplicate files using cache
                     duplicate_files_with_metadata = []
                     for f in group:
                         if f != best_file:
                             resolution_obj, duration = get_media_meta(f)
-                            size = get_file_size(f)
+                            size = cache.get_file_size(f)
                             
                             # Byte-identical, not merely same-resolution-and-size
                             is_exact_match = is_byte_identical(f, best_file, size, best_size)
@@ -587,6 +611,8 @@ class DuplicateFinder:
             logger.error(f"Error in find_duplicates: {e}", exc_info=True)
             increment_counter('duplicate_detection_errors')
             return [], []
+        finally:
+            scan_scope.close()
     
     def _group_files_by_hash_with_cache(
         self,
@@ -860,9 +886,21 @@ class DuplicateFinder:
     
     @staticmethod
     def _has_valid_cached_hash(file_path: str, cache: HashCache) -> bool:
-        """Report whether the cache already holds a usable hash for this file."""
+        """Report whether the cache already holds a usable hash for this file.
+
+        Two SELECTs and a stat per call; the scan uses _cached_hash_is_current
+        over one get_file_hash_rows() instead.
+        """
         relative_path = cache._get_relative_path(file_path)
         return bool(cache.has_cached_hash(relative_path) and cache._is_file_unchanged(file_path))
+
+    @staticmethod
+    def _cached_hash_is_current(
+        file_path: str, cache: HashCache, stored: dict[str, tuple[str, float, int]]
+    ) -> bool:
+        """_has_valid_cached_hash against prefetched rows (get_file_hash_rows)."""
+        row = stored.get(cache._get_relative_path(file_path))
+        return row is not None and (row[1], row[2]) == cache._get_file_stats(file_path)
 
     @staticmethod
     def _get_file_hash(file_path: str, video_extensions: tuple[str, ...]) -> Any | None:
@@ -1183,8 +1221,9 @@ class DuplicateFinder:
                     if create_symlink_and_remove_duplicate(gif, keeper):
                         removed.add(gif)
                         tombstoned += 1
+                        # No remove_file_from_groups here: find_duplicates writes
+                        # the trimmed groups with set_cached_groups after this pass
                         cache.update_file_stats(gif)
-                        cache.remove_file_from_groups(gif)
                         logger.info(f"Tombstoned GIF: {os.path.basename(gif)} -> {os.path.basename(keeper)}")
                     else:
                         logger.warning(f"Failed to tombstone GIF: {gif}")
@@ -1268,9 +1307,11 @@ class DuplicateFinder:
                         total_files_processed += 1
                         removed.add(duplicate_file)
 
-                        # Update cache to reflect the file deletion
+                        # Update cache to reflect the file deletion. Group
+                        # membership is not rewritten per file: find_duplicates
+                        # writes the trimmed groups with set_cached_groups after
+                        # this pass, replacing the whole table either way.
                         cache.update_file_stats(duplicate_file)
-                        cache.remove_file_from_groups(duplicate_file)
 
                         logger.debug(f"Processed exact match: {duplicate_file} -> {keeper}")
                     else:
