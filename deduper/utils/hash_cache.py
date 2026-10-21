@@ -172,6 +172,9 @@ class HashCache:
         self._conn = sqlite3.connect(str(self.db_file), check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
+        # mmap is advisory: SQLite falls back to read() where it is unsupported
+        self._db.execute("PRAGMA mmap_size=268435456")
+        self._db.execute("PRAGMA temp_store=MEMORY")
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -674,7 +677,13 @@ class HashCache:
                     self._db.commit()
             logger.info(f"Cleaned up {len(to_del)} deleted files from cache")
 
-    def get_cache_stats(self) -> dict[str, Any]:
+    def get_cache_stats(self, include_groups: bool = False) -> dict[str, Any]:
+        """File count, database size and timestamps.
+
+        With *include_groups*, also the group counts the cache panel displays.
+        Those decode every grouping row and stat every member, so the scan-start
+        log line and callers that only want a timestamp leave them out.
+        """
         total = 0
         try:
             total = self._db.execute("SELECT COUNT(*) FROM file_hashes").fetchone()[0]
@@ -690,6 +699,14 @@ class HashCache:
                 created = float(row[1])
             else:
                 last = float(row[1])
+        stats: dict[str, Any] = {
+            "total_cached_files": total,
+            "cache_size_mb": size_mb,
+            "created": created,
+            "last_updated": last,
+        }
+        if not include_groups:
+            return stats
         total_groups = 0
         duplicate_groups = 0
         processed_groups = 0
@@ -708,16 +725,13 @@ class HashCache:
                     remaining += 1
         for _ in self._db.execute("SELECT 1 FROM groups WHERE processed=1"):
             processed_groups += 1
-        return {
-            "total_cached_files": total,
-            "cache_size_mb": size_mb,
-            "created": created,
-            "last_updated": last,
-            "total_groups": total_groups,
-            "duplicate_groups": duplicate_groups,
-            "processed_groups": processed_groups,
-            "remaining_duplicates": remaining,
-        }
+        stats.update(
+            total_groups=total_groups,
+            duplicate_groups=duplicate_groups,
+            processed_groups=processed_groups,
+            remaining_duplicates=remaining,
+        )
+        return stats
 
     def save(self) -> None:
         self.flush_media_metadata()
@@ -1007,6 +1021,8 @@ class HashCache:
         try:
             conn = sqlite3.connect(str(db_path))
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA mmap_size=268435456")
+            conn.execute("PRAGMA temp_store=MEMORY")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS file_hashes (

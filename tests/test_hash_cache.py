@@ -147,7 +147,7 @@ class TestCacheVersionInvalidation:
 
         self._bump_version(images_only_dir)
         reopened = HashCache(images_only_dir)
-        assert reopened.get_cache_stats()["processed_groups"] == 1, (
+        assert reopened.get_cache_stats(include_groups=True)["processed_groups"] == 1, (
             "groups the user had already worked through came back as unhandled"
         )
 
@@ -426,3 +426,35 @@ class TestQualityAndAnalysisPersistence:
             "SELECT 1 FROM quality_metrics WHERE relative_path=?", ("img_a_copy.png",)
         ).fetchone()
         assert row is None
+
+
+class TestCheapCacheStats:
+    def _cache_with_group(self, folder):
+        cache = HashCache(folder)
+        cache.get_hash(os.path.join(folder, "img_a.png"), VIDEO_EXTENSIONS)
+        members = [os.path.join(folder, n) for n in ("img_a.png", "img_a_copy.png")]
+        cache.set_cached_groups({members[0]: members})
+        cache.save()
+        return cache
+
+    def test_cheap_form_does_not_stat_members(self, images_only_dir, monkeypatch):
+        from deduper.utils import hash_cache as module
+
+        cache = self._cache_with_group(images_only_dir)
+
+        def _no_exists(path):
+            raise AssertionError(f"os.path.exists called for {path}")
+
+        monkeypatch.setattr(module.os.path, "exists", _no_exists)
+        stats = cache.get_cache_stats()
+        assert stats["total_cached_files"] >= 1
+        assert "last_updated" in stats
+        assert "remaining_duplicates" not in stats
+
+    def test_full_form_reports_group_counts(self, images_only_dir):
+        cache = self._cache_with_group(images_only_dir)
+        stats = cache.get_cache_stats(include_groups=True)
+        assert stats["total_groups"] == 1
+        assert stats["duplicate_groups"] == 1
+        assert stats["processed_groups"] == 0
+        assert stats["remaining_duplicates"] == 2

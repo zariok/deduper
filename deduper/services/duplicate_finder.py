@@ -179,7 +179,12 @@ def _get_process_pool() -> ProcessPoolExecutor:
     if _process_pool is None:
         with _pool_lock:
             if _process_pool is None:
-                workers = min(mp.cpu_count(), 8)  # cap at 8 to avoid memory pressure
+                # Imported here, not at module level: spawned workers import this
+                # module, and config's import-time SECRET_KEY check does not
+                # belong in a hashing child. DEDUPER_HASH_WORKERS sizes the pool.
+                from ..config import Config
+
+                workers = Config.HASH_WORKERS
                 _process_pool = ProcessPoolExecutor(
                     max_workers=workers,
                     mp_context=_spawn_ctx,
