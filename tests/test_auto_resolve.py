@@ -196,3 +196,236 @@ class TestProvenPassesWriteLedger:
         assert os.path.basename(row["keeper"]) == "full.mp4"
         assert row["evidence"]["keeper_width"] == 640
         assert os.path.islink(row["duplicate"])
+
+
+@pytest.fixture
+def reencode_dir(tmp_path) -> str:
+    """One picture saved twice at the same size - PNG and a high-quality JPEG -
+    plus an unrelated image. The JPEG is 4:4:4: Pillow's default 4:2:0 shifts
+    the colour of this saturated synthetic gradient enough for the analysis to
+    flag a colour difference, which (correctly) disqualifies the group."""
+    from .conftest import gradient_image
+
+    folder = tmp_path / "reencode"
+    folder.mkdir()
+    picture = gradient_image(240, 240, 11)
+    picture.save(folder / "pic.png")
+    picture.save(folder / "pic.jpg", quality=95, subsampling=0)
+    gradient_image(200, 200, 200).save(folder / "other.png")
+    return os.path.realpath(folder)
+
+
+def _policy(monkeypatch, value: str) -> None:
+    monkeypatch.setattr(config_module.Config, "AUTO_RESOLVE_POLICY", value)
+
+
+def _reencode_rows(folder: str, applied: bool | None = None) -> list[dict]:
+    return HashCache(folder).get_auto_actions(applied=applied, tier="reencode")
+
+
+class TestReencodeTier:
+    def test_fixture_is_within_the_tier_bound(self, reencode_dir):
+        """Premise: if the JPEG drifts past 2 bits the other tests mean nothing."""
+        from deduper.utils.media import MultiHash
+
+        _scan(reencode_dir)
+        rows = HashCache(reencode_dir).get_file_hash_rows()
+        png = MultiHash.from_str(rows["pic.png"][0])
+        jpg = MultiHash.from_str(rows["pic.jpg"][0])
+        assert png.phash_distance(jpg) <= 2
+        assert png.dhash_distance(jpg) <= 2
+
+    def test_ledger_records_without_touching_files(self, reencode_dir, monkeypatch):
+        _policy(monkeypatch, "ledger")
+        png = os.path.join(reencode_dir, "pic.png")
+        jpg = os.path.join(reencode_dir, "pic.jpg")
+        before = {p: os.stat(p).st_mtime_ns for p in (png, jpg)}
+
+        images, _ = _scan(reencode_dir)
+
+        (row,) = _reencode_rows(reencode_dir)
+        assert row["applied"] is False
+        assert row["duplicate"] == jpg and row["keeper"] == png
+        evidence = row["evidence"]
+        assert evidence["width"] == 240 and evidence["height"] == 240
+        assert evidence["phash_max"] <= 2 and evidence["dhash_max"] <= 2
+        assert evidence["members"] == 2
+        assert evidence["keeper_score"] >= evidence["duplicate_score"] > 0
+        assert evidence["keeper_size"] == os.path.getsize(png)
+        assert evidence["duplicate_size"] == os.path.getsize(jpg)
+        assert evidence["keeper_reason"]
+        assert row["group_id"] == images[0]["group_id"]
+
+        for path, mtime in before.items():
+            assert not os.path.islink(path) and os.stat(path).st_mtime_ns == mtime
+        assert len(images) == 1, "ledger mode must leave the group for the user"
+
+    def test_second_ledger_scan_does_not_duplicate_rows(self, reencode_dir, monkeypatch):
+        _policy(monkeypatch, "ledger")
+        _scan(reencode_dir)
+        _scan(reencode_dir)  # warm: no new files, exact-match pass skipped
+        assert len(_reencode_rows(reencode_dir)) == 1
+
+    def test_warm_ledger_scan_reads_hash_rows_once(self, reencode_dir, monkeypatch):
+        """The tier reuses the warm path's read of file_hashes."""
+        _policy(monkeypatch, "ledger")
+        _scan(reencode_dir)
+        calls = []
+        original = HashCache.get_file_hash_rows
+
+        def counting(self):
+            calls.append(1)
+            return original(self)
+
+        monkeypatch.setattr(HashCache, "get_file_hash_rows", counting)
+        _scan(reencode_dir)
+        assert len(calls) == 1
+        assert len(_reencode_rows(reencode_dir)) == 1
+
+    def test_apply_replaces_the_duplicate(self, reencode_dir, monkeypatch):
+        _policy(monkeypatch, "ledger")
+        _scan(reencode_dir)
+        assert len(_reencode_rows(reencode_dir, applied=False)) == 1
+
+        _policy(monkeypatch, "apply")
+        images, _ = _scan(reencode_dir)
+
+        jpg = os.path.join(reencode_dir, "pic.jpg")
+        assert os.path.islink(jpg)
+        assert os.path.realpath(jpg) == os.path.join(reencode_dir, "pic.png")
+        (row,) = _reencode_rows(reencode_dir, applied=True)
+        assert row["duplicate"] == jpg
+        assert _reencode_rows(reencode_dir, applied=False) == []
+        assert images == [], "the resolved group must drop out of the results"
+
+        # And it stays resolved: a rescan finds nothing further to do
+        images, _ = _scan(reencode_dir)
+        assert images == []
+        assert len(_reencode_rows(reencode_dir)) == 1
+
+    def test_policy_off_writes_nothing(self, reencode_dir, monkeypatch):
+        _policy(monkeypatch, "off")
+        images, _ = _scan(reencode_dir)
+        assert _reencode_rows(reencode_dir) == []
+        assert len(images) == 1
+        assert not os.path.islink(os.path.join(reencode_dir, "pic.jpg"))
+
+    def test_differing_dimensions_do_not_qualify(self, images_only_dir, monkeypatch):
+        """img_a and img_a_small group together, but one is a downscale."""
+        _policy(monkeypatch, "apply")
+        images, _ = _scan(images_only_dir)
+        assert images, "premise: img_a and img_a_small must still group"
+        assert _reencode_rows(images_only_dir) == []
+        assert not os.path.islink(os.path.join(images_only_dir, "img_a_small.png"))
+
+    def test_manual_pick_that_left_the_group_disqualifies(self, reencode_dir, monkeypatch):
+        _policy(monkeypatch, "ledger")
+        images, _ = _scan(reencode_dir)
+        cache = HashCache(reencode_dir)
+        cache.set_best_file(images[0]["group_id"], os.path.join(reencode_dir, "other.png"))
+
+        _scan(reencode_dir)
+        assert _reencode_rows(reencode_dir) == []
+
+    def test_manual_pick_still_in_the_group_is_the_keeper(self, reencode_dir, monkeypatch):
+        _policy(monkeypatch, "ledger")
+        images, _ = _scan(reencode_dir)
+        jpg = os.path.join(reencode_dir, "pic.jpg")
+        HashCache(reencode_dir).set_best_file(images[0]["group_id"], jpg)
+
+        _scan(reencode_dir)
+        (row,) = _reencode_rows(reencode_dir)
+        assert row["keeper"] == jpg
+        assert row["duplicate"] == os.path.join(reencode_dir, "pic.png")
+        assert row["evidence"]["keeper_reason"] == "Chosen manually"
+
+
+class TestReencodeGuards:
+    """Guards a real scan cannot easily reach, checked on the tier directly."""
+
+    @pytest.fixture
+    def scanned(self, reencode_dir, monkeypatch):
+        from deduper.services.duplicate_finder import DuplicateFinder
+
+        from .conftest import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+
+        _policy(monkeypatch, "ledger")
+        _scan(reencode_dir)
+        assert len(_reencode_rows(reencode_dir)) == 1, "premise: the group qualifies"
+        cache = HashCache(reencode_dir)
+        groups = {k: v for k, v in cache.get_cached_groups().items() if len(v) > 1}
+        finder = DuplicateFinder(IMAGE_EXTENSIONS, VIDEO_EXTENSIONS)
+        return finder, cache, groups
+
+    def test_guards_pass_unmodified(self, scanned):
+        finder, cache, groups = scanned
+        assert finder._auto_resolve_reencodes(groups, cache) is groups
+        assert cache.count_auto_actions(applied=False, tier="reencode") == 1
+
+    def test_video_member_disqualifies(self, scanned, tmp_path):
+        finder, cache, groups = scanned
+        (key, members), = groups.items()
+        clip = os.path.join(str(cache.directory_path), "pic.mp4")
+        with open(clip, "wb") as fh:
+            fh.write(b"\0")
+        finder._auto_resolve_reencodes({key: members + [clip]}, cache)
+        assert cache.count_auto_actions(tier="reencode") == 0
+
+    def test_missing_analysis_disqualifies(self, scanned):
+        finder, cache, groups = scanned
+        cache._db.execute("DELETE FROM group_analysis")
+        cache._db.commit()
+        finder._auto_resolve_reencodes(groups, cache)
+        assert cache.count_auto_actions(tier="reencode") == 0
+
+    def test_stale_analysis_version_disqualifies(self, scanned):
+        import json
+
+        finder, cache, groups = scanned
+        for group_id, payload in cache._db.execute(
+            "SELECT group_id, payload FROM group_analysis"
+        ).fetchall():
+            data = json.loads(payload)
+            data["version"] = -1
+            cache._db.execute(
+                "UPDATE group_analysis SET payload=? WHERE group_id=?",
+                (json.dumps(data), group_id),
+            )
+        cache._db.commit()
+        finder._auto_resolve_reencodes(groups, cache)
+        assert cache.count_auto_actions(tier="reencode") == 0
+
+    def test_changed_member_disqualifies(self, scanned):
+        """A member edited since it was hashed and analysed: neither its stored
+        hash nor the group's analysis fingerprint describes it any more."""
+        finder, cache, groups = scanned
+        jpg = os.path.join(str(cache.directory_path), "pic.jpg")
+        os.utime(jpg, (1_000_000_000, 1_000_000_000))
+        finder._auto_resolve_reencodes(groups, cache)
+        assert cache.count_auto_actions(tier="reencode") == 0
+
+    def test_modification_flag_disqualifies(self, scanned):
+        import json
+
+        finder, cache, groups = scanned
+        for group_id, payload in cache._db.execute(
+            "SELECT group_id, payload FROM group_analysis"
+        ).fetchall():
+            data = json.loads(payload)
+            first = next(iter(data["members"].values()))
+            first["modifications"] = [{"kind": "overlay", "label": "Overlay"}]
+            cache._db.execute(
+                "UPDATE group_analysis SET payload=? WHERE group_id=?",
+                (json.dumps(data), group_id),
+            )
+        cache._db.commit()
+        finder._auto_resolve_reencodes(groups, cache)
+        assert cache.count_auto_actions(tier="reencode") == 0
+
+    def test_symlinked_member_disqualifies(self, scanned):
+        finder, cache, groups = scanned
+        jpg = os.path.join(str(cache.directory_path), "pic.jpg")
+        os.remove(jpg)
+        os.symlink("pic.png", jpg)
+        finder._auto_resolve_reencodes(groups, cache)
+        assert cache.count_auto_actions(tier="reencode") == 0
